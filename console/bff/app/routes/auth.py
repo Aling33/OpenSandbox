@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import hmac
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -67,7 +69,10 @@ async def login_tenant(body: TenantLoginBody, response: Response) -> dict:
 @router.post("/admin")
 async def login_admin(body: AdminLoginBody, response: Response) -> dict:
     settings = get_settings()
-    if body.admin_token != settings.bff_admin_token:
+    if not hmac.compare_digest(
+        body.admin_token.encode("utf-8"),
+        settings.bff_admin_token.encode("utf-8"),
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "INVALID_ADMIN_TOKEN", "message": "Invalid admin token"},

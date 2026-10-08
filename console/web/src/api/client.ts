@@ -161,14 +161,6 @@ export const sandboxApi = {
     apiRequest<DiagnosticContentResponse>(
       `/api/sandboxes/${encodeURIComponent(id)}/diagnostics/events?scope=${encodeURIComponent(scope)}`,
     ),
-  archiveLogs: (id: string, maxBytes?: number) => {
-    const params = new URLSearchParams();
-    if (maxBytes) params.set('maxBytes', String(maxBytes));
-    const qs = params.toString();
-    return apiRequest<DiagnosticContentResponse>(
-      `/api/sandboxes/${encodeURIComponent(id)}/logs/archive${qs ? `?${qs}` : ''}`,
-    );
-  },
   createSnapshot: (id: string, body?: { name?: string }) =>
     apiRequest<Snapshot>(`/api/sandboxes/${encodeURIComponent(id)}/snapshots`, {
       method: 'POST',
@@ -189,13 +181,6 @@ export const adminApi = {
     const params = new URLSearchParams({ tenant, scope });
     return apiRequest<DiagnosticContentResponse>(
       `/api/admin/sandboxes/${encodeURIComponent(sandboxId)}/diagnostics/events?${params}`,
-    );
-  },
-  archiveLogs: (sandboxId: string, tenant: string, maxBytes?: number) => {
-    const params = new URLSearchParams({ tenant });
-    if (maxBytes) params.set('maxBytes', String(maxBytes));
-    return apiRequest<DiagnosticContentResponse>(
-      `/api/admin/sandboxes/${encodeURIComponent(sandboxId)}/logs/archive?${params}`,
     );
   },
   sandboxes: (query: Record<string, string | number | undefined>) => {

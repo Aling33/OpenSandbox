@@ -9,7 +9,7 @@
 | `BFF_SESSION_SECRET` | yes | Session cookie signing secret (≥32 random chars) |
 | `BFF_ADMIN_TOKEN` | yes | Admin login password; **never** in frontend build |
 | `BFF_COOKIE_SECURE` | no | Set `true` behind HTTPS |
-| `BFF_CORS_ORIGINS` | no | Comma-separated SPA origins; `*` dev only |
+| `BFF_CORS_ORIGINS` | no | Comma-separated SPA origins. Default `http://localhost:5173`. `*` is rejected because session cookies use credentials |
 | `BFF_AGGREGATE_CACHE_SECONDS` | no | Admin list cache; default `0` |
 | `BFF_HTTP_TIMEOUT_SECONDS` | no | Upstream timeout; default `30` |
 
@@ -25,12 +25,8 @@
 | `BFF_K8S_NODE_AGENT_NAMESPACE` | `opensandbox-system` | DaemonSet namespace |
 | `BFF_K8S_NODE_AGENT_LABEL_SELECTOR` | `app.kubernetes.io/component=node-agent` | Pod selector |
 | `BFF_K8S_NODE_AGENT_PROBE_PORT` | `8080` | node-agent health port |
-| `BFF_NODEAGENT_ARCHIVE_ENABLED` | `false` | Enable `GET .../logs/archive` |
-| `BFF_NODEAGENT_CLUSTER_ID` | `dev-cluster` | Align with node-agent Helm `clusterID` |
-| `BFF_NODEAGENT_OSS_*` | empty | Read-only OSS credentials (same key layout as node-agent writer) |
-| `BFF_NODEAGENT_ARCHIVE_MAX_BYTES` | `524288` | Max bytes per archive response |
 
-In-cluster BFF needs [console-bff-rbac.example.yaml](../k8s/console-bff-rbac.example.yaml) to list pods. Archive logs require node-agent **OSS sink** (file sink on hostPath is not readable cluster-wide).
+In-cluster BFF needs [console-bff-rbac.example.yaml](../k8s/console-bff-rbac.example.yaml) to list pods. Node-agent OSS archive logs are not part of this PR.
 
 Future optional features (history PostgreSQL, Grafana monitor) are documented in [07-sandbox-history.md](./07-sandbox-history.md) and tracked on branch `feat/console-extended-scope`, not in the MVP PR.
 

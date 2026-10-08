@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,6 +80,8 @@ def lookup_by_api_key(path: str | Path, api_key: str) -> TenantRecord | None:
         name = raw["name"]
         namespace = raw["namespace"]
         for key in raw.get("api_keys", []):
-            if key == api_key:
+            if isinstance(key, str) and hmac.compare_digest(
+                key.encode("utf-8"), api_key.encode("utf-8")
+            ):
                 return TenantRecord(name=name, namespace=namespace, api_key=key)
     return None

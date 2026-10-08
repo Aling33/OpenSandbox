@@ -53,6 +53,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies and compile
+        env:
+          TENANTS_TOML_PATH: /tmp/tenants.toml
+          BFF_SESSION_SECRET: ci-session-secret
+          BFF_ADMIN_TOKEN: ci-admin-token
         run: |
           pip install -r requirements.txt
           python -m compileall app
+          python -c "from app.main import app"

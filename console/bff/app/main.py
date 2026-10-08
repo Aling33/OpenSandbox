@@ -31,6 +31,8 @@ def validate_config() -> None:
         raise RuntimeError("TENANTS_TOML_PATH is required")
     if not settings.bff_session_secret or not settings.bff_admin_token:
         raise RuntimeError("BFF_SESSION_SECRET and BFF_ADMIN_TOKEN are required")
+    # Reject wildcard CORS before the process serves credentialed cookies.
+    _ = settings.cors_origins_list
 
 
 @app.get("/health")

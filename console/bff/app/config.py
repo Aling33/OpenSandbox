@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     bff_session_secret: str
     bff_admin_token: str
     bff_cookie_secure: bool = False
-    bff_cors_origins: str = "*"
+    bff_cors_origins: str = "http://localhost:5173"
     bff_aggregate_cache_seconds: int = 0
     bff_http_timeout_seconds: float = 30.0
     bff_session_cookie_name: str = "opensandbox_console_session"
@@ -42,21 +42,15 @@ class Settings(BaseSettings):
     bff_k8s_node_agent_label_selector: str = "app.kubernetes.io/component=node-agent"
     bff_k8s_node_agent_probe_port: int = 8080
 
-    # Optional: read durable sandbox logs written by node-agent (OSS sink)
-    bff_nodeagent_archive_enabled: bool = False
-    bff_nodeagent_cluster_id: str = "dev-cluster"
-    bff_nodeagent_oss_endpoint: str = ""
-    bff_nodeagent_oss_bucket: str = ""
-    bff_nodeagent_oss_key_prefix: str = "logs"
-    bff_nodeagent_oss_access_key_id: str = ""
-    bff_nodeagent_oss_access_key_secret: str = ""
-    bff_nodeagent_archive_max_bytes: int = 524_288
-
     @property
     def cors_origins_list(self) -> list[str]:
-        if self.bff_cors_origins.strip() == "*":
-            return ["*"]
-        return [o.strip() for o in self.bff_cors_origins.split(",") if o.strip()]
+        origins = [origin.strip() for origin in self.bff_cors_origins.split(",") if origin.strip()]
+        if any(origin == "*" for origin in origins):
+            raise ValueError(
+                "BFF_CORS_ORIGINS must list explicit origins; '*' is rejected "
+                "because session cookies are sent with credentials"
+            )
+        return origins
 
 
 @lru_cache
