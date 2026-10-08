@@ -17,7 +17,6 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 
 import { adminApi, sandboxApi } from '../api/client';
-import { SandboxArchiveLogPanel } from '../components/SandboxArchiveLogPanel';
 import { SandboxLogPanel } from '../components/SandboxLogPanel';
 import type { Sandbox } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
@@ -240,24 +239,7 @@ export function SandboxDetailPage() {
             label: '运行日志',
             children: (
               <Card title="日志">
-                <Tabs
-                  items={[
-                    {
-                      key: 'live',
-                      label: '实时（Lifecycle）',
-                      children: (
-                        <SandboxLogPanel sandboxId={id} tenant={logTenant} autoLoad />
-                      ),
-                    },
-                    {
-                      key: 'archive',
-                      label: '归档（Node Agent）',
-                      children: (
-                        <SandboxArchiveLogPanel sandboxId={id} tenant={logTenant} autoLoad />
-                      ),
-                    },
-                  ]}
-                />
+                <SandboxLogPanel sandboxId={id} tenant={logTenant} autoLoad />
               </Card>
             ),
           },
