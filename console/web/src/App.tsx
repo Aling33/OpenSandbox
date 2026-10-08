@@ -18,9 +18,11 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 
 import { AuthProvider, RequireAuth } from './auth/AuthContext';
 import { AppLayout } from './layout/AppLayout';
+import { AdminSandboxesPage } from './pages/AdminSandboxesPage';
 import { DiagnosticsPage } from './pages/DiagnosticsPage';
 import { LoginPage } from './pages/LoginPage';
 import { OverviewPage } from './pages/OverviewPage';
+import { PoolsPage } from './pages/PoolsPage';
 import { SandboxCreatePage } from './pages/SandboxCreatePage';
 import { SandboxDetailPage } from './pages/SandboxDetailPage';
 import { SandboxListPage } from './pages/SandboxListPage';
@@ -69,7 +71,9 @@ export default function App() {
               <Route path="sandboxes" element={<SandboxListPage />} />
               <Route path="sandboxes/new" element={<SandboxCreatePage />} />
               <Route path="sandboxes/:id" element={<SandboxDetailPage />} />
+              <Route path="admin/sandboxes" element={<AdminSandboxesPage />} />
               <Route path="snapshots" element={<SnapshotsPage />} />
+              <Route path="pools" element={<PoolsPage />} />
               <Route path="diagnostics" element={<DiagnosticsPage />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
