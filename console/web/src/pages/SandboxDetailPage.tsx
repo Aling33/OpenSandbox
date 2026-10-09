@@ -37,6 +37,9 @@ export function SandboxDetailPage() {
   const [endpointPort, setEndpointPort] = useState<number>(8080);
   const [endpointInfo, setEndpointInfo] = useState<Record<string, unknown> | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
+  const [renewLoading, setRenewLoading] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [endpointLoading, setEndpointLoading] = useState(false);
 
   const api = useMemo(
     () =>
@@ -92,16 +95,27 @@ export function SandboxDetailPage() {
       content: '此操作不可撤销。',
       okType: 'danger',
       onOk: async () => {
-        await api.remove();
-        message.success('已删除');
-        navigate(isAdminProxy ? '/admin/sandboxes' : '/sandboxes');
+        setDeleteLoading(true);
+        try {
+          await api.remove();
+          message.success('已删除');
+          navigate(isAdminProxy ? '/admin/sandboxes' : '/sandboxes');
+        } catch (e) {
+          message.error(e instanceof Error ? e.message : '删除失败');
+          throw e;
+        } finally {
+          setDeleteLoading(false);
+        }
       },
     });
   };
 
   const onRenew = async () => {
     if (!api) return;
-    const expiresAt = new Date(Date.now() + renewHours * 3_600_000).toISOString();
+    const parsed = sandbox?.expiresAt ? Date.parse(sandbox.expiresAt) : Number.NaN;
+    const base = Number.isNaN(parsed) ? Date.now() : parsed;
+    const expiresAt = new Date(base + renewHours * 3_600_000).toISOString();
+    setRenewLoading(true);
     try {
       await api.renew(expiresAt);
       message.success('已续期');
@@ -109,6 +123,8 @@ export function SandboxDetailPage() {
       await load();
     } catch (e) {
       message.error(e instanceof Error ? e.message : '续期失败');
+    } finally {
+      setRenewLoading(false);
     }
   };
 
@@ -129,11 +145,14 @@ export function SandboxDetailPage() {
 
   const fetchEndpoint = async () => {
     if (!api) return;
+    setEndpointLoading(true);
     try {
       setEndpointInfo(await api.endpoint(endpointPort));
     } catch (e) {
       message.error(e instanceof Error ? e.message : '获取 endpoint 失败');
       setEndpointInfo(null);
+    } finally {
+      setEndpointLoading(false);
     }
   };
 
@@ -192,7 +211,7 @@ export function SandboxDetailPage() {
                     </Descriptions>
                     <Space style={{ marginTop: 16 }} wrap>
                       <Button onClick={() => setRenewOpen(true)}>续期</Button>
-                      <Button danger onClick={onDelete}>
+                      <Button danger loading={deleteLoading} onClick={onDelete}>
                         删除
                       </Button>
                       <Button
@@ -222,7 +241,7 @@ export function SandboxDetailPage() {
                         value={endpointPort}
                         onChange={(v) => setEndpointPort(v ?? 8080)}
                       />
-                      <Button onClick={() => void fetchEndpoint()}>获取端口信息</Button>
+                      <Button loading={endpointLoading} onClick={() => void fetchEndpoint()}>获取端口信息</Button>
                     </Space>
                     {endpointInfo && (
                       <pre style={{ marginTop: 16, background: '#f5f5f5', padding: 12, overflow: 'auto' }}>
@@ -249,10 +268,11 @@ export function SandboxDetailPage() {
       <Modal
         title="续期"
         open={renewOpen}
+        confirmLoading={renewLoading}
         onOk={() => void onRenew()}
         onCancel={() => setRenewOpen(false)}
       >
-        <Typography.Paragraph>新的过期时间为当前时间 + 指定小时数（UTC）。</Typography.Paragraph>
+        <Typography.Paragraph>在当前 expiresAt 上增加指定小时数；没有过期时间时才从现在起算。</Typography.Paragraph>
         <InputNumber min={1} value={renewHours} onChange={(v) => setRenewHours(v ?? 1)} addonAfter="小时" />
       </Modal>
     </div>
