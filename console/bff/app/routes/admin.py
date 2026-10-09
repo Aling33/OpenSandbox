@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -49,6 +50,7 @@ async def admin_list_sandboxes(
     client = LifecycleClient(settings)
     items: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    now = datetime.now(timezone.utc)
 
     async def fetch_one(tenant_name: str, namespace: str, api_key: str) -> None:
         resp = await client.request(api_key, "GET", "/sandboxes", params=params)
@@ -70,7 +72,7 @@ async def admin_list_sandboxes(
             errors.append({"tenant": tenant_name, "code": "UPSTREAM_ERROR", "message": "Invalid response"})
             return
         for item in data.get("items") or []:
-            enriched = attach_runtime_summary(item)
+            enriched = attach_runtime_summary(item, now)
             enriched["tenant"] = tenant_name
             enriched["namespace"] = namespace
             items.append(enriched)
