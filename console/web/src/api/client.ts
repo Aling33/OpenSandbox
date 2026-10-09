@@ -15,17 +15,9 @@
 import type {
   DiagnosticContentResponse,
   PaginatedSandboxes,
-  K8sEventRow,
-  K8sListResponse,
-  K8sWorkloadRow,
-  PlatformSummary,
-  PoolListResponse,
-  PoolItem,
-  RuntimeStats,
   Sandbox,
   SessionUser,
   Snapshot,
-  SnapshotListResponse,
 } from './types';
 
 export class ApiError extends Error {
@@ -89,7 +81,9 @@ export async function apiRequest<T>(
     headers,
   });
 
-  if (res.status === 401) {
+  const requestPath = path.split('?')[0];
+  const isLogin = requestPath === '/api/auth/tenant' || requestPath === '/api/auth/admin';
+  if (res.status === 401 && !isLogin) {
     onUnauthorized?.();
     throw new ApiError('UNAUTHORIZED', 'Session required', 401);
   }
@@ -166,124 +160,4 @@ export const sandboxApi = {
       method: 'POST',
       body: JSON.stringify(body ?? {}),
     }),
-};
-
-export const adminApi = {
-  listTenants: () =>
-    apiRequest<{ items: { name: string; namespace: string }[] }>('/api/admin/tenants'),
-  diagnosticLogs: (sandboxId: string, tenant: string, scope: string) => {
-    const params = new URLSearchParams({ tenant, scope });
-    return apiRequest<DiagnosticContentResponse>(
-      `/api/admin/sandboxes/${encodeURIComponent(sandboxId)}/diagnostics/logs?${params}`,
-    );
-  },
-  diagnosticEvents: (sandboxId: string, tenant: string, scope: string) => {
-    const params = new URLSearchParams({ tenant, scope });
-    return apiRequest<DiagnosticContentResponse>(
-      `/api/admin/sandboxes/${encodeURIComponent(sandboxId)}/diagnostics/events?${params}`,
-    );
-  },
-  sandboxes: (query: Record<string, string | number | undefined>) => {
-    const params = new URLSearchParams();
-    Object.entries(query).forEach(([k, v]) => {
-      if (v !== undefined && v !== '') params.set(k, String(v));
-    });
-    const qs = params.toString();
-    return apiRequest<PaginatedSandboxes>(`/api/admin/sandboxes${qs ? `?${qs}` : ''}`);
-  },
-  runtimeStats: () => apiRequest<RuntimeStats>('/api/admin/stats/runtime'),
-  platformSummary: () => apiRequest<PlatformSummary>('/api/admin/platform/summary'),
-  getSandbox: (id: string, tenant: string) =>
-    apiRequest<Sandbox>(
-      `/api/admin/sandboxes/${encodeURIComponent(id)}?tenant=${encodeURIComponent(tenant)}`,
-    ),
-  removeSandbox: (id: string, tenant: string) =>
-    apiRequest<void>(
-      `/api/admin/sandboxes/${encodeURIComponent(id)}?tenant=${encodeURIComponent(tenant)}`,
-      { method: 'DELETE' },
-    ),
-  renewSandbox: (id: string, tenant: string, expiresAt: string) =>
-    apiRequest<{ expiresAt: string }>(
-      `/api/admin/sandboxes/${encodeURIComponent(id)}/renew-expiration?tenant=${encodeURIComponent(tenant)}`,
-      { method: 'POST', body: JSON.stringify({ expiresAt }) },
-    ),
-  pauseSandbox: (id: string, tenant: string) =>
-    apiRequest<unknown>(
-      `/api/admin/sandboxes/${encodeURIComponent(id)}/pause?tenant=${encodeURIComponent(tenant)}`,
-      { method: 'POST' },
-    ),
-  resumeSandbox: (id: string, tenant: string) =>
-    apiRequest<unknown>(
-      `/api/admin/sandboxes/${encodeURIComponent(id)}/resume?tenant=${encodeURIComponent(tenant)}`,
-      { method: 'POST' },
-    ),
-  sandboxEndpoint: (id: string, tenant: string, port: number) =>
-    apiRequest<Record<string, unknown>>(
-      `/api/admin/sandboxes/${encodeURIComponent(id)}/endpoints/${port}?tenant=${encodeURIComponent(tenant)}`,
-    ),
-  createSnapshot: (sandboxId: string, tenant: string, body?: { name?: string }) => {
-    const params = new URLSearchParams({ tenant });
-    return apiRequest<Snapshot>(
-      `/api/admin/sandboxes/${encodeURIComponent(sandboxId)}/snapshots?${params}`,
-      { method: 'POST', body: JSON.stringify(body ?? {}) },
-    );
-  },
-  listSnapshots: (tenant: string) =>
-    apiRequest<SnapshotListResponse>(
-      `/api/admin/snapshots?tenant=${encodeURIComponent(tenant)}`,
-    ),
-  deleteSnapshot: (snapshotId: string, tenant: string) =>
-    apiRequest<void>(
-      `/api/admin/snapshots/${encodeURIComponent(snapshotId)}?tenant=${encodeURIComponent(tenant)}`,
-      { method: 'DELETE' },
-    ),
-  k8sWorkloads: (query: Record<string, string | undefined>) => {
-    const params = new URLSearchParams();
-    Object.entries(query).forEach(([k, v]) => {
-      if (v) params.set(k, v);
-    });
-    const qs = params.toString();
-    return apiRequest<K8sListResponse<K8sWorkloadRow>>(
-      `/api/admin/k8s/workloads${qs ? `?${qs}` : ''}`,
-    );
-  },
-  k8sEvents: (query: Record<string, string | undefined>) => {
-    const params = new URLSearchParams();
-    Object.entries(query).forEach(([k, v]) => {
-      if (v) params.set(k, v);
-    });
-    const qs = params.toString();
-    return apiRequest<K8sListResponse<K8sEventRow>>(
-      `/api/admin/k8s/events${qs ? `?${qs}` : ''}`,
-    );
-  },
-};
-
-export const snapshotApi = {
-  list: (query?: Record<string, string>) => {
-    const params = new URLSearchParams(query);
-    const qs = params.toString();
-    return apiRequest<SnapshotListResponse>(`/api/snapshots${qs ? `?${qs}` : ''}`);
-  },
-  remove: (id: string) =>
-    apiRequest<void>(`/api/snapshots/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-};
-
-export const poolApi = {
-  list: () => apiRequest<PoolListResponse>('/api/pools'),
-  get: (name: string) => apiRequest<PoolItem>(`/api/pools/${encodeURIComponent(name)}`),
-  create: (body: Record<string, unknown>) =>
-    apiRequest<PoolItem>('/api/pools', { method: 'POST', body: JSON.stringify(body) }),
-  update: (name: string, body: Record<string, unknown>) =>
-    apiRequest<PoolItem>(`/api/pools/${encodeURIComponent(name)}`, {
-      method: 'PUT',
-      body: JSON.stringify(body),
-    }),
-  remove: (name: string) =>
-    apiRequest<void>(`/api/pools/${encodeURIComponent(name)}`, { method: 'DELETE' }),
-};
-
-export const platformApi = {
-  version: () => apiRequest<Record<string, unknown>>('/api/version'),
-  bffHealth: () => apiRequest<{ status: string }>('/health'),
 };

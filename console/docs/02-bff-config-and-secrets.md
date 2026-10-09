@@ -10,7 +10,6 @@
 | `BFF_ADMIN_TOKEN` | yes | Admin login password; **never** in frontend build |
 | `BFF_COOKIE_SECURE` | no | Set `true` behind HTTPS |
 | `BFF_CORS_ORIGINS` | no | Comma-separated SPA origins. Default `http://localhost:5173`. `*` is rejected because session cookies use credentials |
-| `BFF_AGGREGATE_CACHE_SECONDS` | no | Admin list cache; default `0` |
 | `BFF_HTTP_TIMEOUT_SECONDS` | no | Upstream timeout; default `30` |
 
 ### Optional: node-agent integration
@@ -26,7 +25,7 @@
 | `BFF_K8S_NODE_AGENT_LABEL_SELECTOR` | `app.kubernetes.io/component=node-agent` | Pod selector |
 | `BFF_K8S_NODE_AGENT_PROBE_PORT` | `8080` | node-agent health port |
 
-In-cluster BFF needs [console-bff-rbac.example.yaml](../k8s/console-bff-rbac.example.yaml) to list pods. Node-agent OSS archive logs are not part of this PR.
+Platform probes, the BFF ServiceAccount, and node-agent archive logs are not part of this PR. The deployment example uses the namespace default ServiceAccount.
 
 Future optional features (history PostgreSQL, Grafana monitor) are documented in [07-sandbox-history.md](./07-sandbox-history.md) and tracked on branch `feat/console-extended-scope`, not in the MVP PR.
 

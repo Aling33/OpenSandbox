@@ -109,11 +109,3 @@ export function RequireAuth({ children }: { children: ReactNode }) {
   if (!user) return null;
   return <>{children}</>;
 }
-
-export function RequireAdmin({ children }: { children: ReactNode }) {
-  const { user } = useAuth();
-  if (user?.role !== 'admin') {
-    return null;
-  }
-  return <>{children}</>;
-}

@@ -29,10 +29,12 @@ export function OverviewPage() {
     void (async () => {
       setError(null);
       try {
-        const list = await sandboxApi.list({ pageSize: 500 });
-        const items = list.items ?? [];
-        setTotal(items.length);
-        setRunning(items.filter((s) => s.status?.state === 'Running').length);
+        const [all, runningList] = await Promise.all([
+          sandboxApi.list({ page: 1, pageSize: 1 }),
+          sandboxApi.list({ page: 1, pageSize: 1, state: 'Running' }),
+        ]);
+        setTotal(all.pagination?.totalItems ?? all.items?.length ?? 0);
+        setRunning(runningList.pagination?.totalItems ?? runningList.items?.length ?? 0);
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to load overview');
       }

@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
-from fastapi import HTTPException, Request, status
+from typing import Annotated
+
+from fastapi import Depends, HTTPException, Request, status
 
 from app.config import Settings, get_settings
 from app.session import decode_session
@@ -22,12 +24,14 @@ from app.session import decode_session
 
 def get_session_payload(
     request: Request,
-    settings: Settings | None = None,
-    cookie: str | None = None,
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
-    settings = settings or get_settings()
-    if cookie is None:
-        cookie = request.cookies.get(settings.bff_session_cookie_name)
+    """Read the session only from the cookie jar.
+
+    The cookie name is configurable, so this must not be a ``cookie`` query
+    parameter. A query token would be written to access logs and could be replayed.
+    """
+    cookie = request.cookies.get(settings.bff_session_cookie_name)
     if not cookie:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

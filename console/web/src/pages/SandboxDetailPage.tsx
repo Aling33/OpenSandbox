@@ -29,7 +29,9 @@ export function SandboxDetailPage() {
   const [renewHours, setRenewHours] = useState(1);
   const [endpointPort, setEndpointPort] = useState<number>(8080);
   const [endpointInfo, setEndpointInfo] = useState<Record<string, unknown> | null>(null);
-  const [actionLoading, setActionLoading] = useState(false);
+  const [renewLoading, setRenewLoading] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [endpointLoading, setEndpointLoading] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -53,6 +55,56 @@ export function SandboxDetailPage() {
 
   const state = sandbox.status?.state ?? 'Unknown';
 
+  const confirmDelete = () => {
+    Modal.confirm({
+      title: '删除沙箱',
+      content: '删除后无法恢复。',
+      okText: '删除',
+      okType: 'danger',
+      cancelText: '取消',
+      onOk: async () => {
+        setDeleteLoading(true);
+        try {
+          await sandboxApi.remove(id);
+          message.success('已删除');
+          navigate('/sandboxes');
+        } catch (e) {
+          message.error(e instanceof Error ? e.message : '删除失败');
+        } finally {
+          setDeleteLoading(false);
+        }
+      },
+    });
+  };
+
+  const loadEndpoint = async () => {
+    setEndpointLoading(true);
+    try {
+      setEndpointInfo(await sandboxApi.endpoint(id, endpointPort));
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : '获取 Endpoint 失败');
+    } finally {
+      setEndpointLoading(false);
+    }
+  };
+
+  const renew = async () => {
+    const parsed = sandbox.expiresAt ? Date.parse(sandbox.expiresAt) : Number.NaN;
+    const base = Number.isNaN(parsed) ? Date.now() : parsed;
+    const expiresAt = new Date(base + renewHours * 3600_000).toISOString();
+    setRenewLoading(true);
+    try {
+      await sandboxApi.renewExpiration(id, expiresAt);
+      message.success('已续期');
+      setRenewOpen(false);
+      await load();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : '续期失败');
+    } finally {
+      setRenewLoading(false);
+    }
+  };
+
   return (
     <div>
       <Typography.Title level={4}>{sandboxDisplayName(sandbox)}</Typography.Title>
@@ -63,15 +115,11 @@ export function SandboxDetailPage() {
           <Descriptions.Item label="镜像">{sandbox.image?.uri ?? '—'}</Descriptions.Item>
         </Descriptions>
         <Space style={{ marginTop: 16 }}>
-          <Button danger loading={actionLoading} onClick={() => void sandboxApi.remove(id).then(() => navigate('/sandboxes'))}>
+          <Button danger loading={deleteLoading} onClick={confirmDelete}>
             删除
           </Button>
           <Button onClick={() => setRenewOpen(true)}>续期</Button>
-          <Button
-            onClick={() =>
-              void sandboxApi.endpoint(id, endpointPort).then(setEndpointInfo)
-            }
-          >
+          <Button loading={endpointLoading} onClick={() => void loadEndpoint()}>
             获取 Endpoint
           </Button>
           <InputNumber min={1} max={65535} value={endpointPort} onChange={(v) => setEndpointPort(Number(v) || 8080)} />
@@ -80,17 +128,13 @@ export function SandboxDetailPage() {
           <pre style={{ marginTop: 16 }}>{JSON.stringify(endpointInfo, null, 2)}</pre>
         )}
       </Card>
-      <Modal open={renewOpen} title="续期" onCancel={() => setRenewOpen(false)} onOk={async () => {
-        setActionLoading(true);
-        try {
-          const expiresAt = new Date(Date.now() + renewHours * 3600_000).toISOString();
-          await sandboxApi.renewExpiration(id, expiresAt);
-          setRenewOpen(false);
-          await load();
-        } finally {
-          setActionLoading(false);
-        }
-      }}>
+      <Modal
+        open={renewOpen}
+        title="续期"
+        confirmLoading={renewLoading}
+        onCancel={() => setRenewOpen(false)}
+        onOk={() => void renew()}
+      >
         <InputNumber min={1} value={renewHours} onChange={(v) => setRenewHours(Number(v) || 1)} addonAfter="小时" />
       </Modal>
     </div>

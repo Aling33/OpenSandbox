@@ -17,7 +17,7 @@ from __future__ import annotations
 from fastapi import HTTPException, status
 
 from app.config import get_settings
-from app.tenants import get_tenant_by_name, load_tenants
+from app.tenants import get_tenant_by_name
 
 
 def tenant_api_key(payload: dict) -> str:
@@ -68,23 +68,3 @@ def api_key_for_tenant_name(tenant_name: str) -> str:
             },
         )
     return record.api_key
-
-
-def lifecycle_api_key_for_session(payload: dict) -> str:
-    """Tenant session uses tenant key; admin uses first configured tenant for platform proxy."""
-    role = payload.get("role")
-    if role == "tenant":
-        return tenant_api_key(payload)
-    if role == "admin":
-        settings = get_settings()
-        tenants = load_tenants(settings.tenants_toml_path)
-        if not tenants:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "NO_TENANTS", "message": "No tenants configured for upstream proxy"},
-            )
-        return tenants[0].api_key
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail={"code": "FORBIDDEN", "message": "Valid session required"},
-    )

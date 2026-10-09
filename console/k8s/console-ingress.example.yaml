@@ -5,6 +5,11 @@ metadata:
   name: opensandbox-console
   namespace: opensandbox-system
 spec:
+  # BFF_COOKIE_SECURE=true 时浏览器只在 HTTPS 下带回会话 Cookie。
+  tls:
+    - hosts:
+        - console.example.com
+      secretName: console-tls
   rules:
     - host: console.example.com
       http:

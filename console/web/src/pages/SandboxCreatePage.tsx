@@ -29,6 +29,8 @@ export function SandboxCreatePage() {
   const onFinish = async (values: {
     imageUri: string;
     entrypoint: string;
+    cpu: string;
+    memory: string;
     timeout?: number;
     env?: EnvRow[];
     metadata?: MetaRow[];
@@ -51,7 +53,7 @@ export function SandboxCreatePage() {
       const body: Record<string, unknown> = {
         image: { uri: values.imageUri.trim() },
         entrypoint,
-        resourceLimits: { cpu: '500m', memory: '512Mi' },
+        resourceLimits: { cpu: values.cpu.trim(), memory: values.memory.trim() },
       };
       if (values.timeout) body.timeout = values.timeout;
       if (Object.keys(env).length) body.env = env;
@@ -73,7 +75,7 @@ export function SandboxCreatePage() {
       <Form
         layout="vertical"
         onFinish={onFinish}
-        initialValues={{ entrypoint: 'tail -f /dev/null', timeout: 3600 }}
+        initialValues={{ entrypoint: 'tail -f /dev/null', timeout: 3600, cpu: '500m', memory: '512Mi' }}
         style={{ maxWidth: 640 }}
       >
         <Form.Item
@@ -89,6 +91,12 @@ export function SandboxCreatePage() {
           rules={[{ required: true, message: '请输入 entrypoint' }]}
         >
           <Input placeholder="python /app/main.py" />
+        </Form.Item>
+        <Form.Item name="cpu" label="CPU" rules={[{ required: true, message: '请输入 CPU' }]}>
+          <Input placeholder="500m" />
+        </Form.Item>
+        <Form.Item name="memory" label="内存" rules={[{ required: true, message: '请输入内存' }]}>
+          <Input placeholder="512Mi" />
         </Form.Item>
         <Form.Item name="timeout" label="超时（秒）">
           <InputNumber min={60} style={{ width: '100%' }} />

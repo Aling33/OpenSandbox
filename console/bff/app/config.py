@@ -26,7 +26,6 @@ class Settings(BaseSettings):
     bff_admin_token: str
     bff_cookie_secure: bool = False
     bff_cors_origins: str = "http://localhost:5173"
-    bff_aggregate_cache_seconds: int = 0
     bff_http_timeout_seconds: float = 30.0
     bff_session_cookie_name: str = "opensandbox_console_session"
     bff_session_max_age_seconds: int = 86400

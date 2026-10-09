@@ -14,18 +14,18 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.lifecycle import LifecycleClient
+from app.lifecycle import LifecycleClient, bind_http_client
 from app.routes import auth, sandboxes
 
-app = FastAPI(title="OpenSandbox Console BFF", version="0.1.0")
 
-
-@app.on_event("startup")
-def validate_config() -> None:
+def _validate_config() -> None:
     settings = get_settings()
     if not settings.tenants_toml_path:
         raise RuntimeError("TENANTS_TOML_PATH is required")
@@ -33,6 +33,22 @@ def validate_config() -> None:
         raise RuntimeError("BFF_SESSION_SECRET and BFF_ADMIN_TOKEN are required")
     # Reject wildcard CORS before the process serves credentialed cookies.
     _ = settings.cors_origins_list
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _validate_config()
+    settings = get_settings()
+    client = httpx.AsyncClient(timeout=settings.bff_http_timeout_seconds)
+    bind_http_client(client)
+    try:
+        yield
+    finally:
+        bind_http_client(None)
+        await client.aclose()
+
+
+app = FastAPI(title="OpenSandbox Console BFF", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")

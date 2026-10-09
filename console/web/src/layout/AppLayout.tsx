@@ -29,7 +29,7 @@ export function AppLayout() {
   const items = [
     { key: '/', icon: <DashboardOutlined />, label: '概览' },
     ...(isAdmin
-      ? [{ key: '/', icon: <UnorderedListOutlined />, label: '沙箱（PR3+）', disabled: true }]
+      ? [{ key: 'admin-sandboxes-later', icon: <UnorderedListOutlined />, label: '沙箱（PR3+）', disabled: true }]
       : [
           { key: '/sandboxes', icon: <UnorderedListOutlined />, label: '沙箱' },
           { key: '/sandboxes/new', icon: <PlusOutlined />, label: '创建沙箱' },
@@ -59,7 +59,9 @@ export function AppLayout() {
           mode="inline"
           selectedKeys={[selectedKey]}
           items={items}
-          onClick={({ key }) => navigate(key)}
+          onClick={({ key }) => {
+            if (key.startsWith('/')) navigate(key);
+          }}
         />
       </Sider>
       <Layout>

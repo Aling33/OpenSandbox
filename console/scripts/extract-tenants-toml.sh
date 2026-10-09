@@ -20,13 +20,24 @@ CONSOLE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CM="${1:-$CONSOLE_DIR/k8s/tenants-configmap.example.yaml}"
 OUT="${2:-$CONSOLE_DIR/bff/tenants.local.toml}"
 python3 - <<PY
-import sys, pathlib, re
+import pathlib, re, sys
 text = pathlib.Path("$CM").read_text()
-match = re.search(r"tenants\\.toml:\\s*\\|\\s*\\n((?:    .+\\n)+)", text)
-if not match:
+lines = text.splitlines()
+start = None
+for index, line in enumerate(lines):
+    if re.match(r"^\s*tenants\.toml:\s*\|", line):
+        start = index + 1
+        break
+if start is None:
     sys.exit("Could not find data.tenants.toml block in ConfigMap")
-block = match.group(1)
-lines = [ln[4:] if ln.startswith("    ") else ln for ln in block.splitlines()]
-pathlib.Path("$OUT").write_text("\\n".join(lines).rstrip() + "\\n")
+block: list[str] = []
+for line in lines[start:]:
+    if line == "" or line.startswith("    "):
+        block.append(line[4:] if line.startswith("    ") else "")
+        continue
+    break
+if not any(line.strip() for line in block):
+    sys.exit("tenants.toml block is empty")
+pathlib.Path("$OUT").write_text("\n".join(block).rstrip() + "\n")
 print("Wrote", "$OUT")
 PY

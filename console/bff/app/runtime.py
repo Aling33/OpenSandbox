@@ -56,25 +56,3 @@ def attach_runtime_summary(sandbox: dict[str, Any], now: datetime | None = None)
     out = dict(sandbox)
     out["runtimeSummary"] = summary
     return out
-
-
-def aggregate_runtime_stats(sandboxes: list[dict[str, Any]]) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
-    running = [s for s in sandboxes if (s.get("status") or {}).get("state") == "Running"]
-    walls = [s.get("runtimeSummary", {}).get("wallClockSeconds", 0) for s in sandboxes]
-    walls = [w for w in walls if isinstance(w, int)]
-    expiring = 0
-    for s in sandboxes:
-        rem = (s.get("runtimeSummary") or {}).get("remainingSeconds")
-        if isinstance(rem, int) and rem <= 30 * 60:
-            expiring += 1
-
-    total = sum(walls) if walls else 0
-    return {
-        "runningCount": len(running),
-        "totalWallClockSeconds": total,
-        "avgWallClockSeconds": int(total / len(walls)) if walls else 0,
-        "maxWallClockSeconds": max(walls) if walls else 0,
-        "expiringWithin30mCount": expiring,
-        "asOf": now.isoformat().replace("+00:00", "Z"),
-    }

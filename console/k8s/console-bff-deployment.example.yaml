@@ -14,7 +14,6 @@ spec:
       labels:
         app: opensandbox-console-bff
     spec:
-      serviceAccountName: opensandbox-console-bff
       containers:
         - name: bff
           image: YOUR_REGISTRY/opensandbox-console-bff:0.1.0
@@ -32,9 +31,9 @@ spec:
               value: "true"
             - name: BFF_CORS_ORIGINS
               value: "https://console.example.com"
-            # 可选：探测 node-agent（需 console-bff-rbac.example.yaml）
+            # 平台探测和 ServiceAccount 不在本 PR；保持关闭，避免引用尚未提供的 RBAC。
             - name: BFF_K8S_PROBE_ENABLED
-              value: "true"
+              value: "false"
             # 仅当 in-cluster apiserver TLS 与 SA CA 不匹配时启用（与 Server config.toml 无关）
             # - name: BFF_K8S_INSECURE_SKIP_TLS_VERIFY
             #   value: "true"
