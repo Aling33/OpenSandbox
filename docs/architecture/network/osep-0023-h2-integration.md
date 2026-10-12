@@ -5,15 +5,22 @@ description: Approved experimental HTTP/2 admission and drain contract, implemen
 
 # OSEP-0023 HTTP/2 integration
 
-Status: implementation in progress. This page records the approved experimental
+Status: P1 direct/lazy wiring and independent review completed; real-runtime
+acceptance is in progress. This page records the approved experimental
 sidecar contract, not production readiness or deployment approval. Public mode,
 Fast Sandbox, HTTP/3, CONNECT and cross-SNI coalescing remain out of scope.
 
 ## Decisions and ownership
 
 The 2026-10-12 design accepts delayed GOAWAY (D1), a first retry acceptance scope
-of Go 1.25.9 `net/http` synthetic GET only (D2), and a narrow exceptional
-mitmdump process-exit fallback (D3). The existing `LiveReceiver` →
+of Go `net/http` synthetic GET only (D2), and a narrow exceptional
+mitmdump process-exit fallback (D3). D2 initially selected Go 1.25.9; the user
+subsequently approved upgrading the MBA's Go to the latest official stable
+release instead. Each retry run must require and record the exact resulting
+toolchain version, with no fallback to the old installation. This changes the
+selected client version, not the GET-only scope. The verified selected MBA
+toolchain is Go 1.27.2 on darwin/arm64; its retry acceptance remains unrun.
+The existing `LiveReceiver` →
 `RevisionPublisher` → registry/receiver remains the only publication owner and
 keeps Registry → Receiver lock order. The authenticated IPC protocol and exact
 receiver type are unchanged. No dependency fork, global replacement, raw GOAWAY,
@@ -112,8 +119,8 @@ slice; there is no second revision owner or general transport framework.
 | Stage | Required evidence | Current status |
 | --- | --- | --- |
 | P0 | Raw identity, exact hook admission seam, refusal/400/413/cleanup, upstream mapping/queues and termination interfaces | Old STOP retained; targeted D3 amendment independently passed on 2026-10-12 |
-| P1 | Atomic registry races/rollback, actual runtime/hook wiring, snapshot identity, output-obligation lifecycle and bounded cleanup | In progress |
-| P2 | Actual production addon with authenticated Unix IPC, both cutover orders, rotation/removal, reset/disconnect and short/default deadlines | Missing; cloud AF_UNIX runtime blocked |
+| P1 | Atomic registry races/rollback, actual runtime/hook wiring, snapshot identity, output-obligation lifecycle and bounded cleanup | Direct/lazy scope passed socket-free tests and independent review on 2026-10-12 |
+| P2 | Actual production addon with authenticated Unix IPC, both cutover orders, rotation/removal, reset/disconnect and short/default deadlines | Explicit opt-in partial loopback suite prepared; no fresh runtime result yet |
 | P3 | Fixed Go GET retry observations and approved Linux transparent 443 path, H1/policy/credential regressions, independent review | Missing |
 
 Stable coverage denominator:
@@ -127,16 +134,67 @@ Stable coverage denominator:
   remove/re-add preserve snapshots and first deadlines.
 - H2-A4: idempotent reset/error/disconnect, stranded trailers, orphan upload,
   actual default 30-second expiry and resource release; abnormal is not graceful.
-- H2-A5: Go 1.25.9 configured `net/http` GET retry is observed without manual
-  resends; logical requests reach origin at most once and old streams survive.
+- H2-A5: The explicitly selected Go version's configured `net/http` GET retry
+  is observed without manual resends; logical requests reach origin at most
+  once and old streams survive.
 
 Evidence records exact commit/tree, dependency and environment identities and
 marks each required check fresh/reused/missing/blocked separately from pass/fail.
 Pure layer/synthetic transport tests do not prove real socket/TLS/IPC behavior.
+The P1 test denominator is 241 socket-free checks: 108 registry/publication,
+32 adapter, 28 lifecycle, 15 system-hook and 58 existing H1-related checks.
+They pass both in separate processes and together in CI-style alphabetical
+order. Two additional module-isolation regressions check restoration of the
+legacy fake test context without replacing real H2 dependency identities.
+Independent registry review additionally exercised 38,400 deterministic model
+transitions; lifecycle review independently checked failed-connect and
+established-TCP/failed-TLS ordering. These numbers are not runtime-case counts.
 The old W2 run remains single-scenario feasibility evidence only; it does not
 establish new production acceptance. MBA loopback tests cannot replace Linux
 transparent destination 443, restricted user, IPv4/IPv6 and quarantine readback.
 The production port gate must not be relaxed to accommodate a test fixture.
+
+The P2 loopback topology uses the actual system addon and a SOCKS5
+connection whose real destination is `127.0.0.1:443`, followed by TLS with the
+bound synthetic SNI. This exercises the proven direct/lazy child chain without
+rewriting a high destination port. It is not a transparent-redirection test.
+Execution requires an available, permitted loopback port 443, the pinned
+mitmproxy environment, authenticated AF_UNIX IPC and permission for the isolated
+fault-case mitmdump child to exit. The Go case additionally requires an explicit
+expected toolchain version matching the actual runtime. Missing capabilities
+are blocked or missing evidence, never successful skips. The test observer may
+read bounded runtime metadata and hold
+the specified asynchronous fault hook; it must not replace production owners,
+mutate protocol queues or rewrite destinations.
+
+### Running the bounded loopback suite
+
+The explicit runner is
+`components/egress/tests/test_credential_bound_h2_runtime.py`. Ordinary unittest
+discovery does not start these network cases. `--list` reports the static
+denominator without network operations; execution requires
+`--run-real-runtime --artifacts NEW_DIRECTORY` with the pinned venv's Python.
+Use a fresh artifact directory and the exact reviewed checkout. Occupied or
+denied port 443 is blocked, with no alternative-port or destination rewrite.
+
+The first batch contains 15 manual-peer cases: attachment/injection/redaction,
+removal with two backpressured streams, rotation, remove/re-add, reset isolation
+and disconnect, each with genuine H1 and H2 upstreams; short expiry, configured
+default 30-second expiry and the isolated D3 child-exit case add three more.
+The separate Go case is selected by supplying both `--go-client BINARY` and
+`--require-go-version goX.Y.Z`. Build only the standalone
+`components/egress/tests/fixtures/h2_retry_client.go` with the independently
+verified compiler, `GO111MODULE=off` and `GOTOOLCHAIN=local`; the runner never
+installs a toolchain or infers the expected version from the candidate binary.
+
+Reports retain PASS, FAIL, BLOCKED and NOT_RUN separately for all 15 manual
+cases and the Go case, even when `--case` selects a smaller subset. A successful
+selected batch is not full P2 acceptance. This batch checks post-ACK refusal,
+not pre-ACK timing or a suspended-hook commit-before-admission race. Fragmented
+HEADERS, upload/queue and stranded-trailer variants, path-only/policy-only
+rotation and the Linux checks above remain explicit gaps. Process reap and
+origin socket closure do not establish kernel quarantine or origin business
+completion.
 
 Rollback is the focused H2 integration commit set, restoring the existing H1
 path while retaining historical evidence. Workflow edits, remote publication,
