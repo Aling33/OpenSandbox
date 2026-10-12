@@ -23,10 +23,18 @@ Control protocol (UTF-8 JSON lines; keep stdin open):
    write `{"command":"continue_new"}` plus newline exactly once while the old
    response is still open (early completion is rejected). The single new
    `client.Do` issues `/v1/new`, with `X-H2-Logical-ID: new` on the same Transport.
-3. Wait for `new_result`, then release the origin's held old response and await
-   `old_result` and `done`. The new GET has its own deadline and may legitimately
-   negotiate HTTP/1.1 on a fresh, unbound pass-through connection. Its failure
-   does not cancel the old GET. The overall deadline still bounds both requests.
+3. The parent harness chooses one of two separate old-response release policies:
+   - `go_retry` holds old until `new_result`, then releases it. This tests whether
+     the library can migrate while old remains unfinished.
+   - `go_retry_bounded_old` releases old after observing this new GET at the
+     original connection's post-ACK fence, without waiting for `new_result`.
+     This tests recovery when old independently finishes early in the retry
+     window; it cannot establish recovery for arbitrary old-response durations.
+   Await `old_result`, `new_result` and `done` under either policy. The new GET
+   has its own deadline and may legitimately negotiate HTTP/1.1 on a fresh,
+   unbound pass-through connection. Its failure does not cancel the old GET.
+   The overall deadline still bounds both requests. The helper's Transport and
+   single-Do behavior are identical in both scenarios.
 4. `{"command":"cancel"}`, stdin EOF, invalid control, SIGINT, or SIGTERM cancels
    the run and closes its owned connections. Control lines are limited to 4096 bytes.
 
@@ -43,3 +51,5 @@ the parent must assert expected status/body, old-stream preservation, library re
 outcome, origin at-most-once, and actual new-connection revision behavior. Setup,
 control, old-response, and overall-deadline failures exit 2. Runtime verification
 must be reported separately; source preparation is not a Go build or runtime pass.
+See the [versioned integration record](../../../../docs/architecture/network/osep-0023-h2-integration.md#observed-go-retry-limit-and-staged-delivery)
+for the separate held-old failure, bounded-old result and remaining acceptance gates.

@@ -57,9 +57,14 @@ health becomes ready.
 
 The live receiver jointly installs the immutable snapshot and its
 credential-free TLS selector view for connection and request admission. The
-internal sidecar experiment supports bound HTTPS/443 HTTP/1.1 traffic; it does
-not expose a supported public `interceptionMode` or enable Fast Sandbox or
-HTTP/2 support. See the [live admission boundary](/guides/credential-vault#experimental-live-credential-bound-admission-osep-0023).
+internal sidecar experiment covers bound HTTPS/443 HTTP/1.1 traffic and
+experimental HTTP/2 admission and bounded drain wiring on the fixed-dependency
+direct/lazy path. Configured chained upstream proxies remain rejected for this
+live HTTP/2 path. Long-held responses can still cause Go retries to time out;
+full client migration and Linux acceptance remain follow-up work. It does not
+expose a supported public `interceptionMode` or enable Fast Sandbox. See the
+[live admission boundary](/guides/credential-vault#experimental-live-credential-bound-admission-osep-0023)
+and [HTTP/2 integration boundary](/architecture/network/osep-0023-h2-integration).
 
 Vault writes, existing `POST`/`PUT`/`PATCH`/`DELETE /policy` handlers and automatic
 always-rule reloads share the Policy/Vault mutation barrier and an exclusive

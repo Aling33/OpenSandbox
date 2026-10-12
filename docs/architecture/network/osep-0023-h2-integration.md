@@ -5,11 +5,14 @@ description: Approved experimental HTTP/2 admission and drain contract, implemen
 
 # OSEP-0023 HTTP/2 integration
 
-Status: P1 direct/lazy wiring and independent review completed; the first 15
-manual runtime cases passed, but held-old Go retry acceptance failed. Full
-runtime acceptance is incomplete. This page records the approved experimental
-sidecar contract, not production readiness or deployment approval. Public mode,
-Fast Sandbox, HTTP/3, CONNECT and cross-SNI coalescing remain out of scope.
+Status: staged delivery of experimental H2 admission and bounded-drain wiring,
+accepted on 2026-10-12. P1 direct/lazy wiring and independent review completed;
+15 manual runtime cases passed on the first tested tree. Go held-old retry
+acceptance failed; a separate early-completing-old case passed on the follow-up
+tree. Full H2-A5, P2/P3 and Linux acceptance remain open. This page records the
+experimental sidecar contract, not production readiness or deployment approval.
+Public mode, Fast Sandbox, HTTP/3, CONNECT and cross-SNI coalescing remain out of
+scope.
 
 ## Decisions and ownership
 
@@ -128,8 +131,8 @@ slice; there is no second revision owner or general transport framework.
 | --- | --- | --- |
 | P0 | Raw identity, exact hook admission seam, refusal/400/413/cleanup, upstream mapping/queues and termination interfaces | Old STOP retained; targeted D3 amendment independently passed on 2026-10-12 |
 | P1 | Atomic registry races/rollback, actual runtime/hook wiring, snapshot identity, output-obligation lifecycle and bounded cleanup | Direct/lazy scope passed socket-free tests and independent review on 2026-10-12 |
-| P2 | Actual production addon with authenticated Unix IPC, both cutover orders, rotation/removal, reset/disconnect and short/default deadlines | First 15 loopback manual-peer cases passed; broader matrix below remains incomplete |
-| P3 | Fixed Go GET retry observations and approved Linux transparent 443 path, H1/policy/credential regressions, independent review | Go 1.27.2 held-old case failed; bounded-old follow-up unrun; Linux path missing |
+| P2 | Actual production addon with authenticated Unix IPC, both cutover orders, rotation/removal, reset/disconnect and short/default deadlines | First tested tree: 15 loopback manual-peer cases passed. Follow-up tree: those 15 NOT_RUN; broader matrix remains incomplete |
+| P3 | Fixed Go GET retry observations and approved Linux transparent 443 path, H1/policy/credential regressions, independent review | Go 1.27.2 held-old case failed on both tested trees; bounded-old follow-up passed only its narrower scenario; Linux path missing |
 
 Stable coverage denominator:
 
@@ -143,8 +146,11 @@ Stable coverage denominator:
 - H2-A4: idempotent reset/error/disconnect, stranded trailers, orphan upload,
   actual default 30-second expiry and resource release; abnormal is not graceful.
 - H2-A5: The explicitly selected Go version's configured `net/http` GET retry
-  is observed without manual resends; logical requests reach origin at most
-  once and old streams survive.
+  must independently pass its successful-migration acceptance without manual
+  resends; logical requests reach origin at most once and old streams survive.
+  This gate is not satisfied by recording observations alone. The held-old
+  success case remains FAIL; the narrower bounded-old PASS does not complete
+  H2-A5 or replace that failure.
 
 Evidence records exact commit/tree, dependency and environment identities and
 marks each required check fresh/reused/missing/blocked separately from pass/fail.
@@ -204,7 +210,7 @@ rotation and the Linux checks above remain explicit gaps. Process reap and
 origin socket closure do not establish kernel quarantine or origin business
 completion.
 
-### Observed Go retry limit and the bounded-old follow-up
+### Observed Go retry limit and staged delivery
 
 The user-executed MBA run used commit
 `38f7dca55139440cc861dcf5e1e25144e84adbaa`, tree
@@ -222,25 +228,62 @@ occupied. This is not evidence that Go never retries or that a proxy sweep
 failed. The original failure short-circuited its later natural runtime-cleanup
 assertion; finally cleanup does not retroactively satisfy that assertion.
 Go exit cleanup itself closes client connections, so origin closure alone does
-not prove that a proxy GOAWAY initiated closure. No Go-peer raw-frame capture
-was made.
+not prove that a proxy GOAWAY initiated closure.
 
-The separate `go_retry_bounded_old` follow-up releases the old body after an
-observed post-ACK request hits the old connection's fence, without waiting for
-`new_result`. It retains one `Do`, the 8-second new-request deadline, the same
-Transport and production D1 behavior. Its purpose is to measure recovery when
-the old response independently completes within the client's retry window.
-It has not run. Even a future success would not establish migration while the
-old response remains unfinished, for arbitrary finite response durations, or
-for other client configurations. The original held-old failure is retained
-separately rather than converted into successful retry acceptance.
+The follow-up MBA run used commit
+`99c9d1c34f18a494cfa7b1d31771c7e133a706ae`, tree
+`0b5e597748ab0815a20f9c696b7e127bc751de1d`, again with Go 1.27.2. Its separate
+denominators were 15 manual cases NOT_RUN, held-old `go_retry` FAIL, and
+`go_retry_bounded_old` PASS. Overall status remained FAIL, exit 1. These results
+do not mean the manual cases were freshly run on the follow-up tree, even
+though the production source was unchanged.
 
-The next fixture revision also measures normal client-driven runtime and
-origin cleanup before its final retry-success assertion. This can supplement
-negative-result evidence; it cannot make an unsuccessful new GET successful.
-The MBA run required explicit user-performed administrator execution after an
-unprivileged port-443 attempt was blocked. It does not cover the production
-restricted mitmproxy user or any Linux network/quarantine behavior.
+The bounded-old harness releases the old body after observing the new GET at
+the original connection's post-ACK fence, without waiting for `new_result`.
+It retains one `Do`, the 8-second new-request deadline, the same Transport and
+production D1 behavior. In this run, release occurred 25.173 ms after the new
+command. The old 27-byte HTTP/2 response completed intact; its origin connection
+closed naturally, and its tracked runtime/registry/adapter/upstream-task state
+was empty before the new request reached origin. Connection-selection IDs for
+the new GET were `[1, 1, 2]`; the fresh connection returned a complete 26-byte
+HTTP/1.1 200 response. Origin handled that logical GET once, with no deleted
+credential. This proves only the observed cross-connection recovery after the
+old response completed early, not H2-to-H2 migration, recovery for arbitrary
+finite old-response durations, or migration while old remains unfinished.
+
+The repeated held-old case still exhausted its 8-second deadline on connection
+IDs `[1, 1, 1, 1, 1]`, with no new origin handling. Both follow-up cases completed
+normal Go and mitmdump exits, natural origin closure without timeout, empty
+tracked runtime state, and owned-child/socket cleanup. The runner checked
+runtime and origin cleanup before its final retry-success assertion; cleanup
+success does not make the unsuccessful new GET successful. Neither run captured
+Go-peer END_STREAM, GOAWAY or RST frames. The follow-up did not sample
+`goaway_sent=true`, and `proxy_first_goaway_proven` remains false: the timeline
+does not prove GOAWAY initiated migration or establish its wire ordering.
+
+Run artifacts were retained on the test machine; their private local paths are
+not public evidence links. The runner records commit/tree, dependency versions,
+logical outcomes and cleanup in `report.json` and per-case metadata. To reproduce
+the two-case selection using the independently built fixture and pinned venv:
+
+```sh
+GODEBUG= "$PYTHON" components/egress/tests/test_credential_bound_h2_runtime.py \
+  --run-real-runtime --artifacts "$OUT/go-retry-followup" \
+  --go-client "$OUT/h2_retry_client" --require-go-version go1.27.2 \
+  --case go_retry --case go_retry_bounded_old
+```
+
+The MBA runs required explicit user-performed administrator execution after an
+unprivileged port-443 attempt was blocked. Reproduction requires the same
+separately authorized permissions; the command does not bypass that requirement.
+It does not cover the production restricted mitmproxy user or any Linux
+network/quarantine behavior.
+
+The accepted staged delivery is the experimental admission and bounded-drain
+wiring with these limits documented. Complete client-migration acceptance and
+the remaining P2/P3 and Linux matrix are follow-up work, not silently removed
+requirements. No production change to error codes, connection pooling or
+request replay is justified by the bounded-old result.
 
 Rollback is the focused H2 integration commit set, restoring the existing H1
 path while retaining historical evidence. Workflow edits, remote publication,
