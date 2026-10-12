@@ -1252,9 +1252,9 @@ class CredentialBoundH1AuthorityTest(unittest.TestCase):
         )
         self.assertNotIn("Authorization", flow.request.headers)
 
-    def test_http2_denies_in_live_mode(self) -> None:
-        # H2 is outside this phase's scope: the request is denied (killed,
-        # since an H2 body can stream past the local-response size limit).
+    def test_http2_without_instance_adapter_denies_in_live_mode(self) -> None:
+        # H2 cannot acquire a request without the exact raw-identity adapter.
+        # Existing H1 fixtures deliberately do not attach one.
         flow = self._admitted_flow()
         flow.request.http_version = "HTTP/2.0"
         self.system.requestheaders(flow)
