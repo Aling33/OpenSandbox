@@ -386,14 +386,14 @@ func run() int {
 	defer observed.closeRaw()
 	transport := &http.Transport{
 		Proxy: nil, DialContext: socksDialer(*socks, observed),
-		TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: targetHost, MinVersion: tls.VersionTLS12},
+		TLSClientConfig:   &tls.Config{RootCAs: roots, ServerName: targetHost, MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2: true, DisableCompression: true,
 		MaxIdleConns: 2, MaxIdleConnsPerHost: 2,
 		IdleConnTimeout: 10 * time.Second, TLSHandshakeTimeout: 5 * time.Second,
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{
-		Transport: transport,
+		Transport:     transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	out.emit(map[string]any{
