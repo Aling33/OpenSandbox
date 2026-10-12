@@ -5,8 +5,9 @@ description: Approved experimental HTTP/2 admission and drain contract, implemen
 
 # OSEP-0023 HTTP/2 integration
 
-Status: P1 direct/lazy wiring and independent review completed; real-runtime
-acceptance is in progress. This page records the approved experimental
+Status: P1 direct/lazy wiring and independent review completed; the first 15
+manual runtime cases passed, but held-old Go retry acceptance failed. Full
+runtime acceptance is incomplete. This page records the approved experimental
 sidecar contract, not production readiness or deployment approval. Public mode,
 Fast Sandbox, HTTP/3, CONNECT and cross-SNI coalescing remain out of scope.
 
@@ -19,7 +20,8 @@ subsequently approved upgrading the MBA's Go to the latest official stable
 release instead. Each retry run must require and record the exact resulting
 toolchain version, with no fallback to the old installation. This changes the
 selected client version, not the GET-only scope. The verified selected MBA
-toolchain is Go 1.27.2 on darwin/arm64; its retry acceptance remains unrun.
+toolchain is Go 1.27.2 on darwin/arm64; its held-old retry result is described
+below and must not be generalized to other client versions or configurations.
 The existing `LiveReceiver` →
 `RevisionPublisher` → registry/receiver remains the only publication owner and
 keeps Registry → Receiver lock order. The authenticated IPC protocol and exact
@@ -45,6 +47,12 @@ or raise it.
    bound, followed by close. ACK does not wait for this drain.
 4. Expiry force-closes the whole connection and can interrupt newer streams
    after a still-covered-host rotation. That is not graceful completion.
+
+Delayed GOAWAY does not guarantee immediate library-driven migration while an
+old response remains unfinished. In the selected Go 1.27.2 configuration,
+REFUSED_STREAM retries can select the same cached connection until it is
+retired. A new request can exhaust its deadline without reaching the origin.
+The proxy does not replay it or change error codes to influence the pool.
 
 The fixed adapter observes original pseudo-headers before transparent rewriting
 and requires HTTPS, a unique ASCII authority with port 443, the actual target
@@ -120,8 +128,8 @@ slice; there is no second revision owner or general transport framework.
 | --- | --- | --- |
 | P0 | Raw identity, exact hook admission seam, refusal/400/413/cleanup, upstream mapping/queues and termination interfaces | Old STOP retained; targeted D3 amendment independently passed on 2026-10-12 |
 | P1 | Atomic registry races/rollback, actual runtime/hook wiring, snapshot identity, output-obligation lifecycle and bounded cleanup | Direct/lazy scope passed socket-free tests and independent review on 2026-10-12 |
-| P2 | Actual production addon with authenticated Unix IPC, both cutover orders, rotation/removal, reset/disconnect and short/default deadlines | Explicit opt-in partial loopback suite prepared; no fresh runtime result yet |
-| P3 | Fixed Go GET retry observations and approved Linux transparent 443 path, H1/policy/credential regressions, independent review | Missing |
+| P2 | Actual production addon with authenticated Unix IPC, both cutover orders, rotation/removal, reset/disconnect and short/default deadlines | First 15 loopback manual-peer cases passed; broader matrix below remains incomplete |
+| P3 | Fixed Go GET retry observations and approved Linux transparent 443 path, H1/policy/credential regressions, independent review | Go 1.27.2 held-old case failed; bounded-old follow-up unrun; Linux path missing |
 
 Stable coverage denominator:
 
@@ -181,20 +189,58 @@ The first batch contains 15 manual-peer cases: attachment/injection/redaction,
 removal with two backpressured streams, rotation, remove/re-add, reset isolation
 and disconnect, each with genuine H1 and H2 upstreams; short expiry, configured
 default 30-second expiry and the isolated D3 child-exit case add three more.
-The separate Go case is selected by supplying both `--go-client BINARY` and
-`--require-go-version goX.Y.Z`. Build only the standalone
+The separate Go cases are selected by supplying both `--go-client BINARY` and
+`--require-go-version go1.27.2`. Build only the standalone
 `components/egress/tests/fixtures/h2_retry_client.go` with the independently
 verified compiler, `GO111MODULE=off` and `GOTOOLCHAIN=local`; the runner never
 installs a toolchain or infers the expected version from the candidate binary.
 
 Reports retain PASS, FAIL, BLOCKED and NOT_RUN separately for all 15 manual
-cases and the Go case, even when `--case` selects a smaller subset. A successful
+cases and each Go case, even when `--case` selects a smaller subset. A successful
 selected batch is not full P2 acceptance. This batch checks post-ACK refusal,
 not pre-ACK timing or a suspended-hook commit-before-admission race. Fragmented
 HEADERS, upload/queue and stranded-trailer variants, path-only/policy-only
 rotation and the Linux checks above remain explicit gaps. Process reap and
 origin socket closure do not establish kernel quarantine or origin business
 completion.
+
+### Observed Go retry limit and the bounded-old follow-up
+
+The user-executed MBA run used commit
+`38f7dca55139440cc861dcf5e1e25144e84adbaa`, tree
+`39f946563ca06ecbcafcf6a919a04e5d88d4acb1`, with Go 1.27.2. All 15 manual
+cases passed. The original `go_retry` case remains FAIL: the new logical GET
+had one application `Do`, five connection-selection/write callbacks all on
+connection 1, and `deadline_exceeded` at its 8-second budget. The origin
+handled the old GET once and the new GET zero times; the old 27-byte response
+then completed intact. Trace callbacks are not origin-processing counts.
+
+The fixture held the old body until `new_result`, while D1 held normal GOAWAY
+until the old response completed. The observed retries therefore exposed the
+selected library/configuration's limitation while the old stream remained
+occupied. This is not evidence that Go never retries or that a proxy sweep
+failed. The original failure short-circuited its later natural runtime-cleanup
+assertion; finally cleanup does not retroactively satisfy that assertion.
+Go exit cleanup itself closes client connections, so origin closure alone does
+not prove that a proxy GOAWAY initiated closure. No Go-peer raw-frame capture
+was made.
+
+The separate `go_retry_bounded_old` follow-up releases the old body after an
+observed post-ACK request hits the old connection's fence, without waiting for
+`new_result`. It retains one `Do`, the 8-second new-request deadline, the same
+Transport and production D1 behavior. Its purpose is to measure recovery when
+the old response independently completes within the client's retry window.
+It has not run. Even a future success would not establish migration while the
+old response remains unfinished, for arbitrary finite response durations, or
+for other client configurations. The original held-old failure is retained
+separately rather than converted into successful retry acceptance.
+
+The next fixture revision also measures normal client-driven runtime and
+origin cleanup before its final retry-success assertion. This can supplement
+negative-result evidence; it cannot make an unsuccessful new GET successful.
+The MBA run required explicit user-performed administrator execution after an
+unprivileged port-443 attempt was blocked. It does not cover the production
+restricted mitmproxy user or any Linux network/quarantine behavior.
 
 Rollback is the focused H2 integration commit set, restoring the existing H1
 path while retaining historical evidence. Workflow edits, remote publication,

@@ -122,7 +122,13 @@ def requestheaders(flow):
     live = credential_bound.runtime()
     adapter = None if live is None else live.h2_for(flow.client_conn)
     handle = flow.metadata.get("opensandbox_credential_request_handle")
+    values = flow.request.headers.get_all("x-h2-logical-id")
+    logical_id = values[0] if len(values) == 1 and values[0] in ("old", "new") else None
+    state = None if adapter is None else live.registry.drain_state(adapter.token)
     emit("requestheaders", attached=adapter is not None,
+         logical_id=logical_id,
+         connection_serial=None if adapter is None else adapter.token.serial,
+         fenced=None if state is None else state.fenced,
          stream_id=None if handle is None else handle.client_stream_id,
          epoch=None if handle is None else handle.revision.decision_epoch,
          admitted=handle is not None)

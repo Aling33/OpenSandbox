@@ -55,6 +55,11 @@ SMALL_BODY = b"synthetic-production-h2-ok"
 CASES = [f"{name}_{protocol}" for name in (
     "attachment", "removal_drain", "rotation", "remove_readd", "reset_isolation", "disconnect"
 ) for protocol in ("h1", "h2")] + ["expiry_short_h2", "expiry_default_30s_h2", "d3_pending_writer"]
+GO_CASES = ("go_retry", "go_retry_bounded_old")
+GO_SCOPE = {
+    "go_retry": "Old response held until new_result; success requires migration while the old response remains unfinished.",
+    "go_retry_bounded_old": "Old response released after the new GET reaches the post-ACK old-connection fence, before its 8-second retry budget ends. Success would not prove migration while old never finishes or when a finite old response outlasts that budget.",
+}
 MISSING = [
     "Linux transparent redirects and actual original-destination lookup",
     "Restricted mitmproxy user, IPv6 and production CA provisioning",
@@ -856,9 +861,25 @@ def case_d3(harness):
                            "exact_child_wait_completed": True, "go_owner_or_quarantine_claim": False}
 
 
-def case_go_retry(harness, binary, required_version):
+def go_fence_event(events, connection_serial, after_ns):
+    """Match only the bounded synthetic new GET on the known post-ACK fence."""
+    return next((item for item in events
+                 if item.get("kind") == "requestheaders"
+                 and item.get("logical_id") == "new"
+                 and item.get("attached") is True and item.get("admitted") is False
+                 and item.get("fenced") is True
+                 and item.get("connection_serial") == connection_serial
+                 and item.get("monotonic_ns", 0) >= after_ns), None)
+
+
+def case_go_retry(harness, binary, required_version, *, bounded_old=False):
     harness.install(1)
     events = []
+    release_evidence = {"mode": "post_ack_new_fence" if bounded_old else "after_new_result"}
+    normal_cleanup_checked = False
+    cleanup_observation = {"attempted": False, "completed": False,
+                           "scope": "after Go client process exit, before harness teardown",
+                           "client_driven": True, "proxy_first_goaway_proven": False}
     stderr = (harness.root / "go-stderr.log").open("w")
     process = subprocess.Popen(
         [str(binary), "-socks-address", f"127.0.0.1:{harness.proxy_port}",
@@ -892,40 +913,76 @@ def case_go_retry(harness, binary, required_version):
         row = harness.wait_connection(lambda state: bool(state["active"]))
         assert_attached(row)
         old_stream = row["active"][0]["stream_id"]
+        old_connection_serial = row["connection_serial"]
         harness.install(2, None)
         harness.wait_connection(lambda state: state["fenced"] and state["frozen"] == old_stream)
+        new_command_ns = time.monotonic_ns()
         process.stdin.write('{"command":"continue_new"}\n')
         process.stdin.flush()
+        if bounded_old:
+            # This release is driven solely by the verified production fence,
+            # never by the outcome of the new GET or an application retry.
+            fence = wait_for(lambda: go_fence_event(harness.events(), old_connection_serial,
+                                                    max(harness.final_ack_ns, new_command_ns)), timeout=5,
+                             message="bounded-old release did not observe the post-ACK new GET at its old fence")
+            before_result_observed = event("new_result") is None
+            harness.origin.release.set()
+            release_ns = time.monotonic_ns()
+            release_evidence.update(fence_event=fence, ack_ns=harness.final_ack_ns,
+                                    command_ns=new_command_ns, release_signal_ns=release_ns,
+                                    released_before_new_result_observed=before_result_observed,
+                                    elapsed_after_command_seconds=(release_ns - new_command_ns) / 1e9)
         new = wait_for(lambda: event("new_result"), timeout=12,
                        message="Go new GET did not reach its independent bounded result")
-        # Always release the old body even when the selected library does not
-        # retry successfully. Preserve that negative observation in artifacts.
-        harness.origin.release.set()
+        if not bounded_old:
+            # Preserve the original held-old capability case and any negative
+            # result: release only after its independently bounded new result.
+            harness.origin.release.set()
+            release_evidence.update(command_ns=new_command_ns, release_signal_ns=time.monotonic_ns(),
+                                    released_before_new_result_observed=False)
         old = wait_for(lambda: event("old_result"), timeout=8,
                        message="Go old body did not complete after origin release")
         wait_for(lambda: event("done"), timeout=5, message="Go fixture did not finish")
         code = process.wait(timeout=5)
         reader.join(timeout=5)
         require(not reader.is_alive(), "Go stdout reader was not reaped")
+        # The Go helper closes its own connections before normal exit. Verify
+        # runtime and real-origin cleanup BEFORE judging positive retry success,
+        # so the preserved held-old failure still contains cleanup evidence.
+        cleanup_observation.update(attempted=True, go_exit_code=code, normal_exit=code == 0,
+                                   scope=("after normal Go client exit, before harness teardown" if code == 0
+                                          else "after unsuccessful Go client exit, before harness teardown"),
+                                   started_ns=time.monotonic_ns())
+        harness.cleanup["go_cleanup_origin"] = "client_driven_after_Go_process_exit_before_harness_teardown"
+        harness.cleanup["proxy_first_goaway_proven"] = False
+        harness.expect_clean_runtime()
+        normal_cleanup_checked = True
+        cleanup_observation.update(completed=True, finished_ns=time.monotonic_ns())
+        require(harness.process.poll() is None, "Go normal cleanup unexpectedly exited mitmdump")
         require(old["do_calls"] == new["do_calls"] == 1, "Go fixture made application-level replay calls")
         require(old["body_complete"] and old["status"] == 200 and not old["error_class"], "library retry interrupted the old body")
         require(old["body_sha256"] == hashlib.sha256(b"data: synthetic-old-start\n\n").hexdigest(), "Go old streaming body hash differs")
         counts = harness.evidence()["origin_attempt_counts"]
         require(counts.get("old") == 1 and counts.get("new", 0) <= 1, "origin handled a logical GET more than once")
         require(code == 0, "Go fixture did not finish with complete observations")
+        if bounded_old:
+            require(release_evidence["released_before_new_result_observed"]
+                    and release_evidence["elapsed_after_command_seconds"] < 8,
+                    "bounded-old release was not signaled before observed new_result within the 8-second budget")
         require(new["body_complete"] and new["status"] == 200 and not new["error_class"], "selected Go library did not complete a bounded automatic retry")
         require(new["body_sha256"] == hashlib.sha256(SMALL_BODY).hexdigest(), "Go new body hash differs")
         ids = new["connection_ids"]
         require(ids and ids[0] in old["connection_ids"] and any(value not in old["connection_ids"] for value in ids),
                 "Go did not first reuse the fenced connection and then move to a new connection")
-        require(any(item["kind"] == "requestheaders" and not item["admitted"] and item["attached"]
-                    for item in harness.events()), "Go reused-connection request did not reach the production fence")
+        require(go_fence_event(harness.events(), old_connection_serial,
+                               max(harness.final_ack_ns, new_command_ns)) is not None,
+                "Go new logical request did not reach its original connection's post-ACK production fence")
         assert_credential(harness, "/v1/old", "one")
         assert_credential(harness, "/v1/new", "missing")
-        harness.expect_clean_runtime()
     finally:
         harness.origin.release.set()
-        if process.poll() is None:
+        forced_go_cleanup = process.poll() is None
+        if forced_go_cleanup:
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -942,6 +999,16 @@ def case_go_retry(harness, binary, required_version):
                                "exit_code": process.returncode, "exact_child_reaped": process.returncode is not None,
                                "reader_joined": not reader.is_alive(),
                                "events": events, "logical_do_calls_required": 1,
+                               "old_release": release_evidence,
+                               "retry_outcome": {"old_result": event("old_result"),
+                                                 "new_result": event("new_result"),
+                                                 "done": event("done"),
+                                                 "origin_attempt_counts": harness.evidence()["origin_attempt_counts"]},
+                               "cleanup_observation": cleanup_observation,
+                               "normal_cleanup_checked_before_retry_assertion": normal_cleanup_checked,
+                               "forced_go_cleanup": forced_go_cleanup,
+                               "cleanup_scope": "After Go client process exit, before harness teardown; includes client CloseIdleConnections/closeRaw, not proxy-first GOAWAY proof.",
+                               "scope": GO_SCOPE["go_retry_bounded_old" if bounded_old else "go_retry"],
                                "proxy_replay": False, "non_idempotent_guarantee": False}
 
 
@@ -980,9 +1047,9 @@ def preflight(metadata):
 
 
 def run_case(name, artifacts, args):
-    protocol = "h1" if name.endswith("_h1") or name == "go_retry" else "h2"
-    scenario = "d3_pending_server_connected" if name == "d3_pending_writer" else "go_retry" if name == "go_retry" else "normal"
-    seconds = 30 if name == "expiry_default_30s_h2" else 2 if name == "expiry_short_h2" else 20 if name == "go_retry" else 8
+    protocol = "h1" if name.endswith("_h1") or name in GO_CASES else "h2"
+    scenario = "d3_pending_server_connected" if name == "d3_pending_writer" else "go_retry" if name in GO_CASES else "normal"
+    seconds = 30 if name == "expiry_default_30s_h2" else 2 if name == "expiry_short_h2" else 20 if name in GO_CASES else 8
     harness = None
     result = {"case": name, "status": "FAIL", "started_ns": time.monotonic_ns()}
     try:
@@ -992,8 +1059,9 @@ def run_case(name, artifacts, args):
             case_expiry(harness)
         elif name == "d3_pending_writer":
             case_d3(harness)
-        elif name == "go_retry":
-            case_go_retry(harness, args.go_client, args.require_go_version)
+        elif name in GO_CASES:
+            case_go_retry(harness, args.go_client, args.require_go_version,
+                          bounded_old=name == "go_retry_bounded_old")
         else:
             globals()["case_" + name.rsplit("_", 1)[0]](harness)
         require(name == "d3_pending_writer" or harness.process.poll() is None,
@@ -1021,18 +1089,38 @@ def run_case(name, artifacts, args):
     return result
 
 
+def summarize_results(cases, selected):
+    """Keep the manual, held-old and bounded-old evidence denominators distinct."""
+    groups = {"manual_peer": CASES, "go_held_old": ("go_retry",),
+              "go_bounded_old": ("go_retry_bounded_old",)}
+    vocabulary = ("PASS", "FAIL", "BLOCKED", "NOT_RUN")
+
+    def group(names):
+        statuses = [item["status"] for item in cases if item["case"] in names]
+        status = ("FAIL" if "FAIL" in statuses else "BLOCKED" if "BLOCKED" in statuses
+                  else "NOT_RUN" if "NOT_RUN" in statuses or not statuses else "PASS")
+        return {"denominator": len(names), "status": status,
+                "counts": {value: statuses.count(value) for value in vocabulary}}
+
+    return {"status": group(selected)["status"],
+            "summary": {value: sum(item["status"] == value for item in cases)
+                        for value in vocabulary},
+            "denominator_summaries": {name: group(names) for name, names in groups.items()}}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-real-runtime", action="store_true")
     parser.add_argument("--list", action="store_true", help="List the frozen denominator without starting any network")
     parser.add_argument("--artifacts", type=Path)
-    parser.add_argument("--case", action="append", choices=[*CASES, "go_retry"], dest="cases")
+    parser.add_argument("--case", action="append", choices=[*CASES, *GO_CASES], dest="cases")
     parser.add_argument("--go-client", type=Path, help="Previously built, independently verified synthetic Go fixture")
     parser.add_argument("--require-go-version", help="Exact externally verified goX.Y.Z; never inferred from the candidate binary")
     args = parser.parse_args(argv)
     if args.list:
         print(json.dumps({"status": "NOT_RUN", "manual_denominator": CASES,
-                          "optional_client_case": "go_retry", "missing_matrix": MISSING}, indent=2))
+                          "optional_client_cases": GO_CASES, "go_scope": GO_SCOPE,
+                          "missing_matrix": MISSING}, indent=2))
         return 0
     if not args.run_real_runtime:
         print(json.dumps({"status": "NOT_RUN", "reason": "Explicit --run-real-runtime authorization gate was not supplied"}))
@@ -1043,17 +1131,19 @@ def main(argv=None):
         parser.error("--go-client and --require-go-version must be supplied together")
     if args.go_client and not args.go_client.is_file():
         parser.error("--go-client must name an existing previously built fixture")
-    selected = args.cases or [*CASES, *(["go_retry"] if args.go_client else [])]
-    if "go_retry" in selected and not args.go_client:
-        parser.error("go_retry requires --go-client and independently verified --require-go-version")
+    selected = args.cases or [*CASES, *(GO_CASES if args.go_client else [])]
+    if any(name in GO_CASES for name in selected) and not args.go_client:
+        parser.error("Go cases require --go-client and independently verified --require-go-version")
     if len(set(selected)) != len(selected):
         parser.error("duplicate --case selections are not allowed")
     args.artifacts = args.artifacts.resolve()
     args.artifacts.mkdir(mode=0o700, parents=False, exist_ok=False)
     report = {"scope": "P2 production addon / loopback SOCKS5 TLS / authenticated Unix IPC only",
-              "manual_denominator": CASES, "optional_client_case": "go_retry", "missing_matrix": MISSING,
-              "selected": selected, "cases": [{"case": name, "status": "NOT_RUN"} for name in [*CASES, "go_retry"]],
+              "manual_denominator": CASES, "optional_client_cases": GO_CASES, "go_scope": GO_SCOPE,
+              "missing_matrix": MISSING,
+              "selected": selected, "cases": [{"case": name, "status": "NOT_RUN"} for name in [*CASES, *GO_CASES]],
               "status": "NOT_RUN", "fingerprint": fingerprint()}
+    report.update(summarize_results(report["cases"], selected))
     if args.go_client:
         args.go_client = args.go_client.resolve()
         report["go_fixture"] = {"required_go_version": args.require_go_version,
@@ -1074,20 +1164,18 @@ def main(argv=None):
     for name in selected:
         result = run_case(name, args.artifacts, args)
         report["cases"][[item["case"] for item in report["cases"]].index(name)] = result
+        report.update(summarize_results(report["cases"], selected))
         save()
         print(json.dumps({"case": name, "status": result["status"], "reason": result.get("reason")}), flush=True)
         if result["status"] == "BLOCKED":
             # A denied/occupied canonical port is not an invitation to retry
             # through a different route or start the other identical fixtures.
             break
-    statuses = [item["status"] for item in report["cases"] if item["case"] in selected]
-    report["status"] = "FAIL" if "FAIL" in statuses else "BLOCKED" if any(value != "PASS" for value in statuses) else "PASS"
-    report["summary"] = {value: sum(item["status"] == value for item in report["cases"])
-                         for value in ("PASS", "FAIL", "BLOCKED", "NOT_RUN")}
+    report.update(summarize_results(report["cases"], selected))
     save()
     print(json.dumps({"status": report["status"], "summary": report["summary"],
-                      "report": str(destination), "missing_matrix_count": len(MISSING)}), flush=True)
-    return {"PASS": 0, "FAIL": 1, "BLOCKED": 2}[report["status"]]
+                      "denominator_summaries": report["denominator_summaries"], "report": str(destination), "missing_matrix_count": len(MISSING)}), flush=True)
+    return {"PASS": 0, "FAIL": 1, "BLOCKED": 2, "NOT_RUN": 2}[report["status"]]
 
 
 if __name__ == "__main__":
