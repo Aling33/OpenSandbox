@@ -12,21 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run only build-override shell snippets with fixtures and fake commands."""
+"""Check image pins and build snippets without installing packages or Docker."""
 
+import ast
 import os
-from pathlib import Path
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
-
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 RUNS = [line[4:] for line in DOCKERFILE.read_text().replace("\\\n", "").splitlines()
         if line.startswith("RUN ")]
 GOPROXY_RUN = next(run for run in RUNS if "go env -w GOPROXY=" in run)
 APT_RUN = next(run for run in RUNS if "APT_MIRROR" in run).split("&& apt-get update", 1)[0]
+H2_CHECK_RUN = next(run for run in RUNS if "dependency_versions_supported" in run)
+H2_CHECK_CODE = shlex.split(H2_CHECK_RUN)[-1]
+
+
+class DockerfileH2DependencyTests(unittest.TestCase):
+    def test_installed_pins_match_adapter_gate(self):
+        adapter = ast.parse((DOCKERFILE.parent / "mitmscripts" / "credential_bound_h2.py").read_text())
+        pins = next(ast.literal_eval(node.value) for node in adapter.body
+                    if isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "PINS"
+                            for target in node.targets))
+        install = next(run for run in RUNS if "pip3 install" in run)
+        requirements = [token for token in shlex.split(install) if "==" in token]
+        self.assertEqual(sorted(requirements), sorted(f"{name}=={version}" for name, version in pins.items()))
+
+    def test_build_checks_copied_adapter_with_its_runtime_gate(self):
+        dockerfile = DOCKERFILE.read_text()
+        self.assertLess(dockerfile.index("COPY components/egress/mitmscripts"),
+                        dockerfile.index("RUN " + H2_CHECK_RUN.split("    &&", 1)[0].rstrip()))
+        words = shlex.split(H2_CHECK_RUN)
+        self.assertEqual(words[-4:-1], ["PYTHONPATH=/var/egress/mitmscripts", "python3", "-c"])
+        for supported in (True, False):
+            with self.subTest(supported=supported):
+                check = Mock(return_value=supported)
+                module = SimpleNamespace(dependency_versions_supported=check)
+                with (
+                    patch.dict(sys.modules, {"credential_bound_h2": module}),
+                    self.assertRaises(SystemExit) as result,
+                ):
+                    exec(H2_CHECK_CODE, {})  # noqa: S102 - exercise the checked-in Dockerfile's Python check.
+                check.assert_called_once_with()
+                self.assertEqual(result.exception.code,
+                                 0 if supported else "unsupported H2 dependency versions")
+
+    def test_missing_adapter_fails_build_check(self):
+        with (
+            patch.dict(sys.modules, {"credential_bound_h2": None}),
+            self.assertRaises(ModuleNotFoundError),
+        ):
+            exec(H2_CHECK_CODE, {})  # noqa: S102 - exercise the checked-in Dockerfile's Python check.
 
 
 class DockerfileBuildOverrideTests(unittest.TestCase):

@@ -31,6 +31,13 @@ keeps Registry → Receiver lock order. The authenticated IPC protocol and exact
 receiver type are unchanged. No dependency fork, global replacement, raw GOAWAY,
 closed-state reset, or request replay is permitted.
 
+The egress image explicitly installs `mitmproxy==11.0.2`, `h2==4.1.0` and
+`hyperframe==6.0.1`. After copying the addon, its build runs the same exact-version
+gate as the runtime adapter and fails on a missing or mismatched dependency.
+Mitmproxy's transitive version ranges alone are not the image's compatibility
+contract. Changing these pins requires a new adapter compatibility review;
+the runtime gate must not be widened to accommodate an unverified image.
+
 A request is admitted only when the system `requestheaders` hook obtains its
 unique handle and immutable snapshot. Parsing HEADERS does not admit it.
 The registry atomically records the actual inbound client stream ID and its
