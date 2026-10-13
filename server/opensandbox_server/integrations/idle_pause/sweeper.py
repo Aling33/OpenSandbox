@@ -19,8 +19,9 @@ replica per idle episode, and FastPath PauseSandbox is an idempotent CAS, so
 a lost race still converges to a single pause.
 
 Gates (first failure drops the candidate for this sweep): opt-in -> Running
--> expiry -> idle (value / tombstone / unknown) -> probe (declared probes
-are pause-exempt until the probe pipeline lands) -> lock -> re-verify ->
+-> expiry -> idle (value / tombstone / unknown) -> lock -> re-verify ->
+activity probe (declared probes; busy answer records activity, only an
+explicit not-active proceeds, failure drops) -> post-probe re-verify ->
 PauseSandbox. Any Redis failure skips the sweep; the worst case is a missed
 pause, never a lost sandbox.
 """
@@ -30,13 +31,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from opensandbox_server.config import AppConfig
+from opensandbox_server.config import (
+    GATEWAY_ROUTE_MODE_HEADER,
+    GATEWAY_ROUTE_MODE_URI,
+    INGRESS_MODE_GATEWAY,
+    AppConfig,
+)
+from opensandbox_server.api.schema import Endpoint
 from opensandbox_server.integrations.idle_pause.activity import (
     ActivityRegistry,
     ThreadSafeActivityRecorder,
@@ -61,12 +68,21 @@ from opensandbox_server.integrations.idle_pause.logutil import (
     IDLEP_SOURCE_SWEEPER,
     idlep_bundle,
 )
-from opensandbox_server.integrations.idle_pause.metrics import record_pause_request
+from opensandbox_server.integrations.idle_pause.metrics import (
+    record_pause_request,
+    record_probe_outcome,
+)
+from opensandbox_server.integrations.idle_pause.probe import (
+    PROBE_OUTCOME_ACTIVE,
+    PROBE_OUTCOME_ERROR,
+    ActivityProber,
+)
 from opensandbox_server.integrations.idle_pause.redis_client import (
     close_idle_pause_redis_client,
     connect_idle_pause_redis_from_config,
 )
 from opensandbox_server.services.composite_service import CompositeSandboxService
+from opensandbox_server.services.fast_sandbox.endpoint import build_endpoint
 from opensandbox_server.services.fast_sandbox.service import FastSandboxService
 
 logger = logging.getLogger(__name__)
@@ -84,7 +100,6 @@ class SweepStats:
     gated: int = 0
     tombstoned: int = 0
     failed: int = 0
-    details: list[str] = field(default_factory=list)
 
 
 class IdlePauseSweeper:
@@ -102,6 +117,8 @@ class IdlePauseSweeper:
         lock_owner: Optional[str] = None,
         clock: Callable[[], int] = _default_clock,
         owned_redis: Optional[Redis] = None,
+        prober: Optional[ActivityProber] = None,
+        owned_prober: bool = False,
     ) -> None:
         # Re-resolved every sweep: tenants hot-reload and HTTP providers may
         # enumerate late.
@@ -113,6 +130,10 @@ class IdlePauseSweeper:
         self._interval = float(sweep_interval_seconds)
         self._lock_owner = lock_owner or f"sweeper-{id(self):x}"
         self._clock = clock
+        # None keeps probe-declared candidates pause-exempt (no gateway routing).
+        self._prober = prober
+        # Injected probers stay their caller's, mirroring owned_redis.
+        self._owned_prober = owned_prober
         # Set only when this sweeper created the client; caller-supplied
         # clients stay the caller's to close.
         self._owned_redis = owned_redis
@@ -133,6 +154,11 @@ class IdlePauseSweeper:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
+        if self._prober is not None and self._owned_prober:
+            try:
+                await self._prober.aclose()
+            except Exception as exc:  # noqa: BLE001 - shutdown must proceed
+                logger.debug(f"idle_pause prober close deferred error={exc!s}")
         if self._owned_redis is not None:
             client, self._owned_redis = self._owned_redis, None
             try:
@@ -261,12 +287,11 @@ class IdlePauseSweeper:
         ):
             return
 
-        # A declared probe must veto busy sandboxes; until the probe pipeline
-        # lands, declaring one keeps the sandbox pause-exempt.
-        if candidate.policy.active_probe is not None:
+        # No prober: a declared probe means ingress observation alone must
+        # not pause this workload — stay exempt.
+        if candidate.policy.active_probe is not None and self._prober is None:
             record_pause_request(outcome="gated")
             stats.gated += 1
-            stats.details.append(f"{candidate.sandbox_id}:active_probe_declared")
             return
 
         try:
@@ -289,7 +314,6 @@ class IdlePauseSweeper:
         if not acquired:
             record_pause_request(outcome="gated")
             stats.gated += 1
-            stats.details.append(f"{candidate.sandbox_id}:lock_contended")
             return
         try:
             # Re-verify under lock: a request may have landed since the batch
@@ -312,10 +336,40 @@ class IdlePauseSweeper:
             if current != last_active_ms:
                 record_pause_request(outcome="gated")
                 stats.gated += 1
-                stats.details.append(f"{candidate.sandbox_id}:activity_changed")
                 return
 
-            await self._issue_pause(candidate, threshold, now_ms, last_active_ms, stats)
+            # Activity probe: a busy answer records activity, only an
+            # explicit not-active proceeds, any failure drops. Re-verify
+            # after: the probe spans seconds, so a request may have landed
+            # while it ran.
+            probe_note: Optional[str] = None
+            if candidate.policy.active_probe is not None:
+                probe_note = await self._run_probe(candidate, stats)
+                if probe_note is None:
+                    return
+                try:
+                    current = await self._activity.read(candidate.sandbox_id)
+                except (RedisError, OSError) as exc:
+                    line, ex = idlep_bundle(
+                        event=IDLEP_EVENT_SWEEP_SKIPPED,
+                        source=IDLEP_SOURCE_SWEEPER,
+                        sandbox_id=candidate.sandbox_id,
+                        namespace=candidate.namespace,
+                        skip_reason="post_probe_read_failed",
+                        error_type=type(exc).__name__,
+                    )
+                    logger.warning(f"idle_pause {line} error={exc!s}", extra=ex)
+                    record_pause_request(outcome="gated")
+                    stats.gated += 1
+                    return
+                if current != last_active_ms:
+                    record_pause_request(outcome="gated")
+                    stats.gated += 1
+                    return
+
+            await self._issue_pause(
+                candidate, threshold, now_ms, last_active_ms, stats, probe_note=probe_note
+            )
         finally:
             # Best-effort; TTL is the primary release path.
             try:
@@ -401,6 +455,36 @@ class IdlePauseSweeper:
             return False
         return True
 
+    async def _run_probe(self, candidate: SandboxCandidate, stats: SweepStats) -> Optional[str]:
+        """Run the probe; return the pause-audit note, or None to drop the
+        candidate (busy answer, probe failure, or timeout)."""
+        assert self._prober is not None
+        verdict = await self._prober.probe(candidate)
+        record_probe_outcome(outcome=verdict.outcome)
+        if verdict.outcome == PROBE_OUTCOME_ACTIVE:
+            try:
+                await self._activity.record(candidate.sandbox_id, now_ms=self._clock())
+            except (RedisError, OSError) as exc:
+                # The observation write failed, but the verdict stands: this
+                # sweep still drops the candidate (never a pause on "active").
+                line, ex = idlep_bundle(
+                    event=IDLEP_EVENT_SWEEP_SKIPPED,
+                    source=IDLEP_SOURCE_SWEEPER,
+                    sandbox_id=candidate.sandbox_id,
+                    namespace=candidate.namespace,
+                    skip_reason="probe_active_record_failed",
+                    error_type=type(exc).__name__,
+                )
+                logger.warning(f"idle_pause {line} error={exc!s}", extra=ex)
+            record_pause_request(outcome="gated")
+            stats.gated += 1
+            return None
+        if verdict.outcome == PROBE_OUTCOME_ERROR:
+            record_pause_request(outcome="gated")
+            stats.gated += 1
+            return None
+        return verdict.audit_note()
+
     async def _issue_pause(
         self,
         candidate: SandboxCandidate,
@@ -408,6 +492,7 @@ class IdlePauseSweeper:
         judged_at_ms: int,
         last_active_ms: Optional[int],
         stats: SweepStats,
+        probe_note: Optional[str] = None,
     ) -> None:
         outcome = await asyncio.to_thread(self._executor.pause, candidate)
         if outcome == PauseOutcome.ACCEPTED:
@@ -426,16 +511,15 @@ class IdlePauseSweeper:
                 threshold_seconds=threshold,
                 last_observation_age=observation_age,
                 tombstoned=bool(last_active_ms is None),
+                probe_verdict=probe_note,
             )
             logger.info(f"idle_pause {line}", extra=ex)
         elif outcome in (PauseOutcome.STATE_CHANGED, PauseOutcome.NOT_FOUND):
             record_pause_request(outcome="gated")
             stats.gated += 1
-            stats.details.append(f"{candidate.sandbox_id}:{outcome.value}")
         else:
             record_pause_request(outcome="failed")
             stats.failed += 1
-            stats.details.append(f"{candidate.sandbox_id}:{outcome.value}")
 
 
 async def start_idle_pause_sweeper(
@@ -447,12 +531,12 @@ async def start_idle_pause_sweeper(
 ) -> Optional[IdlePauseSweeper]:
     """Build and start the sweeper, or return ``None`` when it must not run.
 
-    Requires ``[idle_pause].enabled``, the fsb (kubernetes) runtime, and a
+    Requires ``[automation.idle_pause].enabled``, the fsb (kubernetes) runtime, and a
     Redis connection (malformed DSN degrades the same way — fail toward
     "not pausing"). A client created here is closed by the sweeper's
     ``stop()``; a caller-supplied client stays the caller's.
     """
-    if not app_config.idle_pause.enabled:
+    if not app_config.automation.idle_pause.enabled:
         return None
     if app_config.runtime.type != "kubernetes":
         logger.info("idle_pause disabled for non-kubernetes runtime (fsb backend only)")
@@ -476,16 +560,20 @@ async def start_idle_pause_sweeper(
             return None
         owned_redis = redis_client is not None
         if redis_client is None:
-            logger.info("idle_pause redis disabled; sweeper not started")
+            logger.info("idle_pause redis dsn missing; sweeper not started")
             return None
 
-    ip = app_config.idle_pause
+    ip = app_config.automation.idle_pause
     registry = ActivityRegistry(redis_client, activity_ttl_seconds=ip.activity_ttl_seconds)
     # OSEP-0024: the server actor records an activity observation on create
     # and resume so the idle clock restarts from the lifecycle transition.
     fsb.set_activity_recorder(
         ThreadSafeActivityRecorder(registry, asyncio.get_running_loop())
     )
+    # The activity-probe pipeline routes through the ingress gateway like any
+    # client request; without gateway routing the prober stays None and
+    # probe-declared candidates remain pause-exempt.
+    prober = _build_activity_prober(app_config)
     sweeper = IdlePauseSweeper(
         namespace_resolver=namespace_resolver,
         inventory=FastSandboxInventory(fsb.cr_reader),
@@ -494,11 +582,32 @@ async def start_idle_pause_sweeper(
         executor=FastPathPauseExecutor(fsb.fastpath_client),
         sweep_interval_seconds=ip.sweep_interval_seconds,
         owned_redis=redis_client if owned_redis else None,
+        prober=prober,
+        owned_prober=prober is not None,
     )
     sweeper.start()
     logger.info(
         f"idle_pause sweeper started namespaces={list(dict.fromkeys(namespace_resolver()))} "
         f"sweep_interval={ip.sweep_interval_seconds} "
-        f"activity_ttl={ip.activity_ttl_seconds}"
+        f"activity_ttl={ip.activity_ttl_seconds} "
+        f"prober={'enabled' if prober is not None else 'unavailable'}"
     )
     return sweeper
+
+
+def _build_activity_prober(app_config: AppConfig) -> Optional[ActivityProber]:
+    """Build the probe client, or None when probes cannot be routed."""
+    ingress = app_config.ingress
+    if (
+        ingress is None
+        or ingress.mode != INGRESS_MODE_GATEWAY
+        or ingress.gateway is None
+        or ingress.gateway.route.mode not in (GATEWAY_ROUTE_MODE_HEADER, GATEWAY_ROUTE_MODE_URI)
+        or ingress.secure_access is None
+    ):
+        return None
+
+    def build(namespace: str, sandbox_id: str, port: int) -> Endpoint:
+        return build_endpoint(ingress, namespace, sandbox_id, port)
+
+    return ActivityProber(endpoint_builder=build)

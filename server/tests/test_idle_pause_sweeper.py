@@ -16,11 +16,19 @@
 
 from datetime import datetime, timedelta, timezone
 import logging
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
 from redis.exceptions import RedisError
 
+from opensandbox_server.config import (
+    GatewayConfig,
+    GatewayRouteModeConfig,
+    IngressConfig,
+    SecureAccessConfig,
+    SecureAccessKey,
+)
 from opensandbox_server.integrations.idle_pause.activity import (
     ActivityRegistry,
     unknown_tombstone_key,
@@ -33,7 +41,15 @@ from opensandbox_server.integrations.idle_pause.policy import (
     IdlePolicy,
     validate_idle_policy,
 )
-from opensandbox_server.integrations.idle_pause.sweeper import IdlePauseSweeper
+from opensandbox_server.integrations.idle_pause.probe import (
+    PROBE_OUTCOME_ACTIVE,
+    PROBE_OUTCOME_ERROR,
+    PROBE_OUTCOME_NOT_ACTIVE,
+)
+from opensandbox_server.integrations.idle_pause.sweeper import (
+    IdlePauseSweeper,
+    _build_activity_prober,
+)
 from tests.test_idle_pause_activity import FakeAsyncRedis
 
 NOW_MS = 1_000_000_000_000
@@ -90,6 +106,7 @@ def _sweeper(
     *,
     clock_now: int = NOW_MS,
     namespaces: Optional[list[str]] = None,
+    prober: Optional[object] = None,
 ) -> IdlePauseSweeper:
     return IdlePauseSweeper(
         namespace_resolver=lambda: namespaces or ["ns"],
@@ -99,6 +116,7 @@ def _sweeper(
         executor=executor,  # type: ignore[arg-type]
         sweep_interval_seconds=15,
         clock=lambda: clock_now,
+        prober=prober,  # type: ignore[arg-type]
     )
 
 
@@ -269,6 +287,116 @@ async def test_declared_probe_gates_pause_until_probe_pipeline_lands():
         candidate.sandbox_id, now_ms=NOW_MS - (X + 10) * 1000
     )
     stats = await sweeper.sweep_once()
+    assert executor.calls == []
+    assert stats.gated == 1
+
+
+class _StubProber:
+    """Scripted prober; optionally records activity while probing."""
+
+    def __init__(self, verdicts: list[tuple[str, Optional[str]]], record_during_probe=None):
+        self.verdicts = list(verdicts)
+        self.probed: list[SandboxCandidate] = []
+        self.record_during_probe = record_during_probe
+
+    async def probe(self, candidate: SandboxCandidate):
+        self.probed.append(candidate)
+        if self.record_during_probe is not None:
+            await self.record_during_probe(candidate)
+        outcome, message = self.verdicts.pop(0)
+        from opensandbox_server.integrations.idle_pause.probe import ProbeVerdict
+
+        return ProbeVerdict(outcome, message)
+
+    async def aclose(self) -> None:
+        pass
+
+
+def _probe_candidate() -> SandboxCandidate:
+    return _candidate(policy=_policy(active_probe=ActivityProbe(port=8080, path="/active")))
+
+
+@pytest.mark.asyncio
+async def test_probe_active_answer_records_activity_and_drops_candidate():
+    redis = FakeAsyncRedis()
+    candidate = _probe_candidate()
+    executor = FakeExecutor()
+    registry = ActivityRegistry(redis, activity_ttl_seconds=1800)  # type: ignore[arg-type]
+    await registry.record(candidate.sandbox_id, now_ms=NOW_MS - (X + 10) * 1000)
+    prober = _StubProber(
+        [(PROBE_OUTCOME_ACTIVE, None)],
+        record_during_probe=lambda _c: registry.record(
+            candidate.sandbox_id, now_ms=NOW_MS
+        ),
+    )
+    sweeper = _sweeper([candidate], redis, executor, prober=prober)
+
+    stats = await sweeper.sweep_once()
+    await sweeper.stop()
+
+    assert executor.calls == []
+    assert stats.gated == 1
+    # The busy answer IS activity: the key now carries the fresh observation.
+    assert await registry.read(candidate.sandbox_id) == NOW_MS
+
+
+@pytest.mark.asyncio
+async def test_probe_not_active_answer_lets_pause_proceed():
+    redis = FakeAsyncRedis()
+    candidate = _probe_candidate()
+    executor = FakeExecutor()
+    await ActivityRegistry(redis, activity_ttl_seconds=1800).record(  # type: ignore[arg-type]
+        candidate.sandbox_id, now_ms=NOW_MS - (X + 10) * 1000
+    )
+    prober = _StubProber([(PROBE_OUTCOME_NOT_ACTIVE, "cron loop idle")])
+    sweeper = _sweeper([candidate], redis, executor, prober=prober)
+
+    stats = await sweeper.sweep_once()
+    await sweeper.stop()
+
+    assert len(executor.calls) == 1
+    assert stats.paused == 1
+    assert stats.gated == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_error_drops_candidate_without_pause():
+    redis = FakeAsyncRedis()
+    candidate = _probe_candidate()
+    executor = FakeExecutor()
+    await ActivityRegistry(redis, activity_ttl_seconds=1800).record(  # type: ignore[arg-type]
+        candidate.sandbox_id, now_ms=NOW_MS - (X + 10) * 1000
+    )
+    prober = _StubProber([(PROBE_OUTCOME_ERROR, None)])
+    sweeper = _sweeper([candidate], redis, executor, prober=prober)
+
+    stats = await sweeper.sweep_once()
+    await sweeper.stop()
+
+    assert executor.calls == []
+    assert stats.gated == 1
+
+
+@pytest.mark.asyncio
+async def test_request_landing_during_probe_drops_candidate():
+    redis = FakeAsyncRedis()
+    candidate = _probe_candidate()
+    executor = FakeExecutor()
+    registry = ActivityRegistry(redis, activity_ttl_seconds=1800)  # type: ignore[arg-type]
+    await registry.record(candidate.sandbox_id, now_ms=NOW_MS - (X + 10) * 1000)
+    prober = _StubProber(
+        [(PROBE_OUTCOME_NOT_ACTIVE, None)],
+        record_during_probe=lambda _c: registry.record(
+            candidate.sandbox_id, now_ms=NOW_MS
+        ),
+    )
+    sweeper = _sweeper([candidate], redis, executor, prober=prober)
+
+    stats = await sweeper.sweep_once()
+    await sweeper.stop()
+
+    # The second re-verify catches the observation that landed while the
+    # probe ran: no pause, next sweep re-evaluates.
     assert executor.calls == []
     assert stats.gated == 1
 
@@ -509,6 +637,7 @@ def _async_returning(value):
 def _idle_pause_config():
     from opensandbox_server.config import (
         AppConfig,
+        AutomationConfig,
         IdlePauseConfig,
         IdlePauseRedisConfig,
         RuntimeConfig,
@@ -516,9 +645,11 @@ def _idle_pause_config():
 
     return AppConfig(
         runtime=RuntimeConfig(type="kubernetes", execd_image="x"),
-        idle_pause=IdlePauseConfig(
-            enabled=True,
-            redis=IdlePauseRedisConfig(enabled=True, dsn="redis://127.0.0.1:6379/5"),
+        automation=AutomationConfig(
+            idle_pause=IdlePauseConfig(
+                enabled=True,
+                redis=IdlePauseRedisConfig(dsn="redis://127.0.0.1:6379/5"),
+            )
         ),
     )
 
@@ -600,3 +731,61 @@ async def test_tombstone_clear_failure_is_fail_safe():
 
     assert len(executor.calls) == 1  # value-based decision unaffected
     assert stats.paused == 1
+
+
+def _ingress(route_mode: str) -> IngressConfig:
+    address = "*.gw.example.com" if route_mode == "wildcard" else "gw.example.com"
+    return IngressConfig(
+        mode="gateway",
+        gateway=GatewayConfig(
+            address=address,
+            route=GatewayRouteModeConfig(mode=route_mode),
+        ),
+        secure_access=SecureAccessConfig(
+            active_key="a",
+            keys=[SecureAccessKey(key_id="a", key="c2VjcmV0")],
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("route_mode", "expected"),
+    [
+        ("header", True),
+        ("uri", True),
+        # wildcard is a legal gateway mode but build_endpoint cannot route
+        # probes there; the prober must stay unbuilt so declared-probe
+        # candidates keep the pause-unavailable exemption.
+        ("wildcard", False),
+    ],
+)
+def test_prober_build_follows_gateway_route_mode(route_mode, expected):
+    app_config = SimpleNamespace(ingress=_ingress(route_mode))
+    prober = _build_activity_prober(app_config)  # type: ignore[arg-type]
+    assert (prober is not None) is expected
+
+
+@pytest.mark.asyncio
+async def test_stop_leaves_injected_prober_open():
+    class _OwnedTrackingProber(_StubProber):
+        def __init__(self):
+            super().__init__([(PROBE_OUTCOME_NOT_ACTIVE, None)])
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    redis = FakeAsyncRedis()
+    candidate = _probe_candidate()
+    executor = FakeExecutor()
+    await ActivityRegistry(redis, activity_ttl_seconds=1800).record(  # type: ignore[arg-type]
+        candidate.sandbox_id, now_ms=NOW_MS - (X + 10) * 1000
+    )
+    prober = _OwnedTrackingProber()
+    sweeper = _sweeper([candidate], redis, executor, prober=prober)
+
+    await sweeper.sweep_once()
+    await sweeper.stop()
+
+    assert len(executor.calls) == 1
+    assert prober.closed is False  # injected probers stay their caller's
