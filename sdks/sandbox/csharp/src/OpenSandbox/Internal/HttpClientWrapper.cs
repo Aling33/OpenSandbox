@@ -270,12 +270,13 @@ internal sealed class HttpClientWrapper
     /// <summary>
     /// Sends a file transfer request (upload or download).
     /// When a transfer client is configured, the transfer is not capped by the connection request
-    /// timeout, so a large file or a slow link is not aborted while data keeps flowing. The wait
-    /// for response headers is still bounded: for a request without a body the deadline starts
-    /// with the request, and for an upload it starts once the body has been sent, so a server
-    /// that stops responding fails the transfer instead of hanging it. The response body is read
-    /// with the caller token; a caller that wants the whole transfer bounded passes a
-    /// CancellationToken.
+    /// timeout, so a large file or a slow link is not aborted while data keeps flowing. A positive
+    /// header timeout still bounds the wait for response headers: for a request without a body the
+    /// deadline starts with the request, and for an upload it starts once the body of the current
+    /// hop has been sent (a redirect re-arms it per hop), so a server that stops responding fails
+    /// the transfer instead of hanging it. Without a header timeout the transfer is bounded only
+    /// by the caller token. The response body is read with the caller token; a caller that wants
+    /// the whole transfer bounded passes a CancellationToken.
     /// </summary>
     public async Task<HttpResponseMessage> SendTransferAsync(
         HttpRequestMessage request,
@@ -289,34 +290,35 @@ internal sealed class HttpClientWrapper
         ApplyDefaultHeaders(request);
 
         var transferClient = _transferHttpClient;
-        var headerTimeout = _transferHeaderTimeout;
-        if (transferClient is null || headerTimeout is null || headerTimeout.Value <= TimeSpan.Zero)
+        if (transferClient is null)
         {
             _logger.LogDebug("HTTP {Method} {Url} (transfer, shared client)", request.Method, request.RequestUri);
             return await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         }
 
+        if (_transferHeaderTimeout is not { } headerTimeout || headerTimeout <= TimeSpan.Zero)
+        {
+            // A configured transfer client never falls back to the shared client's whole-call
+            // request timeout; without a positive header timeout there is no deadline at all and
+            // the caller token is the only bound.
+            _logger.LogDebug("HTTP {Method} {Url} (transfer, no header timeout)", request.Method, request.RequestUri);
+            return await transferClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        }
+
         var headerDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         if (request.Content is null)
         {
-            headerDeadline.CancelAfter(headerTimeout.Value);
+            headerDeadline.CancelAfter(headerTimeout);
         }
         else
         {
-            // Arm the header deadline only after the body has been written: the body send of an
-            // upload (large file, slow link) must not count against it.
-            request.Content = new BodySentSignalingContent(request.Content, () =>
-            {
-                try
-                {
-                    // A duplex transport can deliver the response before the body has been fully
-                    // written, in which case the deadline is already gone and arming it is moot.
-                    headerDeadline.CancelAfter(headerTimeout.Value);
-                }
-                catch (ObjectDisposedException)
-                {
-                }
-            });
+            // The header deadline stays off while the body is being written - a large file or a
+            // slow link must not count its own upload time against it - and is cleared again
+            // before each hop of a redirect re-serializes the body.
+            request.Content = new BodySentSignalingContent(
+                request.Content,
+                onBodySendStarted: () => DisarmHeaderDeadline(headerDeadline),
+                onBodySent: () => ArmHeaderDeadline(headerDeadline, headerTimeout));
         }
 
         try
@@ -328,8 +330,35 @@ internal sealed class HttpClientWrapper
         {
             // Response headers have arrived (or the send failed): stop the header deadline and
             // release the linked registration. Body reads use the caller token, so they stay
-            // cancellable and are never bounded by the header deadline.
+            // cancellable and are never bounded by the header deadline. A duplex transport can
+            // still be writing the request body here, but HttpClient seals the request token when
+            // the send returns, so a caller cancellation after this point cannot reach that write
+            // whether or not the deadline is still alive.
             headerDeadline.Dispose();
+        }
+    }
+
+    private static void ArmHeaderDeadline(CancellationTokenSource headerDeadline, TimeSpan headerTimeout)
+    {
+        try
+        {
+            headerDeadline.CancelAfter(headerTimeout);
+        }
+        catch (ObjectDisposedException)
+        {
+            // The send has already returned and released the deadline: arming it is moot.
+        }
+    }
+
+    private static void DisarmHeaderDeadline(CancellationTokenSource headerDeadline)
+    {
+        try
+        {
+            headerDeadline.CancelAfter(Timeout.InfiniteTimeSpan);
+        }
+        catch (ObjectDisposedException)
+        {
+            // The send has already returned and released the deadline.
         }
     }
 
@@ -368,6 +397,34 @@ internal sealed class HttpClientWrapper
         }
 
         return buffer.ToArray();
+    }
+
+    /// <summary>
+    /// Reads a response body as a string with the caller token. Transfer responses are sent with
+    /// <see cref="HttpCompletionOption.ResponseHeadersRead"/>, so their bodies are not buffered
+    /// by the transport and a stalled body must stay cancellable instead of blocking the caller.
+    /// </summary>
+    internal static async Task<string> ReadContentStringAsync(HttpContent content, CancellationToken cancellationToken)
+    {
+#if NET5_0_OR_GREATER
+        return await content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+#else
+        var bytes = await ReadContentBytesAsync(content, cancellationToken).ConfigureAwait(false);
+        var charset = content.Headers.ContentType?.CharSet;
+        if (!string.IsNullOrEmpty(charset))
+        {
+            try
+            {
+                return Encoding.GetEncoding(charset!.Trim('"')).GetString(bytes);
+            }
+            catch (ArgumentException)
+            {
+                // Unknown charset: fall back to the UTF-8 default of HttpContent.
+            }
+        }
+
+        return Encoding.UTF8.GetString(bytes);
+#endif
     }
 
     private string BuildUrl(string path, Dictionary<string, string?>? queryParams = null)
@@ -433,7 +490,7 @@ internal sealed class HttpClientWrapper
     {
         if (!response.IsSuccessStatusCode)
         {
-            var content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            var content = await ReadContentStringAsync(response.Content, cancellationToken).ConfigureAwait(false);
             LogHttpFailure(response);
             ThrowApiException(response, content);
         }

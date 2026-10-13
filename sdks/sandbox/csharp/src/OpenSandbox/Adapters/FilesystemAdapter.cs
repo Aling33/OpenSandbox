@@ -173,7 +173,9 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles
 
         if (!response.IsSuccessStatusCode)
         {
-            var content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            // The error body is streamed, not buffered: read it with the caller token so a
+            // stalled body cannot block the caller past its cancellation.
+            var content = await HttpClientWrapper.ReadContentStringAsync(response.Content, cancellationToken).ConfigureAwait(false);
             var requestId = response.Headers.TryGetValues(Constants.RequestIdHeader, out var values)
                 ? values.FirstOrDefault()
                 : null;
@@ -256,7 +258,7 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles
 
         if (!response.IsSuccessStatusCode)
         {
-            var content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            var content = await HttpClientWrapper.ReadContentStringAsync(response.Content, cancellationToken).ConfigureAwait(false);
             var requestId = response.Headers.TryGetValues(Constants.RequestIdHeader, out var values)
                 ? values.FirstOrDefault()
                 : null;

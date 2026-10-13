@@ -17,19 +17,23 @@ using System.Net;
 namespace OpenSandbox.Internal;
 
 /// <summary>
-/// Wraps request content to signal when the request body has been fully written to the wire.
-/// <see cref="HttpClientWrapper.SendTransferAsync"/> uses the signal to start the
-/// response-header deadline of a file upload only after the body has been sent, so a slow
-/// upload is not aborted by the time its own body takes.
+/// Wraps request content to signal when a request-body serialization starts and when the body
+/// has been fully written to the wire. <see cref="HttpClientWrapper.SendTransferAsync"/> uses
+/// the signals to keep the response-header deadline of a file upload off while the body is being
+/// sent: a slow upload is not aborted by the time its own body takes, the deadline is re-armed
+/// per hop of a redirect, and a duplex transport that already delivered the response leaves the
+/// deadline disarmed.
 /// </summary>
 internal sealed class BodySentSignalingContent : HttpContent
 {
     private readonly HttpContent _inner;
+    private readonly Action _onBodySendStarted;
     private readonly Action _onBodySent;
 
-    public BodySentSignalingContent(HttpContent inner, Action onBodySent)
+    public BodySentSignalingContent(HttpContent inner, Action onBodySendStarted, Action onBodySent)
     {
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        _onBodySendStarted = onBodySendStarted ?? throw new ArgumentNullException(nameof(onBodySendStarted));
         _onBodySent = onBodySent ?? throw new ArgumentNullException(nameof(onBodySent));
 
         foreach (var header in inner.Headers)
@@ -40,6 +44,9 @@ internal sealed class BodySentSignalingContent : HttpContent
 
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
     {
+        // A redirect serializes the content once per hop: clear the deadline armed by the
+        // previous hop before this hop's body is sent.
+        _onBodySendStarted();
 #if NET5_0_OR_GREATER
         await _inner.CopyToAsync(stream, context, CancellationToken.None).ConfigureAwait(false);
 #else
@@ -58,6 +65,7 @@ internal sealed class BodySentSignalingContent : HttpContent
         TransportContext? context,
         CancellationToken cancellationToken)
     {
+        _onBodySendStarted();
         await _inner.CopyToAsync(stream, context, cancellationToken).ConfigureAwait(false);
         _onBodySent();
     }

@@ -21,6 +21,7 @@ using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using OpenSandbox.Config;
 using OpenSandbox.Factory;
+using OpenSandbox.Internal;
 using OpenSandbox.Models;
 using OpenSandbox.Services;
 using Xunit;
@@ -283,6 +284,124 @@ public class FilesystemTransferTimeoutTests
         transfer.Timeout.Should().Be(Timeout.InfiniteTimeSpan);
     }
 
+    [Fact]
+    public async Task RedirectedUploadBodySendIsNotCappedByThePreviousHopsDeadline()
+    {
+        // A 307/308 makes the transport serialize the same request content once per hop, so the
+        // deadline armed after the first hop's body send is still ticking while the second hop's
+        // body is written. The handler reproduces that double serialization; the slow sink keeps
+        // the second hop's body send past RequestTimeoutSeconds while every individual write
+        // stays far inside it, and the response follows immediately afterwards.
+        var handler = new RedirectEmulatingHandler();
+        using var shared = new HttpClient { Timeout = TimeSpan.FromSeconds(RequestTimeoutSeconds) };
+        using var transfer = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+        var wrapper = new HttpClientWrapper(
+            shared,
+            "http://127.0.0.1:1",
+            transferHttpClient: transfer,
+            transferHeaderTimeout: TimeSpan.FromSeconds(RequestTimeoutSeconds));
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "http://127.0.0.1:1/files/upload")
+        {
+            Content = new ByteArrayContent(new byte[512 * 1024]),
+        };
+
+        var elapsed = Stopwatch.StartNew();
+        using var response = await wrapper.SendTransferAsync(request);
+        elapsed.Stop();
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        handler.Serializations.Should().Be(2, "a redirect serializes the body once per hop");
+        elapsed.Elapsed.Should().BeGreaterThan(
+            TimeSpan.FromSeconds(RequestTimeoutSeconds),
+            "the second hop's body send has to outlive the request timeout");
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(0)]
+    public async Task ConfiguredTransferClientWithoutHeaderTimeoutKeepsTransfersUncapped(int? headerTimeoutSeconds)
+    {
+        await using var server = new LoopbackHttpServer();
+        server.OnRequest(async (stream, _, cancellationToken) =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
+            await WriteResponseAsync(stream, "ok");
+        });
+        var serving = server.ServeIgnoringClientAbortsAsync();
+
+        TimeSpan? headerTimeout = headerTimeoutSeconds is { } seconds
+            ? TimeSpan.FromSeconds(seconds)
+            : null;
+        using var shared = new HttpClient { Timeout = TimeSpan.FromSeconds(RequestTimeoutSeconds) };
+        using var transfer = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        var wrapper = new HttpClientWrapper(
+            shared,
+            FormattableString.Invariant($"http://127.0.0.1:{server.Port}"),
+            transferHttpClient: transfer,
+            transferHeaderTimeout: headerTimeout);
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Get,
+            FormattableString.Invariant($"http://127.0.0.1:{server.Port}/files/download?path=%2Ftmp%2Ff.bin"));
+        using var response = await wrapper.SendTransferAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        await serving;
+    }
+
+    [Fact]
+    public async Task DownloadErrorBodyHonorsCallerCancellation()
+    {
+        await using var server = new LoopbackHttpServer();
+        server.OnRequest((stream, _, cancellationToken) => WriteStalledErrorAsync(stream, cancellationToken));
+        var serving = server.ServeIgnoringClientAbortsAsync();
+
+        var (files, provider) = CreateFiles(server.Port);
+        using var _ = provider;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        var download = files.ReadBytesAsync("/tmp/failure.bin", null, cts.Token);
+        var elapsed = Stopwatch.StartNew();
+        await FluentActions.Awaiting(() => download.WaitAsync(ResponseBound))
+            .Should().ThrowAsync<OperationCanceledException>();
+        elapsed.Stop();
+
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "a caller token must release a transfer error body that stops making progress");
+        await serving;
+    }
+
+    [Fact]
+    public async Task UploadErrorBodyHonorsCallerCancellation()
+    {
+        await using var server = new LoopbackHttpServer();
+        server.OnRequest(async (stream, head, cancellationToken) =>
+        {
+            await ReadRequestBodyAsync(stream, head);
+            await WriteStalledErrorAsync(stream, cancellationToken);
+        });
+        var serving = server.ServeIgnoringClientAbortsAsync();
+
+        var (files, provider) = CreateFiles(server.Port);
+        using var _ = provider;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        var upload = files.WriteFilesAsync(
+            new[] { new WriteEntry { Path = "/tmp/failure.bin", Data = new byte[1024] } },
+            cts.Token);
+        var elapsed = Stopwatch.StartNew();
+        await FluentActions.Awaiting(() => upload.WaitAsync(ResponseBound))
+            .Should().ThrowAsync<OperationCanceledException>();
+        elapsed.Stop();
+
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "a caller token must release a transfer error body that stops making progress");
+        await serving;
+    }
+
     private static (ISandboxFiles Files, HttpClientProvider Provider) CreateFiles(int port)
     {
         var (stack, provider) = CreateStack(port);
@@ -351,6 +470,15 @@ public class FilesystemTransferTimeoutTests
         await stream.WriteAsync(Encoding.ASCII.GetBytes(head));
         await stream.WriteAsync(payload);
         await stream.FlushAsync();
+    }
+
+    private static async Task WriteStalledErrorAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        var head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4096\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(head), cancellationToken);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("{\"message\":\"boom\""), cancellationToken);
+        await stream.FlushAsync(cancellationToken);
+        await WaitForPeerCloseAsync(stream, cancellationToken);
     }
 
     private static async Task WriteSlowBodyAsync(
@@ -486,6 +614,81 @@ public class FilesystemTransferTimeoutTests
             _cts.Dispose();
             return ValueTask.CompletedTask;
         }
+    }
+
+    /// <summary>
+    /// Serializes the request body twice like the transport does for a 307/308 redirect, the
+    /// second time into a sink that is slower than the header timeout.
+    /// </summary>
+    private sealed class RedirectEmulatingHandler : HttpMessageHandler
+    {
+        public int Serializations { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            await request.Content!.CopyToAsync(Stream.Null, cancellationToken);
+            Serializations++;
+
+            await request.Content!.CopyToAsync(
+                new SlowWriteStream(chunkBytes: 64 * 1024, delayPerChunk: TimeSpan.FromMilliseconds(300)),
+                cancellationToken);
+            Serializations++;
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new ByteArrayContent(Array.Empty<byte>()),
+            };
+        }
+    }
+
+    private sealed class SlowWriteStream : Stream
+    {
+        private readonly int _chunkBytes;
+        private readonly TimeSpan _delayPerChunk;
+
+        public SlowWriteStream(int chunkBytes, TimeSpan delayPerChunk)
+        {
+            _chunkBytes = chunkBytes;
+            _delayPerChunk = delayPerChunk;
+        }
+
+        public override bool CanRead => false;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => true;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var written = 0;
+            while (written < buffer.Length)
+            {
+                await Task.Delay(_delayPerChunk, cancellationToken);
+                written += Math.Min(_chunkBytes, buffer.Length - written);
+            }
+        }
+
+        public override void Write(byte[] buffer, int offset, int count) =>
+            WriteAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override void Flush()
+        {
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
     }
 
     private sealed class SlowReadStream : Stream
