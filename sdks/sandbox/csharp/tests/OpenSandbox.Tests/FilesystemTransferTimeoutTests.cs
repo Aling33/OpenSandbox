@@ -677,8 +677,13 @@ public class FilesystemTransferTimeoutTests
             }
         }
 
-        public override void Write(byte[] buffer, int offset, int count) =>
-            WriteAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+        // ByteArrayContent serializes through the array-based overload; it has to be the
+        // token-aware one so a canceled deadline interrupts the write instead of being
+        // silently dropped by the sync path.
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 
         public override void Flush()
         {
