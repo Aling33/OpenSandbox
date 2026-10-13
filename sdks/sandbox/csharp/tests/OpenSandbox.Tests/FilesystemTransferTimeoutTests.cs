@@ -242,6 +242,36 @@ public class FilesystemTransferTimeoutTests
     }
 
     [Fact]
+    public async Task UploadBodyReadHonorsCallerCancellation()
+    {
+        await using var server = new LoopbackHttpServer();
+        server.OnRequest(async (stream, head, _) => await ReadRequestBodyAsync(stream, head));
+        var serving = server.ServeIgnoringClientAbortsAsync();
+
+        var (files, provider) = CreateFiles(server.Port);
+        using var _ = provider;
+
+        // The body read blocks for far longer than the caller token lives, so only a token that
+        // reaches the body read itself can end the upload promptly.
+        var stalledBody = new SlowReadStream(
+            totalBytes: 1024 * 1024,
+            chunkBytes: 256 * 1024,
+            delayPerChunk: TimeSpan.FromSeconds(30));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        var elapsed = Stopwatch.StartNew();
+        await FluentActions.Awaiting(() => files.WriteFilesAsync(
+                new[] { new WriteEntry { Path = "/tmp/slow.bin", Data = stalledBody } },
+                cts.Token))
+            .Should().ThrowAsync<OperationCanceledException>();
+        elapsed.Stop();
+
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "a caller token must interrupt an upload body read that blocks");
+        await serving;
+    }
+
+    [Fact]
     public void TransferHttpClientHasNoWholeCallTimeout()
     {
         var config = new ConnectionConfig(new ConnectionConfigOptions { RequestTimeoutSeconds = RequestTimeoutSeconds });

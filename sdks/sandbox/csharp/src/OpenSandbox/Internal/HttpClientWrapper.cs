@@ -305,7 +305,18 @@ internal sealed class HttpClientWrapper
         {
             // Arm the header deadline only after the body has been written: the body send of an
             // upload (large file, slow link) must not count against it.
-            request.Content = new BodySentSignalingContent(request.Content, () => headerDeadline.CancelAfter(headerTimeout.Value));
+            request.Content = new BodySentSignalingContent(request.Content, () =>
+            {
+                try
+                {
+                    // A duplex transport can deliver the response before the body has been fully
+                    // written, in which case the deadline is already gone and arming it is moot.
+                    headerDeadline.CancelAfter(headerTimeout.Value);
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            });
         }
 
         try

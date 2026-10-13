@@ -478,7 +478,7 @@ await sandbox.PatchMetadataAsync(new Dictionary<string, string?>
 The `ConnectionConfig` class manages API server connection settings.
 
 ::: info Transfer timeouts
-`RequestTimeoutSeconds` bounds the wait for a response, and for a file upload it starts only once the request body has been sent: a healthy file upload or download that keeps making progress is never cut off by it, while a transfer that gets no response headers within the timeout fails instead of hanging (the Go SDK's `ResponseHeaderTimeout` contract). All non-transfer calls keep the whole-call request timeout. Once response headers have arrived, a body that stops making progress is bounded only by the `CancellationToken` you pass to the call, so pass one when a transfer needs an end-to-end cap.
+`RequestTimeoutSeconds` bounds the wait for a response, and for a file upload it starts only once the request body has been sent: a healthy file upload or download that keeps making progress is never cut off by it, while a download that gets no response headers at all, or an upload that gets none within the timeout once its body has been sent, fails instead of hanging (the Go SDK's `ResponseHeaderTimeout` contract). All non-transfer calls keep the whole-call request timeout. A request body that never finishes being sent, and a response body that stops making progress after the headers have arrived, are bounded only by the `CancellationToken` you pass to the call, so pass one when a transfer needs an end-to-end cap.
 :::
 
 | Parameter | Description | Default | Environment Variable |

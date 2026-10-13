@@ -48,6 +48,21 @@ internal sealed class BodySentSignalingContent : HttpContent
         _onBodySent();
     }
 
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Forwards the transport's token so a caller cancellation still interrupts a body read that
+    /// blocks (for example a slow producer stream); modern runtimes call this overload.
+    /// </summary>
+    protected override async Task SerializeToStreamAsync(
+        Stream stream,
+        TransportContext? context,
+        CancellationToken cancellationToken)
+    {
+        await _inner.CopyToAsync(stream, context, cancellationToken).ConfigureAwait(false);
+        _onBodySent();
+    }
+#endif
+
     protected override bool TryComputeLength(out long length)
     {
         // HttpContent.TryComputeLength is protected and cannot be forwarded to another instance,
