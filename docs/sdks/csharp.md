@@ -477,6 +477,10 @@ await sandbox.PatchMetadataAsync(new Dictionary<string, string?>
 
 The `ConnectionConfig` class manages API server connection settings.
 
+::: info Transfer timeouts
+`RequestTimeoutSeconds` bounds the wait for a response, and for a file upload it starts only once the request body has been sent: a healthy file upload or download that keeps making progress is never cut off by it, while a transfer that gets no response headers within the timeout fails instead of hanging (the Go SDK's `ResponseHeaderTimeout` contract). All non-transfer calls keep the whole-call request timeout. Once response headers have arrived, a body that stops making progress is bounded only by the `CancellationToken` you pass to the call, so pass one when a transfer needs an end-to-end cap.
+:::
+
 | Parameter | Description | Default | Environment Variable |
 | --- | --- | --- | --- |
 | `ApiKey` | API key for authentication | Optional | `OPEN_SANDBOX_API_KEY` |
@@ -684,7 +688,7 @@ guidance, and Git/curl examples.
 
 ### 6. Timeout and Retry Behavior
 
-- `ConnectionConfig.RequestTimeoutSeconds` controls timeout for SDK HTTP calls.
+- `ConnectionConfig.RequestTimeoutSeconds` controls timeout for SDK HTTP calls. File uploads and downloads are exempt while they keep making progress; the timeout still bounds how long a transfer waits for response headers before failing.
 - `RunCommandOptions.TimeoutSeconds` controls command execution timeout for command runs.
 - `RunInSessionOptions.TimeoutSeconds` controls command execution timeout for session runs.
 - `SandboxCreateOptions.TimeoutSeconds` controls sandbox server-side TTL.

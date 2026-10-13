@@ -28,6 +28,8 @@ internal sealed class HttpClientWrapper
     private static readonly HttpMethod PatchMethod = new("PATCH");
 
     private readonly HttpClient _httpClient;
+    private readonly HttpClient? _transferHttpClient;
+    private readonly TimeSpan? _transferHeaderTimeout;
     private readonly string _baseUrl;
     private readonly IReadOnlyDictionary<string, string> _defaultHeaders;
     private readonly ILogger _logger;
@@ -43,9 +45,13 @@ internal sealed class HttpClientWrapper
         HttpClient httpClient,
         string baseUrl,
         IReadOnlyDictionary<string, string>? defaultHeaders = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        HttpClient? transferHttpClient = null,
+        TimeSpan? transferHeaderTimeout = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+        _transferHttpClient = transferHttpClient;
+        _transferHeaderTimeout = transferHeaderTimeout;
         _baseUrl = baseUrl?.TrimEnd('/') ?? throw new ArgumentNullException(nameof(baseUrl));
         _defaultHeaders = defaultHeaders ?? new Dictionary<string, string>();
         _logger = logger ?? NullLogger.Instance;
@@ -54,7 +60,7 @@ internal sealed class HttpClientWrapper
     public string BaseUrl => _baseUrl;
 
     public HttpClientWrapper WithBaseUrl(string baseUrl) =>
-        new(_httpClient, baseUrl, _defaultHeaders, _logger);
+        new(_httpClient, baseUrl, _defaultHeaders, _logger, _transferHttpClient, _transferHeaderTimeout);
 
     public async Task<T> GetAsync<T>(
         string path,
@@ -256,9 +262,64 @@ internal sealed class HttpClientWrapper
             }
         }
 
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendTransferAsync(request, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
-        return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        return await ReadContentBytesAsync(response.Content, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Sends a file transfer request (upload or download).
+    /// When a transfer client is configured, the transfer is not capped by the connection request
+    /// timeout, so a large file or a slow link is not aborted while data keeps flowing. The wait
+    /// for response headers is still bounded: for a request without a body the deadline starts
+    /// with the request, and for an upload it starts once the body has been sent, so a server
+    /// that stops responding fails the transfer instead of hanging it. The response body is read
+    /// with the caller token; a caller that wants the whole transfer bounded passes a
+    /// CancellationToken.
+    /// </summary>
+    public async Task<HttpResponseMessage> SendTransferAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken = default)
+    {
+        if (request is null)
+        {
+            throw new ArgumentNullException(nameof(request));
+        }
+
+        ApplyDefaultHeaders(request);
+
+        var transferClient = _transferHttpClient;
+        var headerTimeout = _transferHeaderTimeout;
+        if (transferClient is null || headerTimeout is null || headerTimeout.Value <= TimeSpan.Zero)
+        {
+            _logger.LogDebug("HTTP {Method} {Url} (transfer, shared client)", request.Method, request.RequestUri);
+            return await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        }
+
+        var headerDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (request.Content is null)
+        {
+            headerDeadline.CancelAfter(headerTimeout.Value);
+        }
+        else
+        {
+            // Arm the header deadline only after the body has been written: the body send of an
+            // upload (large file, slow link) must not count against it.
+            request.Content = new BodySentSignalingContent(request.Content, () => headerDeadline.CancelAfter(headerTimeout.Value));
+        }
+
+        try
+        {
+            _logger.LogDebug("HTTP {Method} {Url} (transfer)", request.Method, request.RequestUri);
+            return await transferClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headerDeadline.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Response headers have arrived (or the send failed): stop the header deadline and
+            // release the linked registration. Body reads use the caller token, so they stay
+            // cancellable and are never bounded by the header deadline.
+            headerDeadline.Dispose();
+        }
     }
 
     public async Task<Stream> GetStreamAsync(
@@ -282,6 +343,20 @@ internal sealed class HttpClientWrapper
         var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         return await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
+    }
+
+    private static async Task<byte[]> ReadContentBytesAsync(HttpContent content, CancellationToken cancellationToken)
+    {
+        using var source = await content.ReadAsStreamAsync().ConfigureAwait(false);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[81920];
+        int read;
+        while ((read = await source.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0)
+        {
+            buffer.Write(chunk, 0, read);
+        }
+
+        return buffer.ToArray();
     }
 
     private string BuildUrl(string path, Dictionary<string, string?>? queryParams = null)

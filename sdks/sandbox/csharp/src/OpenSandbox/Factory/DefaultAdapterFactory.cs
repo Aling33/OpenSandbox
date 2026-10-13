@@ -60,18 +60,20 @@ public sealed class DefaultAdapterFactory : IAdapterFactory
     public ExecdStack CreateExecdStack(CreateExecdStackOptions options)
     {
         var headers = BuildDataPlaneHeaders(options.ConnectionConfig, options.ExecdHeaders);
+        var transferHeaderTimeout = TimeSpan.FromSeconds(options.ConnectionConfig.RequestTimeoutSeconds);
 
         var clientWrapper = new HttpClientWrapper(
             options.HttpClientProvider.HttpClient,
             options.ExecdBaseUrl,
             headers,
-            options.LoggerFactory.CreateLogger("OpenSandbox.HttpClientWrapper"));
+            options.LoggerFactory.CreateLogger("OpenSandbox.HttpClientWrapper"),
+            options.HttpClientProvider.TransferHttpClient,
+            transferHeaderTimeout);
 
         var health = new HealthAdapter(clientWrapper);
         var metrics = new MetricsAdapter(clientWrapper);
         var files = new FilesystemAdapter(
             clientWrapper,
-            options.HttpClientProvider.HttpClient,
             options.ExecdBaseUrl,
             headers);
         var commands = new CommandsAdapter(
@@ -86,7 +88,9 @@ public sealed class DefaultAdapterFactory : IAdapterFactory
             options.HttpClientProvider.SseHttpClient,
             options.ExecdBaseUrl,
             headers,
-            options.LoggerFactory.CreateLogger("OpenSandbox.IsolatedSessionsAdapter"));
+            options.LoggerFactory.CreateLogger("OpenSandbox.IsolatedSessionsAdapter"),
+            options.HttpClientProvider.TransferHttpClient,
+            transferHeaderTimeout);
 
         return new ExecdStack
         {
