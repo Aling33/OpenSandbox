@@ -3,7 +3,7 @@ title: Multi-Sandbox Egress Control Plane
 authors:
   - "@Pangjiping"
 creation-date: 2026-08-21
-last-updated: 2026-10-12
+last-updated: 2026-10-14
 status: implementing
 ---
 
@@ -15,11 +15,12 @@ status: implementing
 - [Goals and Non-Goals](#goals-and-non-goals)
 - [Core Design](#core-design)
   - [Subject Abstraction](#subject-abstraction)
-  - [One Control Channel](#one-control-channel)
+  - [Two Control Channels](#two-control-channels)
   - [Credential Vault](#credential-vault)
-    - [Vault Envelope](#vault-envelope)
-    - [Key Management](#key-management)
+    - [Egress Vault Surface](#egress-vault-surface)
+    - [Vault Storage](#vault-storage)
     - [Vault Lifecycle](#vault-lifecycle)
+    - [Vault Sealing (deferred)](#vault-sealing-deferred)
   - [MITM Trust Anchor](#mitm-trust-anchor)
   - [Lifecycle and Fail-Closed Guarantee](#lifecycle-and-fail-closed-guarantee)
   - [Per-Subject Policy Consumption](#per-subject-policy-consumption)
@@ -40,7 +41,7 @@ status: implementing
 
 ## Summary
 
-A single egress control plane serves N sandboxes sharing one host/network domain (fast-sandbox Fastlet Pods, or bwrap isolated sessions). The existing single-sandbox sidecar profile is unchanged; the opt-in `fast-sandbox` profile adds a **Subject** abstraction — one opaque identifier per sandbox owning an isolated slice of policy, credentials, and kernel rules — dispatched by platform-provided identity keys. The integration is **API-based, not file-based**: subject lifecycle, policy, and credential vaults all arrive over the Fastlet's public **Sandbox Actions Handler protocol** (`SET_BINDING` / `LIFECYCLE_HOOK` / `REMOVE_BINDING`, `sandbox.fast.io/actions/v1`). Policy rides the Sandbox CRD `actionBindings` (declarative, revisioned); the credential vault rides the **same binding as an AEAD-sealed revision** (pool-scoped key, sandbox-UID AAD) — ciphertext is the only persisted form; plaintext is memory-only in egress and transient in the server. This supersedes the earlier proxy-route credential channel (fastlet-proxy additions, UID header, and server push/reconcile loop are dropped) and revises OSEP-0012's framing for this profile. A subject is fail-closed from `SET_BINDING` until `sandbox.data-plane-ready`, where policy and vault activate at the same barrier; an undecryptable vault is a permanent, observable binding failure.
+A single egress control plane serves N sandboxes sharing one host/network domain (fast-sandbox Fastlet Pods, or bwrap isolated sessions). The existing single-sandbox sidecar profile is unchanged; the opt-in `fast-sandbox` profile adds a **Subject** abstraction — one opaque identifier per sandbox owning an isolated slice of policy, credentials, and kernel rules. **Policy** rides the Sandbox CRD `actionBindings` over the Fastlet's public Sandbox Actions Handler protocol (`SET_BINDING` / `LIFECYCLE_HOOK` / `REMOVE_BINDING`, `sandbox.fast.io/actions/v1`) as a bare JSON input — declarative, revisioned, replayable. The **credential vault is egress-held**: the server pushes complete vault revisions over a new generic **FastPath handler-relay RPC** (server → FastPath → Fastlet → egress loopback) and gets a synchronous, egress-validated ack; egress keeps vault state in memory plus a per-subject file (plaintext in v1 — AEAD sealing is deferred, see [Vault Sealing](#vault-sealing-deferred)), so restarts recover locally and pause/resume carries vault files in the snapshot bundle. The CRD never carries vault material; vault size is decoupled from the binding-input cap. A subject is fail-closed from `SET_BINDING` until `sandbox.data-plane-ready`, where policy and vault activate at the same barrier.
 
 ## Motivation
 
@@ -53,11 +54,11 @@ Goals:
 1. **Subject abstraction**: platform-neutral identity as the unit of policy, credential, and rule ownership; dispatch key pluggable (source IP / host uid / cgroup path).
 2. **Multi-sandbox dispatch**: one egress process hosts N independent subjects.
 3. **Zero impact on single-sandbox mode**: sidecar profile, env, API, behavior unchanged when the `fast-sandbox` profile is off.
-4. **Consume, don't modify**: fast-sandbox CRD, RPC protocol, and fastlet process are used as-is; the integration rides the public Sandbox Actions Handler protocol. The slot-store file observation is explicitly NOT used.
-5. **No new platform contract**: fast-sandbox CRD, RPC protocol, and Actions protocol unchanged; `specs/egress-api.yaml` unchanged (sidecar profile). The only new contract is the OpenSandbox-owned binding-input wrapper (policy + encrypted vault, server↔egress); no egress-local persistence beyond memory.
+4. **Minimal platform surface**: the Sandbox Actions Handler protocol is consumed as-is; the only fast-sandbox asks are one generic handler-relay RPC, the fastlet relay hop, and snapshot-file support (all vault-agnostic). The slot-store file observation is explicitly NOT used.
+5. **Two concerns, two carriers, no credential persistence outside egress**: policy rides the declarative binding; vault rides the relay with egress-local persistence (memory + file) — the CRD, etcd, and backups never carry vault material. `specs/egress-api.yaml` unchanged (sidecar profile); the vault file format + relay payload are the only new OpenSandbox-owned contracts.
 6. **Engine reuse**: no behavioral changes inside `pkg/dnsproxy`, `pkg/nftables`, `pkg/credentialvault`, `pkg/mitmproxy`.
 
-Non-Goals: no per-process policies; no eBPF; no in-guest control plane; no rate limiting; no DNS-protocol changes; no policy storage on the cluster; no **plaintext** credentials in the action binding — vault material rides the binding only as AEAD ciphertext under pool-scoped keys (this supersedes the earlier blanket no-credentials-in-binding rule; see [Vault Envelope](#vault-envelope)).
+Non-Goals: no per-process policies; no eBPF; no in-guest control plane; no rate limiting; no DNS-protocol changes; no policy storage on the cluster; **no credential material in the action binding** — the binding carries policy only; vault material never touches the CRD, etcd, or any binding (this supersedes both the earlier blanket rule and the sealed-binding revision; see [Credential Vault](#credential-vault)). v1 stores vault files in plaintext — an owned posture, hardened by sealing later (see [Vault Sealing](#vault-sealing-deferred)).
 
 ## Core Design
 
@@ -67,17 +68,30 @@ A **Subject** is one opaque identifier per sandbox (e.g. `s-<sandboxUID>`), owni
 
 Single-sandbox mode is the process being one implicit subject (no-op layer); the `fast-sandbox` profile is N subjects. The authority over "who is who" never belongs to egress — each adapter must prove its key unforgeable (IPAM + per-sandbox netns without `NET_ADMIN`; execd-assigned uid).
 
-### One Control Channel
+### Two Control Channels
 
-The `fast-sandbox` profile has **no sandbox-reachable policy surface and no second channel** (a fast-sandbox guest root is untrusted and must not rewrite its own policy or vault). Everything flows over one channel:
+The `fast-sandbox` profile has **no sandbox-reachable control surface** (a fast-sandbox guest root is untrusted and must not rewrite its own policy or vault). One concern per channel:
+
+```mermaid
+flowchart LR
+    SDK[SDK] --> SRV[OpenSandbox server]
+    SRV --> FP[FastPath]
+    FP -->|"① policy<br/>(declarative)"| CRD[("Sandbox CRD<br/>actionBindings")]
+    CRD --> C[Controller]
+    C --> F[Fastlet]
+    FP -->|"② vault relay<br/>(sync ack)"| F
+    F -->|"SET_BINDING · HOOKS<br/>REMOVE_BINDING"| E[Egress<br/>Pod loopback]
+    F -->|"relay → /vault/{uid}"| E
+    E --> MEM[subject memory] --> FILE["vault/&lt;uid&gt;.json<br/>emptyDir"]
+    E <-->|"export / import<br/>(via driver)"| SNAP[snapshot bundle]
+```
 
 | Channel | Direction | Auth | Carries |
 |---------|-----------|------|---------|
-| **Sandbox Actions Handler protocol** `/_fastlet/v1/actions` + `/_fastlet/v1/actions/status` | Fastlet → egress handler (Pod-loopback HTTP on the Pool-declared action `targetHTTPPort`, 18080 in examples) | Pod-netns loopback; the envelope carries sandbox UID + revision fencing; the Fastlet is the only caller | Subject lifecycle (`SET_BINDING` / `LIFECYCLE_HOOK` / `REMOVE_BINDING`), **policy**, and the **encrypted vault revision** (inside the binding input, see [Vault Envelope](#vault-envelope)) |
+| **① Sandbox Actions Handler protocol** `/_fastlet/v1/actions*` | Fastlet → egress (Pod-loopback) | loopback; envelope carries sandbox UID + revision fencing; the Fastlet is the only caller | Subject lifecycle + **policy** (bare JSON input) |
+| **② FastPath handler relay** `InvokeHandlerAction(sandbox, handler, payload) → result` | server → FastPath → Fastlet → egress | FastPath validates tenant-scoped sandbox ownership — no proxy-added UID header | **Vault ops** (PUT/GET/DELETE), synchronous result |
 
-The listener binds Pod-netns loopback on the Pool-declared `targetHTTPPort` (18080 in examples) and serves exactly the actions endpoints plus `/healthz` (the runtime driver's pre-create probe). `/policy` and `/credential-vault` **do not exist** in this profile — runtime policy and vault updates ride declarative binding replacement (see [OpenSandbox Server](#opensandbox-server)); the MITM addon keeps exchanging active per-subject vault snapshots over the egress-local unix socket (internal, unchanged). Vault ownership needs no UID header: identity is the envelope's `sandbox.uid`.
-
-Two earlier carriers are dropped: the slot-store file observation (`/run/fast-sandbox/network/*.json`) — fastlet-internal, no stability contract — and the proxy-route channel (`/v1/sandboxes/{sandboxId}/egress/*`, `X-Fast-Sandbox-Uid`, fastlet-proxy host upstream, egress route parsing; see [Credential Vault](#credential-vault) for why). The Actions protocol is fast-sandbox's supported public contract — binding/Hook delivery, identity fencing, and `instanceId` replay — so no fastlet-side stabilization work is required.
+The listener serves the actions endpoints, `/healthz` (the runtime driver's pre-create probe), and the relay-only vault surface (see [Egress Vault Surface](#egress-vault-surface)). Policy never rides the relay; vault never rides the binding. Both channels terminate in one egress process — every mutation validates point-in-time and per-subject changes serialize in-process; no cross-channel fencing machinery. Slot-store file observation stays dropped; the earlier proxy-route channel is superseded (identity validation moved from a proxy header into the FastPath control plane).
 
 #### Action envelope fields consumed
 
@@ -85,98 +99,145 @@ Egress reads exactly these fields from the action envelope (everything else is i
 
 | Envelope field | Used for |
 |-------|----------|
-| `sandbox.uid` | Subject identity (`s-<uid>`); also the vault ciphertext's AAD |
+| `sandbox.uid` | Subject identity (`s-<uid>`) |
 | `revision.runtimeInstanceId`, `revision.attachmentId` | identity fencing (a change = rebind, discard all prior state) |
 | `revision.specGeneration` | binding-update fencing |
 | `attachment.network.ip` | dispatch key (`ip saddr`) |
 | `attachment.network.hostVeth` | unused (on the bridge topology the IP hooks see skb->dev = the bridge, so an iifname match on the pod-side veth would never fire) |
 | `attachment.network.gateway` | gateway DNS REDIRECT target / MITM DNAT target |
 | `attachment.network.privateCidr` | sibling-isolation rules |
-| `binding.input` | the composite input — wrapper `osbEgressInput: 1` carrying `policy` and an optional encrypted `vault`; a bare policy JSON string remains valid (vault-less pools) |
+| `binding.input` | the policy (bare JSON string, parsed by egress as its policy format) |
 | `hook.name` / `hook.sequence` | lifecycle checkpoint delivery order (`sandbox.runtime-ready`, `sandbox.data-plane-ready`) |
 
 ### Credential Vault
 
-The vault joins the policy on the same declarative path. In one sentence: **the vault rides `actionBindings` as an AEAD-sealed revision — ciphertext is the only form persisted anywhere, plaintext lives memory-only in egress and transiently in the server at composition, and it activates together with the policy at `data-plane-ready`.**
+The vault is **egress-held**. In one sentence: **the server pushes complete vault revisions over the FastPath relay and gets a synchronous egress-validated ack; egress keeps the vault in memory, persists it to an egress-local per-subject file, and carries it across pause/resume as a snapshot-bundle file — the CRD never carries vault material.**
 
-- **Why this replaced the proxy-route channel**: the earlier revision pushed vault revisions over a dedicated fastlet-proxy route to keep credentials out of the persisted binding. Sealing each revision with a pool-scoped key resolves that persistence objection while keeping the declarative properties — ordered delivery, revision fencing, Fastlet replay, and snapshot restore give vault recovery for free, with no server push loop, and no credential material ever traverses fastlet-proxy.
-- **Surfaces**: no vault HTTP surface on egress in this profile — all vault traffic goes through the server vault API (see [OpenSandbox Server](#opensandbox-server)); the MITM addon's active-vault unix socket stays an internal egress surface. Reads exist only server-side: the server API mirrors the sidecar read contract, returning sanitized state and metadata (credential values are never returned).
-- **Failure posture**: any decryption or validation failure is a permanent, observable binding failure — the subject is never half-open.
+- **Why this replaced the sealed binding**: the previous revision sealed vault revisions into `actionBindings` to inherit the binding's declarative properties (ordered delivery, replay, snapshot restore) for free. That trade bought recovery at the cost of latency (every ack is a control-plane round trip through binding status), in-band error reporting (validation failures surface as async binding status, not the API response), and CRD hygiene (credential ciphertext in etcd/backups; vault size capped by the 65536-byte binding input). Egress-held state with local persistence + snapshot files re-owns that recovery machinery deliberately, and buys one-hop latency, synchronous acks, and a credential-free CRD.
+- **Surfaces**: the egress loopback vault API (relay-only caller; see [Egress Vault Surface](#egress-vault-surface)); the server vault API keeps its public shape (see [OpenSandbox Server](#opensandbox-server)); the MITM addon's active-vault unix socket stays an internal egress surface. The internal relay `GET` returns the **full** revision (it is what `PATCH` merges against); the **server strips credential values on every public read**, so values never appear on any public surface.
+- **Failure posture**: an operation that fails validation is **NACKed and the subject keeps its last-good state** — never half-open. A vault file that cannot be loaded at registration degrades that subject's vault (credential interception fails closed for it) while policy enforcement continues — observable on `/healthz` and the actions status payload.
 
-The subsections below define the wire format ([Vault Envelope](#vault-envelope)), the key system ([Key Management](#key-management)), and how vault state moves through the subject state machine ([Vault Lifecycle](#vault-lifecycle)).
+The subsections below define the relay surface ([Egress Vault Surface](#egress-vault-surface)), the persistence format ([Vault Storage](#vault-storage)), and how vault state moves through the subject state machine ([Vault Lifecycle](#vault-lifecycle)).
 
-#### Vault Envelope
+#### Egress Vault Surface
 
-The binding input is a self-describing wrapper. A bare policy JSON string (today's shape) remains valid and means policy-only:
+OpenSandbox-owned endpoints on the same loopback listener, served only in the `fast-sandbox` profile; the only caller is the Fastlet's relay hop. `specs/egress-api.yaml` (the sidecar public contract) is unchanged — this surface is an internal, versioned contract between server and egress:
 
-```json
-{
-  "osbEgressInput": 1,
-  "policy": { "defaultAction": "deny", "egress": [ { "action": "allow", "target": "api.github.com" } ] },
-  "vault": {
-    "v": 1,
-    "kid": "k3",
-    "alg": "A256GCM",
-    "ct": "<base64(nonce || ciphertext || tag)>"
-  }
-}
+| Endpoint | Semantics |
+|----------|-----------|
+| `PUT /vault/{sandboxUid}` | Full revision replace (vault JSON + `expectedRevision`) → `{revision, state}` |
+| `GET /vault/{sandboxUid}` | **Full revision including values** — internal surface (relay-only, loopback); the server sanitizes all public reads |
+| `DELETE /vault/{sandboxUid}` | Removes the vault; the policy is kept |
+
+```mermaid
+flowchart TD
+    A["vault PUT"] --> B{subject registered?}
+    B -- no --> R404["404 — retry after ready<br/>(no caching)"]
+    B -- yes --> C{expectedRevision<br/>matches?}
+    C -- no --> R409["409 + current revision<br/>(readback → retry)"]
+    C -- yes --> D{parse + policy<br/>consistency}
+    D -- fail --> NACK["400 NACK — keep last-good"]
+    D -- ok --> P["persist: temp + rename"]
+    P --> Q{subject state}
+    Q -- denying --> H["hold to data-plane-ready barrier"]
+    Q -- active --> AP["apply in place"]
+    H --> ACK["ack — {revision, state}"]
+    AP --> ACK
 ```
 
-Rules:
+- Concurrent writers: per-subject changes serialize in-process; concurrent `PUT`s apply one at a time and the final state is the **last-delivered** revision. `expectedRevision` makes a write conditional (stale writer → 409, recover by readback — the OSEP-0023 pattern); without it the write is unconditional (last-writer-wins).
+- A rejected update never leaves a partially applied revision; registration-time binding-input failures keep the fail-closed rule. A successful `PUT` clears a degraded vault (a corrupt-file subject recovers without recreation).
+- `PATCH` composes server-side (relay `GET` → merge in server memory → relay `PUT`; per-sandbox in-process lock, `expectedRevision` as the cross-replica backstop) — the egress surface stays a full-revision replace, identical in shape to the sidecar contract. Plaintext traverses the server only transiently.
 
-- `vault.ct` is an **AES-256-GCM** seal of the OSEP-0012 vault JSON (credentials + bindings, a complete revision) under the pool key selected by `kid`, with a random 96-bit nonce and **AAD = `sandbox.uid`** — a ciphertext transplanted into another sandbox's binding fails to open.
-- **The input is the complete desired state**: a bare policy input (no wrapper), or a wrapper without `vault`, removes any existing vault from the subject. The server therefore always re-states the full input — policy updates carry the `vault` object verbatim; bare policy input is only sent to vault-less pools.
-- Egress validation order (all inside `SET_BINDING`, before any state mutation): parse wrapper → parse policy (invalid = 400) → AEAD open (unknown `kid`, AAD mismatch, or tag failure = **permanent 400**, not a retryable 500) → vault-vs-policy consistency (every binding target covered by the effective policy; ambiguity rules per OSEP-0012). Any failure leaves the subject unregistered: the Fastlet marks the binding `ActionFailed` and the sandbox never becomes usable — fail-closed and observable.
-- `"vault": null` removes the vault from a live subject and keeps the policy. An envelope-level JSON-null input removes the whole binding — policy and vault together.
-- Unencrypted vault material never appears in the wrapper. The wrapper version (`osbEgressInput`) gates all future format evolution.
-- Size: the CRD caps a binding input at 65536 bytes; the server pre-flights the composed size (base64 + nonce + tag overhead ≈ 1.4× the vault JSON).
+#### Vault Storage
 
-#### Key Management
-
-- One 256-bit key per SandboxPool, operator-generated, with a stable `kid`.
-- **Custody**: one per-pool Secret carries all egress key material — `{kid, key}` entries for the vault seal key and the MITM CA pair — mounted into the egress container as read-only seed volumes (e.g. `/etc/opensandbox/egress-seed/`). The server holds the vault keys via pool-level configuration. No one else ever holds keys: the Fastlet and CRD readers see ciphertext only (the key-bearing Secret itself is ordinary Kubernetes state — its at-rest protection is the cluster's Secret-encryption posture, a deployment prerequisite per [Infrastructure and Migration](#infrastructure-and-migration)). The server needs no Kubernetes Secret API access.
-- **Rotation**: new writes always seal with the newest `kid`; because a vault write opens the current revision to merge the delta (see [OpenSandbox Server](#opensandbox-server)), every vault write also re-seals the whole revision under the newest `kid` — actively written vaults migrate kids eagerly. Policy-only updates never decrypt: the server copies the `vault` object verbatim from the current binding. Egress keeps the last N (default 3) keys decrypt-only, so a vault that stops receiving writes keeps opening as long as its `kid` stays inside the window.
-- Compromise scoping: a leaked server pool configuration decrypts that pool's vault history — key material is production-secret tier and must be stored accordingly.
+| Aspect | Decision |
+|--------|----------|
+| Layout | one file per subject: `<egress-volume>/vault/<sandboxUid>.json` — purge and snapshot export are per-file ops |
+| Format | `{"v": 1, "revision": …, "vault": {…OSEP-0012 vault JSON…}}` — versioned shared server↔egress contract (conformance vectors in this repo) |
+| v1 posture | **plaintext** (owned): the egress volume + snapshot-bundle storage join the credential trust surface (see [Security Boundaries](#security-boundaries)). Deferred hardening: AEAD-seal the same file body — file bytes only ([Vault Sealing](#vault-sealing-deferred)) |
+| Write | temp + atomic rename; the relay ack follows successful persist (acked ⇒ on disk) |
+| Reload | at `SET_BINDING` (re)registration — the egress-restart recovery path; corrupt/unreadable → that subject's vault degrades (interception fail-closed, policy unaffected), surfaced on `/healthz` + status |
+| Purge / restore | `REMOVE_BINDING` deletes memory + file (terminal); snapshot restore imports the bundle file before `data-plane-ready` |
+| Volume | Pod-scoped **`emptyDir`** (FastletTemplate): survives egress container crash/restart (the reload path), dies with the Pod. Container writable layer insufficient (wiped on restart); `hostPath` rejected (ownerless plaintext on node disk after Pod recreation, no GC). Optional `medium: Memory` (tmpfs) keeps plaintext off node disk |
 
 #### Vault Lifecycle
 
-How vault state moves through the subject state machine (absent → denying → active):
+```mermaid
+stateDiagram-v2
+    [*] --> absent
+    absent --> pending: PUT while denying (held)
+    absent --> active: PUT while active (in place)
+    pending --> active: data-plane-ready (same barrier as policy)
+    active --> active: PUT (validate → persist → apply)
+    pending --> absent: DELETE
+    active --> absent: DELETE (policy kept)
+    active --> sealed: export (pause — bundle copy taken)
+    sealed --> [*]: REMOVE_BINDING (purge memory + file)
+    sealed --> active: import (resume)
+    absent --> [*]: REMOVE_BINDING (purge memory + file)
+```
 
-- **Register**: the wrapper's vault revision is opened and validated during `SET_BINDING` (before any state mutation, alongside the policy) and held pending; the subject stays fully denying.
-- **Activate**: at `sandbox.data-plane-ready` the vault snapshot becomes resolvable at the **same barrier** as the policy swap — a subject's credential-bearing traffic can only ever flow through a loaded vault. A vault delivered after activation applies in place without replaying Hooks.
-- **Update**: a revision replace (`PATCH`) re-seals — the server opens the current revision in memory, applies the delta, and seals the complete new revision (see [OpenSandbox Server](#opensandbox-server)) — and applies in place on an active subject; the server acknowledges only after the binding status reports Ready (revisioned ack per OSEP-0012 semantics, fenced by the binding generation).
-- **Remove**: `DELETE` seals `vault: null` — the vault is dropped from the live subject and the policy is kept. An envelope-level JSON-null input removes the whole binding: policy and vault together. `REMOVE_BINDING` frees enforcement and vault as terminal cleanup.
-- **Recovery**: egress restart → Fastlet replays `SET_BINDING` → egress re-opens the ciphertext from the replayed binding → re-denies → re-activates on the replayed Hook. **No server re-push exists or is needed.** Pause/resume: the binding (with ciphertext) is preserved in the snapshot manifest and re-applied on restore, so the vault survives restore.
-- **Failure**: any decryption or validation failure is a permanent 400 — the binding reports `ActionFailed` and the sandbox never becomes usable. Fail-closed, never half-open.
+A vault op before registration → **404** (no caching; SDK flow is create → ready → set vault). A vault op on a **sealed** (paused) subject → **409** — a mutation would go stale: the bundle copy is already taken. A validation failure at any step → **NACK, last-good kept** — never half-open.
+
+```mermaid
+flowchart LR
+    subgraph R1["Egress restart (same Pod)"]
+        direction LR
+        A1["crash / restart"] --> A2["wipe rules<br/>new instanceId"] --> A3["Fastlet replays<br/>SET_BINDING + hooks"] --> A4["reload vault files<br/>at registration"] --> A5["denying → active"]
+    end
+    subgraph R2["Pause / resume (any Pod)"]
+        direction LR
+        B1["pause"] --> B2["driver: export → bundle<br/>(subject sealed)"] --> B3["runtime teardown<br/>REMOVE_BINDING purges file"] --> B4["paused:<br/>ops 409 (subject held)<br/>/ 404 (purged)"] --> B5["resume"] --> B6["import before<br/>data-plane-ready"] --> B7["active"]
+    end
+```
+
+**Ordering invariant: export strictly precedes the runtime teardown** — `REMOVE_BINDING` purges the local file, so the bundle copy must exist first; the driver invokes export inside the pause flow, before teardown. **No server re-push exists or is needed** — egress self-persistence covers both recovery paths.
+
+#### Vault Sealing (deferred)
+
+Encrypting the vault at rest is **deferred, not v1 scope** — and deliberately **egress-local**: it changes file bytes only. No channel, surface, lifecycle, template, snapshot-manifest, or platform-contract change; no server key custody; the Secret gains additive entries. Pinned here so the design is settled when picked up:
+
+| Aspect | Decision (when sealing lands) |
+|--------|-------------------------------|
+| Envelope | file body becomes `{ "v": 2, "kid", "alg": "A256GCM", "ct": base64(nonce ‖ ciphertext ‖ tag) }` — one AEAD seal over the whole v1 JSON; **AAD = `sandbox.uid`** (a transplanted ciphertext fails to open); v1/v2 dual-read, always write v2 |
+| Key custody | per-pool `{kid, key}` entries in the existing egress Secret (alongside the MITM CA pair), read-only seed mount — **egress seals and opens; the server never holds a vault key**; cluster Secret encryption at rest (KMS envelope) becomes a prerequisite for sealed pools |
+| Rotation | writes always seal under the newest `kid` (write = re-seal, eager migration); the Secret carries the last N (default 3) kids decrypt-only, so idle vaults keep opening inside the window |
+| Migration | enabling = seal-key entries appear in the pool Secret; leftover v1 plaintext files re-seal lazily at reload (bounded per Pod) |
+| Not covered | relay bodies (loopback, same trust domain), egress memory, the server's transient `PATCH` view — sealing protects **at rest** only (volume, snapshot bundles, backups) |
+| Cross-pool restore | ciphertext binds to the pool key — restore into a different pool fails to open and lands in the existing degraded posture; unsupported unless pools share keys |
 
 ### MITM Trust Anchor
 
 The fast-sandbox profile **pins the MITM CA**: a per-pool, operator-generated keypair provisioned once — mitmdump loads it from its confdir and never generates a new one. Combined with baking the public certificate into sandbox templates at build time, there is **no per-sandbox certificate delivery, guest trust seeding, or bootstrap step** in this profile, for Firecracker or containerd alike.
 
-- **Provisioning**: the CA pair rides the same per-pool Secret as the vault seal key (see [Key Management](#key-management)), mounted read-only as a seed volume (Secret entry names are the operator's choice). At startup egress copies the pair idempotently into a writable confdir under the names mitmproxy actually loads — `mitmproxy-ca.pem` (private key) + `mitmproxy-ca-cert.pem` (certificate), per the component's fixed-CA contract — mitmproxy loads a confdir CA when present and only generates when missing. The read-only seed mount keeps the Secret immutable and sidesteps Secret-defaultMode/uid concerns (mitmdump runs as a non-root user).
+- **Provisioning**: the CA pair rides a per-pool Secret, mounted read-only as a seed volume (Secret entry names are the operator's choice; the per-pool egress Secret carries only the CA pair in v1 — the vault seal key is deferred with vault sealing, see [Vault Sealing](#vault-sealing-deferred)). At startup egress copies the pair idempotently into a writable confdir under the names mitmproxy actually loads — `mitmproxy-ca.pem` (private key) + `mitmproxy-ca-cert.pem` (certificate), per the component's fixed-CA contract — mitmproxy loads a confdir CA when present and only generates when missing. The read-only seed mount keeps the Secret immutable and sidesteps Secret-defaultMode/uid concerns (mitmdump runs as a non-root user).
 - **Fail-closed startup, scoped to the addon**: in the fast-sandbox profile egress never silently generates a CA. A missing or unloadable pinned CA fails the MITM addon closed — it refuses to start and the down state is surfaced on `/healthz` and the actions status payload — while the rest of egress keeps serving policy actions. Pools that never enable credential interception keep working with no CA provisioned (legacy bare-policy pools upgrade unchanged); a pool that intends interception and lacks its seed Secret fails observably at the addon instead of bricking policy enforcement. The sidecar profile keeps today's generate-on-start behavior unchanged.
 - **Template baking**: the public certificate is baked into the sandbox template at build time — installed into the guest trust store (`update-ca-certificates` or distro equivalent) together with the env vars non-system-store clients need (`NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `PIP_CERT`). This rides the same template-build rootfs pass that already bakes `/etc/resolv.conf` for egress-managed pools. Guests trust the interception CA from the first boot; nothing is delivered at sandbox create time.
 - **Superseded mechanisms**: the `mitm-ca` export directory, the fastlet read-only mount of it into sandboxes, guest trust-store seeding at bootstrap, and the stale-CA purge on restart are all dropped for this profile. `SyncRootCAFastSandbox` degrades to a startup consistency check (confdir cert == pinned cert) and the export path remains sidecar-only.
 - **Restart and snapshot safety**: egress restart no longer rotates the CA, so live sandboxes keep passing TLS verification across restarts, Hook replays, pause/resume, and snapshot restore (the certificate is part of the rootfs the snapshot carries). This removes a whole failure class of the ephemeral-confdir behavior, where an egress restart silently invalidated every live guest's trust anchor.
 - **Observability**: the pinned CA's fingerprint is exposed on `/healthz` and mirrored in the actions status payload — with an explicit addon-down signal when no CA is provisioned — so a template↔pool Secret mispairing is visible at a glance instead of surfacing as opaque guest TLS failures.
-- **Rotation**: deliberate only — new keypair → Secret update → template rebuild → pool rollover; live sandboxes continue on the old trust anchor until recreated. There is no automatic rotation; long horizons (10–20 years, or longer) are acceptable for a private CA (public CA validity rules do not apply). A leaked CA key is MITM capability for the pool until rotation completes — the same production-secret handling as the vault seal key applies.
+- **Rotation**: deliberate only — new keypair → Secret update → template rebuild → pool rollover; live sandboxes continue on the old trust anchor until recreated. There is no automatic rotation; long horizons (10–20 years, or longer) are acceptable for a private CA (public CA validity rules do not apply). A leaked CA key is MITM capability for the pool until rotation completes — the same production-secret handling as any pool key material applies.
 
 ### Lifecycle and Fail-Closed Guarantee
 
-```
-  SET_BINDING arrives      data-plane-ready lands     steady
-absent ────────────────► denying ────────────────► active ────► …
-    ▲                       │ deny-first                │
-    └──── REMOVE_BINDING ◄──────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> denying: SET_BINDING (deny-first, vault file loaded)
+    denying --> active: data-plane-ready (policy + vault, one barrier)
+    active --> active: binding update / relay vault op (in place)
+    active --> denying: SET_BINDING null input
+    denying --> [*]: REMOVE_BINDING
+    active --> [*]: REMOVE_BINDING (detach → deny → free)
 ```
 
 The Fastlet is the only lifecycle dispatcher; egress is the Handler.
 
-- **Register** on `SET_BINDING` (identity + fencing from the envelope's `sandbox.uid` and `revision`); egress parses the wrapper (policy + vault) fully before any state mutation; deny-first installs immediately (nft sets empty, gateway DNS REDIRECT + forward rules) — fully blocked until activation. The policy (and vault, if present — see [Vault Lifecycle](#vault-lifecycle)) is held pending; DNS and nft keep denying. Any wrapper validation failure is a permanent 400 — the subject is never half-registered.
-- **Activate** on the `sandbox.data-plane-ready` Hook: DNS policy swap + one atomic nft batch (delete+add in a single `nft -f` transaction), with the vault activating at the same barrier (see [Vault Lifecycle](#vault-lifecycle)). `sandbox.runtime-ready` only confirms the deny-first install. An input update on an already-ready subject applies in place without replaying Hooks.
-- **Unload** on `REMOVE_BINDING` (terminal cleanup): detach → deny → free (enforcement + vault). A stale removal (fence mismatch for a previous instance of the same UID) is ignored; missing Handler state is success.
-- **Race handling**: identity fencing unchanged (a fence mismatch for the same UID discards all prior state — a reset can never carry old policy or old credentials into a new sandbox). The unknown-UID pending-push cache, its TTL, and the 202 semantics of the earlier design are **removed** — policy and vault arrive in the same ordered delivery as the binding, so there is no push race to absorb.
-- **Recovery**: on egress restart the Handler wipes stale kernel rules and serves a new `instanceId` on the status endpoint; the Fastlet replays the latest `SET_BINDING` followed by the already-reached Hooks for every live sandbox — egress re-opens the binding's ciphertext and every subject re-enters `denying`, then activates (vault recovery: see [Vault Lifecycle](#vault-lifecycle); no server reconciliation is needed).
+- **Register**: identity + fencing from the envelope (`sandbox.uid`, `revision`); the policy parses fully before any mutation; deny-first installs immediately — blocked until activation. A bad input is a permanent 400 — never half-registered.
+- **Activate**: DNS policy swap + one atomic nft batch; the vault activates at the same barrier. `runtime-ready` only confirms the deny-first install; updates on a ready subject apply in place.
+- **Unload**: `REMOVE_BINDING` is terminal (enforcement, vault memory, file); stale removals (fence mismatch) are ignored, missing state is success.
+- **Races**: fence mismatch discards all prior state — a reset never carries old policy or credentials into a new sandbox. Relay vault ops validate point-in-time: unregistered subject → 404, consistency failure → NACK keeps last-good (see [Vault Lifecycle](#vault-lifecycle)).
+- **Recovery**: egress restart → new `instanceId` → Fastlet replays binding + reached hooks → vault files reload at registration → deny → activate. No server reconciliation.
 
 ### Per-Subject Policy Consumption
 
@@ -191,7 +252,7 @@ The Fastlet is the only lifecycle dispatcher; egress is the Handler.
         └── resolved IPs ──► dynamic allow sets (per subject)
 ```
 
-Each subject owns an isolated slice (policy, vault, kernel sets); the resolver is the only shared component (pure map lookup). The vault slice is sourced from the binding (opened once per `SET_BINDING`) instead of a push API. The mitmdump instance is shared in the fast-sandbox adapter; per-subject listeners are only needed where identity is not recoverable from the socket (bwrap uid mode).
+Each subject owns an isolated slice (policy, vault, kernel sets); the resolver is the only shared component (pure map lookup). The vault slice is loaded from the egress-local vault file at registration and updated in place via the relay channel. The mitmdump instance is shared in the fast-sandbox adapter; per-subject listeners are only needed where identity is not recoverable from the socket (bwrap uid mode).
 
 ### Sequences
 
@@ -203,29 +264,31 @@ sequenceDiagram
     participant C as Controller
     participant F as Fastlet (action dispatcher)
     participant E as Egress handler<br/>(127.0.0.1:18080, loopback)
+    participant FP as FastPath (control plane)
     participant SRV as OpenSandbox server
     participant SDK as User / SDK
 
-    SRV->>C: CreateSandbox (actionBindings: egress input = policy wrapper)
+    SRV->>FP: CreateSandbox (actionBindings: egress input = policy)
+    FP->>C: persist Sandbox CRD (binding delivered via watch)
     C->>F: create runtime (RPC, binding delivered in order)
-    F->>E: SET\_BINDING (sandbox uid, revision, attachment.network, wrapper{policy})
+    F->>E: SET\_BINDING (sandbox uid, revision, attachment.network, policy)
     E->>E: Register subject: deny-first rules, gateway DNS redirect, MITM DNAT
     Note over E: policy held pending - DNS/nft keep denying
     F->>F: EnsureSandbox succeeds
     F->>E: LIFECYCLE\_HOOK sandbox.runtime-ready
     F->>F: data plane ready (route published)
     F->>E: LIFECYCLE\_HOOK sandbox.data-plane-ready
-    E->>E: apply policy atomically → active
+    E->>E: apply policy (+ vault file, if any) → active
     SDK->>SRV: POST /v1/sandboxes/{id}/credential-vault
-    SRV->>SRV: seal vault revision (pool key, AAD = sandbox uid)
-    SRV->>C: binding replacement (wrapper{policy, vault ct})
-    C->>F: binding replacement delivered in order
-    F->>E: SET\_BINDING (new input, same identity fence)
-    E->>E: open + validate → vault active in place (no Hook replay)
-    SRV-->>SDK: sanitized revision ack (after binding Ready)
+    SRV->>FP: InvokeHandlerAction(sandbox, vault PUT)
+    FP->>F: relay to Pool handler (ownership validated)
+    F->>E: PUT /vault/{uid} (loopback)
+    E->>E: validate vs policy → persist file → apply in place
+    E-->>SRV: relayed result {revision, state}
+    SRV-->>SDK: sanitized revision ack
 ```
 
-Invariant: deny-first is installed at `SET_BINDING`, which precedes the `sandbox.runtime-ready` Hook — the sandbox is enforced from before its runtime exists; the Hooks can be late, never early-open. A vault replacement that races `data-plane-ready` waits at the same barrier as the policy; delivered after, it applies in place. The server acknowledges a vault revision only after the binding status reports Ready — there is never a state where the server believes credentials are in place and the subject has not loaded them.
+Invariant: deny-first is installed at `SET_BINDING`, before the runtime exists — Hooks can be late, never early-open. A vault `PUT` on a not-yet-active subject waits at the same barrier; after, it applies in place. The relay response **is** the ack: success means egress has validated, persisted, and applied the revision — the server never believes credentials are in place before the subject has loaded them.
 
 #### Runtime updates
 
@@ -233,41 +296,46 @@ Invariant: deny-first is installed at `SET_BINDING`, which precedes the `sandbox
 sequenceDiagram
     autonumber
     participant U as SDK / server
+    participant SRV as OpenSandbox server
+    participant FP as FastPath
     participant C as Controller
     participant F as Fastlet (action dispatcher)
     participant E as Egress handler
 
     alt Policy update
-        U->>C: PUT /v1/sandboxes/{id}/networkpolicy (replace)
-        C->>F: binding replacement (wrapper{new policy, vault copied verbatim})
+        U->>SRV: PUT /v1/sandboxes/{id}/networkpolicy (replace)
+        SRV->>FP: UpdateSandbox (ReplaceActionBindings)
+        FP->>C: persist binding (watch delivery)
+        C->>F: binding replacement (bare policy input)
         F->>E: SET\_BINDING (same fence)
-        E->>E: DNS swap (atomic) + nft batch rebuild (vault re-opened, unchanged)
+        E->>E: validate vs loaded vault → NACK keeps last-good / apply: DNS swap + nft rebuild in place
     else Vault update / removal
-        U->>C: PATCH|DELETE /v1/sandboxes/{id}/credential-vault
-        C->>F: binding replacement (wrapper{policy verbatim, re-sealed or null vault})
-        F->>E: SET\_BINDING (same fence)
-        E->>E: open + validate → vault rebind / drop in place
+        U->>SRV: PATCH|DELETE /v1/sandboxes/{id}/credential-vault
+        SRV->>FP: InvokeHandlerAction (relay)
+        FP->>F: relay to Pool handler
+        F->>E: PUT|DELETE /vault/{uid}
+        E->>E: validate vs policy → persist → apply in place / NACK
     end
 ```
 
-Unload is declarative: sandbox deletion → Fastlet sends `REMOVE_BINDING` → egress tears the subject down. No lifecycle verb exists anywhere else.
+Unload is declarative (`REMOVE_BINDING`: enforcement, vault memory, file). Vault mutations exist only on the relay; policy mutations only on the binding.
 
 ## System Boundaries
 
 ### Profile Separation
 
-The two profiles are mutually exclusive deployment forms. `sidecar`: a service inside the sandbox network domain owning the public contract (18080, `/policy`, `/credential-vault`) — unchanged. `fast-sandbox` (`OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`): a host-domain control-plane component that is **Actions-only** — the listener serves `/_fastlet/v1/actions*` and `/healthz` on Pod-netns loopback; no HTTP policy or vault surface exists in this profile (the routes are absent, not merely protected); credentials are sealed into the binding by the server.
+The two profiles are mutually exclusive deployment forms. `sidecar`: a service inside the sandbox network domain owning the public contract (18080, `/policy`, `/credential-vault`) — unchanged. `fast-sandbox` (`OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`): a host-domain control-plane component that serves `/_fastlet/v1/actions*`, `/healthz`, and the relay-only vault surface (`/vault/{sandboxUid}`) on Pod-netns loopback; policy rides the binding; credentials are pushed by the server over the FastPath relay and persist in the egress volume (plaintext in v1).
 
 ### Security Boundaries
 
 | Boundary | Guarantee |
 |----------|-----------|
-| No sandbox-reachable policy surface | Listener on Pod-netns loopback only; sandbox guests cannot reach it; the Fastlet action dispatcher is the only peer. No UID-header trust is needed — policy and vault identity come from the Fastlet-delivered envelope |
+| No sandbox-reachable control surface | Listener on Pod-netns loopback only; sandbox guests cannot reach it; the Fastlet action dispatcher and the relay path are the only peers. No UID-header trust is needed — vault identity is FastPath-validated (tenant-scoped sandbox ownership); policy identity comes from the Fastlet-delivered envelope |
 | Control plane outside the sandbox | Egress daemon never runs in the guest (RFC #1582 trust-boundary analysis); sandbox users run privileged and cannot touch it |
-| Credentials ciphertext-at-rest, plaintext memory-only | Vault revisions ride the binding as AEAD ciphertext (pool key, AAD = sandbox UID): the Sandbox CRD, etcd, and backups hold ciphertext only; egress opens revisions into memory; plaintext is never persisted and exists in the server only transiently at vault-write composition (open-merge-reseal; policy updates never decrypt). No credential traffic traverses fastlet-proxy or any other proxy. This revises OSEP-0012's sidecar framing for this profile |
-| Key custody | Pool-scoped cryptographic material — the vault seal key and the MITM CA keypair — exists only in the egress container (FastletTemplate Secret volume) and in server/template tooling; the MITM CA private key never leaves the egress container (templates carry only the public certificate); rotation via `kid` with decrypt-only grace keys (vault) and deliberate keypair rollover (CA); a leaked server pool configuration decrypts that pool's vault history |
-| Fail-closed at every transition | `denying` state, atomic policy swaps, deny-first registration, data-plane-ready as the only activation signal, and undecryptable/invalid vault as a permanent binding failure (never a half-open subject) |
-| Management plane independent of subject state | Policy and vault updates ride declarative binding replacement — accepted while `denying` (held pending) or `active` (in place); no HTTP push surface exists to protect |
+| Vault material never in the control-plane store; plaintext at rest in v1, owned | The Sandbox CRD, etcd, and backups never carry vault material. In v1 vault state persists **in plaintext** in the egress Pod volume and in snapshot-bundle files — the trust surface grows from process memory to Pod volume + snapshot storage, both of which must be access-controlled (deployment prerequisite; see [Vault Storage](#vault-storage)). Plaintext traverses the server only transiently during `PATCH` merges; no credential traffic traverses fastlet-proxy or any other proxy. AEAD sealing of the vault file (pool key, AAD = sandbox UID) is deferred, egress-local hardening — it restores ciphertext-only-at-rest without changing the channel, surfaces, or lifecycle ([Vault Sealing](#vault-sealing-deferred)) |
+| Key custody | Pool-scoped cryptographic material in v1 is the **MITM CA keypair only** — it exists only in the egress container (FastletTemplate Secret volume) and in template tooling; the CA private key never leaves the egress container (templates carry only the public certificate); rotation is deliberate keypair rollover. The vault seal key is deferred with vault sealing — an egress-local follow-up, non-breaking ([Vault Sealing](#vault-sealing-deferred)) |
+| Fail-closed at every transition | `denying` state, atomic policy swaps, deny-first registration, data-plane-ready as the only activation signal; registration-time input failure never registers the subject; a vault op that fails validation NACKs and keeps last-good (never half-open); a vault file that fails to load at registration degrades that subject's vault — observably |
+| Management plane independent of subject state | Policy updates ride declarative binding replacement; vault updates ride the relay — both accepted while `denying` (held to the barrier) or `active` (in place); both surfaces are loopback-only and sandbox-unreachable |
 | No creation window when egress is unavailable | The OpenSandbox runtime driver probes egress healthz (`127.0.0.1:18080/healthz`, same Pod netns) inside `EnsureSandbox` before creating the sandbox container; unready egress rejects creation. Deny-first is installed at `SET_BINDING`, which precedes the `sandbox.runtime-ready` Hook, and deny-first installation is far faster than container startup; a fully deterministic guarantee (independent of timing) would additionally require the driver to confirm the subject is registered before container creation — recorded as a known trade-off |
 | Dispatch key unforgeability | IPAM + per-sandbox netns without `NET_ADMIN` (existing); the new OpenSandbox driver additionally drops `NET_RAW`; Pod netns rp_filter strict mode rejects forged source IPs (iifname binding is not usable on the bridge topology — the IP hooks see skb->dev = the bridge) |
 | Enforcement placement | Pod netns `hook forward` (ACCEPT policy + unmarked-drop tail; allowed traffic is marked in per-subject `hook prerouting` chains with `meta mark set 0x2`, because an explicit forward `accept` cannot pass on the `bridge-nf-call-iptables=1` Firecracker bridge topology — the frame returns to the bridge L2 path and is dropped before postrouting) plus the Pod-netns INPUT chain for intercepted MITM traffic; Kata covered via TAP (same forward surface). The earlier per-sandbox netns OUTPUT defense-in-depth layer is dropped (the action envelope does not carry the netns path; the Pod-netns layers are authoritative for both forwarded and intercepted traffic) |
@@ -281,12 +349,12 @@ The two profiles are mutually exclusive deployment forms. `sidecar`: a service i
 | DNS | gateway REDIRECT → shared proxy on :15353 | per-subject port REDIRECT `-m owner --uid-owner` (port = subject) |
 | MITM | shared mitmdump, vault by client IP | per-subject ports |
 | Lifecycle authority | Fastlet action dispatcher (`SET_BINDING` / `LIFECYCLE_HOOK` / `REMOVE_BINDING`, `sandbox.fast.io/actions/v1`) | execd session registry, same protocol pattern (TBD, detailed separately) |
-| Credentials | encrypted vault in `binding.input` (pool-key AEAD, this revision) | same envelope over its adapter (TBD, detailed separately) |
-| Endpoint | `/_fastlet/v1/actions` (Fastlet, Pod loopback) — no other egress endpoint in this profile | TBD (execd adapter to be detailed separately) |
+| Credentials | egress-held vault — relay channel, egress-local file (this revision) | same relay/storage model over its adapter (TBD, detailed separately) |
+| Endpoint | `/_fastlet/v1/actions` + `/vault/{uid}` (Fastlet-relayed, Pod loopback) | TBD (execd adapter to be detailed separately) |
 
 ### Scaling Constraints
 
-Two scales matter independently. **Cluster-wide** there is no centralized bottleneck: bindings are delivered point-to-point by each Fastlet — no watch storm, no etcd write amplification, no API-server dependency in the control path, and no server push fan-out (the per-Pod credential push loop of the earlier design is gone). **Per-Pod density** (target 64 subjects/Pod, ≤100 policy updates/s/Pod): nft dispatch is O(1) with incremental per-subject set updates; the connection-refresh loop is bucketed per subject; one shared mitmdump; DNS proxy is a stateless map lookup; a vault-bearing `SET_BINDING` adds one AEAD open (microseconds) per delivery and replay. Server orchestration is a pure mapping and needs no idempotent-retry machinery: a failed binding is retried by the Fastlet's dispatcher, and the sandbox simply does not become usable until the binding reports Ready.
+Two scales matter independently. **Cluster-wide** there is no centralized bottleneck for policy: bindings are delivered point-to-point by each Fastlet — no watch storm, no etcd write amplification, no API-server dependency in the policy control path. Vault ops are user-initiated, sandbox-lifetime-frequency operations over the relay (a `PUT` is one consistency check + one atomic file write) — there is no reconcile loop and no recovery-driven fan-out, because egress self-persistence covers restarts and restores. **Per-Pod density** (target 64 subjects/Pod, ≤100 policy updates/s/Pod): nft dispatch is O(1) with incremental per-subject set updates; the connection-refresh loop is bucketed per subject; one shared mitmdump; DNS proxy is a stateless map lookup; `SET_BINDING` replay adds one vault-file load per subject. Policy orchestration needs no idempotent-retry machinery: a failed binding is retried by the Fastlet's dispatcher, and the sandbox simply does not become usable until the binding reports Ready. Vault ops are synchronous RPCs — a failure returns to the caller directly.
 
 ## Impact on fast-sandbox
 
@@ -297,47 +365,50 @@ Verified against current source (`internal/runtime/containerd/driver.go` and the
 | Requirement | Status | Notes |
 |------------|--------|-------|
 | Sandbox Actions Handler protocol: `GET /_fastlet/v1/actions/status` + `POST /_fastlet/v1/actions` (`SET_BINDING` / `LIFECYCLE_HOOK` / `REMOVE_BINDING`), ordered delivery, `instanceId` replay | ✅ already present | consumed as-is by egress; the handler binds the Pool-declared `targetHTTPPort` (18080) |
-| `actionHandlers` / `actionBindings` in Pool/Sandbox specs | ✅ already present | egress is declared as a Handler; the input carries the wrapper. Note the CRD cap: input MaxLength 65536 bytes constrains wrapper size |
+| `actionHandlers` / `actionBindings` in Pool/Sandbox specs | ✅ already present | egress is declared as a Handler; the input carries the bare policy (the 65536-byte input cap no longer constrains vault size — the vault is not in the binding) |
 | Slot pre-provisioning: netns/veth/MASQUERADE ready before sandbox creation; network attachment (IP, gateway, veth) delivered with `SET_BINDING` before runtime creation | ✅ already present | basis of the no-creation-window guarantee. Timing note: the first `SET_BINDING` is emitted at admission, before slot acquisition, so its `attachment.network` is empty; egress rejects it and the dispatcher's at-least-once retry converges once the slot is filled. Recommended hardening: include network fields in the attachment ID (or acquire the slot before registering bindings) to make delivery deterministic |
 | Sandbox without `NET_ADMIN` (dispatch key unforgeable) | ✅ already present | spec sets no capabilities; runc defaults exclude `NET_ADMIN` |
 | Sandbox without `NET_RAW` | ❌ new driver work | runc defaults grant `NET_RAW` (UDP source spoofing would weaken the source-IP dispatch key); the OpenSandbox runtime driver must drop it (see below) |
-| Per-pool egress Secret in `FastletTemplate` | ✅ deployment-level | one Secret carries the vault seal key (`{kid, key}` entries) and the MITM CA keypair; read-only seed mounts, idempotent copy at egress startup (see [Key Management](#key-management), [MITM Trust Anchor](#mitm-trust-anchor)); no code change |
+| FastPath v2 handler-relay verb: `InvokeHandlerAction(sandbox, handler, payload) → per-handler result` | ❌ new platform contract | generic and vault-agnostic — the single RPC ask to fast-sandbox; identity is FastPath-validated (tenant-scoped sandbox ownership), replacing the earlier UID-header trust argument; today's only handler-input verb is `ReplaceActionBindings` (the CRD path) |
+| Fastlet relay hop to the Pool handler's loopback port | ❌ new fastlet code | forwards relay payloads to the declared handler `targetHTTPPort` and returns the handler's response as the RPC result; reuses the existing loopback delivery path |
+| Snapshot manifest carries egress-owned vault files; pause/resume invoke egress export/import | ❌ new fastlet/driver work | export is driver-invoked inside the pause flow — strictly before the runtime teardown purges the local file; import is driver-invoked before `data-plane-ready` at restore; the file follows the sandbox to any Pod |
+| Per-pool egress Secret in `FastletTemplate` | ✅ deployment-level | one Secret carries the MITM CA keypair in v1 (the vault seal key is deferred with vault sealing — see [Vault Sealing](#vault-sealing-deferred)); read-only seed mounts, idempotent copy at egress startup (see [MITM Trust Anchor](#mitm-trust-anchor)); no code change |
 | MITM CA certificate baked into sandbox templates | ✅ build-level | template builder installs the pinned pool CA into the guest trust store plus client env vars, on the same build-time rootfs pass that bakes `/etc/resolv.conf` for egress-managed pools; the template↔pool Secret pairing is an operator contract, surfaced via the CA fingerprint on `/healthz` |
 
-The route-credential and fastlet-proxy requirements of the earlier revision are removed: egress no longer consumes any proxy route.
+The route-credential and fastlet-proxy requirements of the earlier revision remain removed — egress consumes no proxy route; the imperative channel is the FastPath relay instead.
 
 ### Explicitly Untouched
 
-fast-sandbox CRDs, RPC protocol, `SandboxSpec`, fastlet phases/admission/deletion paths, the data-plane reconcile loop, route-credential issuance/verification (unused by egress), `sandbox-init` supervisor, the existing containerd/firecracker runtime drivers, `specs/egress-api.yaml`, sidecar SDK vault semantics, and the server's K8s-mode egress helper (`egress_helper.py`) are untouched. The earlier revision's "Internal Additions" are deleted: host-process delivery already exists in the infra catalog; the fastlet-proxy host upstream, `X-Fast-Sandbox-Uid` propagation, and the `/v1/sandboxes/{sandboxId}/egress/*` route-parsing branch served only the dropped proxy-route channel.
+fast-sandbox CRDs, `SandboxSpec`, fastlet phases/admission/deletion paths, the data-plane reconcile loop, route-credential issuance/verification (unused by egress), `sandbox-init` supervisor, the existing containerd/firecracker runtime drivers, `specs/egress-api.yaml`, sidecar SDK vault semantics, and the server's K8s-mode egress helper (`egress_helper.py`) are untouched. The enumerated platform changes are exactly the three requirements marked ❌ above (relay verb, fastlet relay hop, snapshot vault files + pause/resume hooks); the fastlet-proxy additions of the earlier revision (host upstream, `X-Fast-Sandbox-Uid`, egress route parsing) stay deleted.
 
 **OpenSandbox runtime driver** — the first of two contained fast-sandbox code additions (the second is template-builder CA baking): a **new `internal/runtime/contract.Driver` implementation** registered in the runtime factory alongside containerd/firecracker. Its container spec drops `NET_RAW` (runc defaults grant it → UDP source spoofing would weaken the source-IP dispatch key; Pod netns rp_filter strict mode — set by egress at startup — is the remaining defense against forged source IPs). The egress healthz probe lives inside its `EnsureSandbox` (before container creation): unready egress → reject with a runtime-unavailable error. Existing drivers are untouched; existing Fastlet Pods without the egress component behave exactly as today.
 
 ### OpenSandbox Server
 
-- Fast Sandbox mapping removes the phase-1a rejection of `credentialProxy`: `networkPolicy` maps into the Create request's egress binding input (as today); the vault is **not** carried at create time — it is created and patched after creation through the server vault API, which performs a binding replacement.
-- New server API (additive; lifecycle spec update): `POST|PATCH|DELETE /v1/sandboxes/{sandboxId}/credential-vault` — the server composes the wrapper (policy verbatim from the current binding; vault re-sealed with the pool key, AAD = sandbox UID; DELETE seals `vault: null`), replaces the action bindings, and acknowledges sanitized revision metadata only after the binding status reports Ready.
-- Reads mirror the sidecar contract, served by the server: `GET /v1/sandboxes/{sandboxId}/credential-vault` (sanitized vault state) plus the sanitized metadata reads (`GET .../credential-vault/credentials[/{name}]`, `GET .../credential-vault/bindings[/{name}]`). The server implements them locally — it opens the current revision with the pool key and returns the sanitized shape the sidecar would return (names, binding metadata, revision; credential values are never returned), with no egress route involved (the egress listener has no vault surface in this profile). SDK semantics are therefore identical across profiles: `get`/`list` behave the same everywhere, and readback resolves a lost mutation ack or discovers the current `expectedRevision` (the OSEP-0023 recovery pattern).
-- The server composes vault revisions without persisting plaintext: at any vault write (`POST` or `PATCH`) it opens the current revision transiently in memory with the pool key, applies the delta (add/replace/delete) to the opened vault, and re-seals the complete revision under the newest `kid` — the persisted form remains ciphertext-only. Policy updates never decrypt: the server copies the `vault` object verbatim from the current binding. Plaintext exists in the server process only transiently, during vault-write composition.
-- Pool-level key configuration (`kid` + key) ships with the pool's server-side configuration and must match the FastletTemplate Secret volume; the same Secret carries the MITM CA keypair (see [MITM Trust Anchor](#mitm-trust-anchor)), whose public certificate must in turn match the sandbox template the pool references.
-- Binding input size pre-flight against the 65536-byte CRD cap.
+- Fast Sandbox mapping removes the phase-1a rejection of `credentialProxy`: `networkPolicy` maps into the Create request's egress binding input (as today, bare policy); the vault is **not** carried at create time — it is created and patched after creation through the server vault API over the relay.
+- Server API (additive; lifecycle spec update): `POST|PATCH|DELETE /v1/sandboxes/{sandboxId}/credential-vault` — the server relays to egress: `POST`/`DELETE` map 1:1 to relay `PUT`/`DELETE`; `PATCH` is a read-modify-write (relay `GET` → merge in server memory → relay `PUT`). The **relay response is the ack** — it carries the egress-validated revision and state, so the server acknowledges synchronously (no binding-status wait).
+- Reads: `GET /v1/sandboxes/{sandboxId}/credential-vault` plus the sanitized metadata reads (`GET .../credential-vault/credentials[/{name}]`, `GET .../credential-vault/bindings[/{name}]`) relay to egress, which returns the **full revision** (the internal `GET` — also what `PATCH` merges against); the **server strips credential values** and returns the sanitized sidecar shapes (names, binding metadata, revision). SDK semantics are identical across profiles, and readback resolves a lost mutation ack or discovers the current `expectedRevision` (the OSEP-0023 recovery pattern).
+- Plaintext credential values traverse the server only transiently during `PATCH` composition; the server holds no vault state and no vault keys in v1 (no sealing) — it is a relay + merge point.
+- The MITM CA certificate must match the pool Secret and the sandbox template the pool references (see [MITM Trust Anchor](#mitm-trust-anchor)); the earlier pool-level vault key configuration is dropped with sealing (deferred).
 - Policy updates ride `PUT /v1/sandboxes/{sandboxId}/networkpolicy` (complete replacement) — unchanged. Egress readiness surfaced via the platform's `InfraComponentStatus` channel (optional, non-blocking) — unchanged.
 
 ## Test Plan
 
-- Unit: wrapper parsing/versioning and bare-policy compatibility; AEAD open failures (unknown `kid`, tampered ciphertext, AAD transplant across sandboxes); `vault: null` vs envelope-null semantics; vault-vs-policy consistency checks; pinned-CA confdir seeding (idempotent seed copy materializing `mitmproxy-ca.pem`/`mitmproxy-ca-cert.pem`; missing or unloadable CA fails the MITM addon closed while policy actions keep serving; sidecar generate-on-start unchanged); subject registry transitions and fail-closed invariants; server-side sanitized reads (decrypt-on-read returns names/binding metadata/revision with values stripped; read shapes identical to the sidecar contract); action-envelope parsing/validation (unknown apiVersion/operation/Hook rejected); rule-builder determinism; dispatch (DNS per-subject, nft sets, mitm vault selection).
-- fast-sandbox e2e (Kind): N sandboxes with distinct policies and vaults on one Fastlet Pod; per-subject allow/deny at DNS/nft and per-subject credential injection; sibling isolation; fail-closed create-then-configure window (deny-first from `SET_BINDING`, policy and vault only after `data-plane-ready`); in-place vault revision swap on a live subject; server readback after a simulated lost mutation ack returns sanitized state and a usable `expectedRevision`; tampered or kid-mismatched binding → binding `ActionFailed`, sandbox never usable, no stale rules; egress-restart recovery (new `instanceId` → replay → ciphertext re-opened → `denying` → active, **no server re-push**); pause/resume → vault survives restore; guest HTTPS verified against the template-baked CA across egress restart and pause/resume; pinned-CA fingerprint on `/healthz` flags a template↔pool Secret mispairing; key rotation (dual-kid decrypt window, a vault write re-seals the whole revision under the newest `kid`, policy-only updates copy verbatim); wrapper `vault: null` removes credentials; legacy bare-policy pools keep working (including a pool with no CA Secret: policy served, MITM addon down surfaced on `/healthz`); sandbox cannot reach any policy or vault mutation surface (routes absent → 404); stale `REMOVE_BINDING` (fence mismatch) ignored.
+- Unit: vault surface semantics (unknown subject → 404; consistency failure → 400/NACK with last-good kept; `expectedRevision` conflict → 409; PUT validates before mutating); vault storage (atomic write via temp+rename, reload at `SET_BINDING` registration, corrupt file → subject registers with vault degraded and `/healthz`/status surface it, purge on `REMOVE_BINDING`, file format `v: 1` gating); server-side `PATCH` merge (relay GET → merge → PUT; values never persisted server-side); public reads sanitize (values stripped before the SDK response; the relay GET returns the full revision); successful `PUT` clears a degraded vault; relay result shapes (sync ack carries revision + state); pinned-CA confdir seeding (idempotent seed copy materializing `mitmproxy-ca.pem`/`mitmproxy-ca-cert.pem`; missing or unloadable CA fails the MITM addon closed while policy actions keep serving; sidecar generate-on-start unchanged); subject registry transitions and fail-closed invariants; action-envelope parsing/validation (unknown apiVersion/operation/Hook rejected); rule-builder determinism; dispatch (DNS per-subject, nft sets, mitm vault selection).
+- fast-sandbox e2e (Kind): N sandboxes with distinct policies and vaults on one Fastlet Pod; per-subject allow/deny at DNS/nft and per-subject credential injection; sibling isolation; fail-closed create-then-configure window (deny-first from `SET_BINDING`, policy and vault only after `data-plane-ready`; vault op before ready → 404); in-place vault revision swap on a live subject with a synchronous relay ack; policy update conflicting with a loaded vault → NACK, subject stays active on last-good, error visible in the relay response and actions status; egress-restart recovery (new `instanceId` → replay → vault file reloaded at registration → `denying` → active, **no server re-push**); pause/resume → vault file exported into the bundle and re-imported before `data-plane-ready`, vault survives restore on the same and a different Pod; export strictly precedes teardown (`REMOVE_BINDING` purges the file, bundle copy intact); vault op on a paused (sealed) subject → 409; guest HTTPS verified against the template-baked CA across egress restart and pause/resume; pinned-CA fingerprint on `/healthz` flags a template↔pool Secret mispairing; `DELETE` removes credentials and keeps policy; legacy bare-policy pools keep working (including a pool with no CA Secret: policy served, MITM addon down surfaced on `/healthz`); sandbox cannot reach any policy or vault mutation surface (loopback-only → unreachable); stale `REMOVE_BINDING` (fence mismatch) ignored.
+- (Deferred with sealing: AEAD open failures, unknown-`kid` handling, tampered-ciphertext and key-rotation-window tests.)
 - bwrap: per-uid dispatch with host-uid allowlist intact. Kata: policy enforced via the Pod netns forward hook.
 - Compatibility: full egress suite in `sidecar` profile; `test_egress_helper.py` unchanged.
-- Manual: kill mid-transition; restart storm; key rotation under load; corrupt key volume (subjects stuck denying, observable).
+- Manual: kill mid-transition; restart storm; kill mid-vault-write (temp+rename leaves the last-good file); corrupt the egress vault volume (subjects degraded, observable, policy unaffected).
 
 ## Drawbacks and Alternatives
 
-Drawbacks: a Pod-domain daemon is a larger trust domain than per-sandbox processes (mitigated by per-subject isolation + deny-first); usable sandboxes require the binding + Hook flow to complete (a stuck Handler or an undecryptable binding keeps the sandbox non-Ready, fail-closed and observable); **credentials now exist as ciphertext at rest** in the Sandbox CRD, etcd, and backups until sandbox deletion — the absolute nothing-at-rest property of the dropped proxy-route channel is traded for a pool-scoped key-management obligation (custody, rotation, compromise runbook), and a leaked server pool configuration decrypts that pool's vault history; the baked MITM certificate couples a sandbox template to its pool's CA — rotation requires a template rebuild and pool rollover, and a leaked CA key is MITM capability for the pool until rotated; the binding-input wrapper is a new OpenSandbox-owned contract between server and egress that must be versioned and pinned by shared conformance test vectors.
+Drawbacks: a Pod-domain daemon is a larger trust domain than per-sandbox processes (mitigated by per-subject isolation + deny-first); usable sandboxes require the binding + Hook flow to complete (fail-closed and observable); **vault material persists in plaintext** in the egress volume and snapshot-bundle files in v1 — the trust surface grows from process memory to Pod volume + snapshot storage, both of which must be access-controlled (the deferred hardening restores ciphertext-at-rest, [Vault Sealing](#vault-sealing-deferred)); **the platform contract is no longer zero** — one generic FastPath relay verb, the fastlet relay hop, and snapshot-file support are negotiating surface with fast-sandbox; the two-channel split makes policy↔vault consistency a point-in-time check at egress — a concurrent policy + vault update can surface an order-dependent (but deterministic and retryable) 400, and a rejected update NACKs instead of atomically swapping both; the sealed binding's free replay/restore recovery is replaced by egress-local persistence + snapshot files — recovery machinery is re-owned, not eliminated; the baked MITM certificate couples a sandbox template to its pool's CA — rotation requires a template rebuild and pool rollover, and a leaked CA key is MITM capability for the pool until rotated; the vault file format + relay payload are a new OpenSandbox-owned contract that must be versioned and pinned by shared conformance test vectors.
 
-Alternatives considered: slot-store file observation (rejected — the store is a fastlet-internal implementation detail with no stability contract; superseded by the public Sandbox Actions protocol); per-subject host-side processes (kept as deployment variant); per-sandbox sidecar in the guest netns (rejected — control plane inside the trust boundary it controls is not a security control); eBPF/cgroup dispatch (deferred); an egress-specific policy carrier CRD/ConfigMap (rejected — semantic mismatch, etcd write amplification, watch storms, credential exposure, and it couples a generic component to the cluster API; the platform's own `actionBindings` carry policy declaratively without any of these costs); **credential delivery over the fastlet-proxy route (this OSEP's earlier revision — rejected: it required three fastlet-proxy additions, a UID-header trust argument, and a server push/reconcile loop to survive egress restarts and snapshot restores, all to preserve a nothing-at-rest property that the sealed binding achieves more simply — with ciphertext instead of absence)**; vault credentials via a host-domain unix socket or Kubernetes Secret volume (rejected — a new host-local transport to secure and a kubelet sync dependency; the sealed binding needs neither — Secret volumes remain the transport for egress key material, which is a different thing from vault plaintext).
+Alternatives considered: slot-store file observation (rejected — the store is a fastlet-internal implementation detail with no stability contract; superseded by the public Sandbox Actions protocol); per-subject host-side processes (kept as deployment variant); per-sandbox sidecar in the guest netns (rejected — control plane inside the trust boundary it controls is not a security control); eBPF/cgroup dispatch (deferred); an egress-specific policy carrier CRD/ConfigMap (rejected — semantic mismatch, etcd write amplification, watch storms, credential exposure, and it couples a generic component to the cluster API; the platform's own `actionBindings` carry policy declaratively without any of these costs); **vault sealed into the binding (the previous revision of this OSEP — rejected: binding-status acks are asynchronous and slower than one relay hop, validation failures surface as async status instead of the API response, vault size collides with the 65536-byte input cap, and credential ciphertext lands in the CRD/etcd/backups under a pool-key custody obligation; its free replay/restore recovery is what egress-local persistence + snapshot files re-implement)**; **credential delivery over the fastlet-proxy route (an earlier revision of this OSEP — rejected: it required three fastlet-proxy additions and a UID-header trust argument — a proxy vouching for identity; superseded by the FastPath relay, which keeps the imperative channel but moves identity validation into the platform control plane)**; vault credentials via a host-domain unix socket or Kubernetes Secret volume (rejected — a new host-local transport to secure and a kubelet sync dependency; the relay + egress-local file needs neither — Secret volumes remain the transport for egress key material, which is a different thing from vault plaintext).
 
 ## Infrastructure and Migration
 
-- fast-sandbox: **no platform-contract changes** — Actions protocol, CRDs, RPC, and fastlet/fastlet-proxy paths are untouched. Two contained code additions: the **OpenSandbox runtime driver** (new `contract.Driver`: drops `NET_RAW`, probes egress healthz pre-create) and **template-builder CA baking** for egress-managed pools. Deployment config: egress container in Pool `FastletTemplate` (Pod-netns privileges) plus the per-pool egress Secret (vault seal key + MITM CA keypair); egress-managed templates bake the pinned CA's public certificate at build time. Clusters serving credential-enabled pools must enable Secret encryption at rest (KMS envelope plugin) so the key Secret never lands usable in etcd or etcd backups; policy-only pools carry no such requirement. Cross-repo dependency: the wrapper format is shared between the server (Python) and egress (Go) — keep it versioned (`osbEgressInput`) with shared conformance test vectors in the OpenSandbox repo.
-- OSEP-0012 gains a fast-sandbox-profile delta note: vault state for this profile is ciphertext-at-rest in the Sandbox CRD and plaintext-in-egress-memory only; sidecar semantics are unchanged.
-- `sidecar` is the default profile; existing deployments upgrade with zero config change. `fast-sandbox` profile is opt-in (`OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`); Fastlet Pods without the egress component behave exactly as today until an operator enables it. Rollout order: egress wrapper support behind the profile feature gate (no fast-sandbox code needed) → server key ops + `credentialProxy` mapping + vault API → docs. The previously planned proxy-route rollout stages are cancelled. Pools that never use `credentialProxy` are unaffected end to end (bare-policy inputs remain valid).
+- fast-sandbox: three platform asks, all generic and vault-agnostic — the **FastPath v2 handler-relay verb**, the **fastlet relay hop** to Pool handlers, and **snapshot vault files** (manifest entry + pause/resume export/import hooks). OpenSandbox-side additions: the **OpenSandbox runtime driver** (new `contract.Driver`: drops `NET_RAW`, probes egress healthz pre-create), **template-builder CA baking** for egress-managed pools, and the **egress vault surface + storage** (this OSEP). Deployment config: egress container in Pool `FastletTemplate` (Pod-netns privileges) plus the per-pool egress Secret (MITM CA keypair only in v1) and a Pod-scoped `emptyDir` mount for vault files (see [Vault Storage](#vault-storage)); egress-managed templates bake the pinned CA's public certificate at build time. Clusters must still protect the CA Secret at rest (KMS envelope plugin on Secret encryption); **snapshot-bundle storage joins the credential trust surface in v1** (plaintext vault files) — access-controlled, encrypted-at-rest snapshot storage is a deployment prerequisite for credential-enabled pools. Cross-repo dependency: the vault file format and relay payload are shared between the server (Python) and egress (Go) — keep them versioned (`v: 1`) with shared conformance test vectors in the OpenSandbox repo.
+- OSEP-0012 gains a fast-sandbox-profile delta note: v1 vault state for this profile is plaintext at rest in the egress volume and snapshot files, plaintext in egress memory, and transiently in the server during merge; sidecar semantics (memory-only) are unchanged. Sealing the vault file restores ciphertext-at-rest without further surface changes.
+- `sidecar` is the default profile; existing deployments upgrade with zero config change. `fast-sandbox` profile is opt-in (`OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`); Fastlet Pods without the egress component behave exactly as today until an operator enables it. Rollout order: egress vault surface behind the profile feature gate (no fast-sandbox code needed) → FastPath relay verb + fastlet hop → server vault API over the relay → snapshot export/import → docs. The previously planned proxy-route rollout stages stay cancelled, and the sealed-binding rollout stages are withdrawn. Pools that never use `credentialProxy` are unaffected end to end (the bare-policy input remains the only binding shape).
