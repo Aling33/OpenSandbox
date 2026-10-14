@@ -256,7 +256,7 @@ internal sealed class HttpClientWrapper
         var url = BuildUrl(path, queryParams);
         // Buffered download: the request is trivially replayable, so it goes
         // through the wake retry like the JSON reads (streaming downloads via
-        // GetStreamAsync stay single-shot) and each attempt is sent on the
+        // ReadBytesStreamAsync stay single-shot) and each attempt is sent on the
         // transfer path, so the download is not capped by the connection
         // request timeout.
         using var response = await SendWithWakeRetryAsync(
@@ -356,9 +356,9 @@ internal sealed class HttpClientWrapper
             // Response headers have arrived (or the send failed): stop the header deadline and
             // release the linked registration. Body reads use the caller token, so they stay
             // cancellable and are never bounded by the header deadline. A duplex transport can
-            // still be writing the request body here, but HttpClient seals the request token when
-            // the send returns, so a caller cancellation after this point cannot reach that write
-            // whether or not the deadline is still alive.
+            // still be writing the request body here; disposing a source only releases its timer
+            // and registration - it never cancels - and the deadline is already disarmed while a
+            // body write is in flight, so this cleanup cannot cut that write short.
             headerDeadline.Dispose();
         }
     }
@@ -413,7 +413,12 @@ internal sealed class HttpClientWrapper
     private static async Task<byte[]> ReadContentBytesAsync(HttpContent content, CancellationToken cancellationToken)
     {
         using var source = await content.ReadAsStreamAsync().ConfigureAwait(false);
-        using var buffer = new MemoryStream();
+        // Preallocate from a declared Content-Length so a large download does not pay the
+        // doubling growth (and the transient copies it produces) of an unbounded MemoryStream;
+        // an unknown or out-of-range length keeps the default growth.
+        var declaredLength = content.Headers.ContentLength;
+        using var buffer = new MemoryStream(
+            declaredLength is > 0 and <= int.MaxValue ? (int)declaredLength.Value : 0);
         var chunk = new byte[81920];
         int read;
         while ((read = await source.ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false)) > 0)
@@ -428,9 +433,11 @@ internal sealed class HttpClientWrapper
     /// Reads a response body as a string with the caller token. Transfer responses are sent with
     /// <see cref="HttpCompletionOption.ResponseHeadersRead"/>, so their bodies are not buffered
     /// by the transport and a stalled body must stay cancellable instead of blocking the caller.
-    /// The bytes are read in chunks with the token and decoded with the charset of the
-    /// Content-Type (a byte order mark, then UTF-8, when it is missing; UTF-8 when it is
-    /// unknown) - one code path on every target framework, instead of a netstandard-only
+    /// The bytes are read in chunks with the token and decoded the way
+    /// <c>HttpContent.ReadAsStringAsync</c> does it: a declared charset is honored with its own
+    /// byte order mark skipped when present, and without one a byte order mark selects
+    /// UTF-8/UTF-16/UTF-32 and is skipped. An unknown charset decodes as UTF-8 instead of
+    /// failing the read. One code path on every target framework, instead of a netstandard-only
     /// fallback that CI could not reach.
     /// </summary>
     internal static async Task<string> ReadContentStringAsync(HttpContent content, CancellationToken cancellationToken)
@@ -441,11 +448,21 @@ internal sealed class HttpClientWrapper
         {
             try
             {
-                return Encoding.GetEncoding(charset!.Trim('"')).GetString(bytes);
+                var encoding = Encoding.GetEncoding(charset!.Trim('"'));
+                // HttpContent.ReadAsStringAsync drops the declared encoding's own preamble (byte
+                // order mark) when the bytes start with it; a foreign byte order mark is kept.
+                var preamble = encoding.GetPreamble();
+                if (preamble.Length > 0 && bytes.Length >= preamble.Length && PreambleMatches(bytes, preamble))
+                {
+                    return encoding.GetString(bytes, preamble.Length, bytes.Length - preamble.Length);
+                }
+
+                return encoding.GetString(bytes);
             }
             catch (ArgumentException)
             {
-                // Unknown charset: fall back to the UTF-8 default of HttpContent.
+                // Unknown charset: decode as UTF-8 rather than fail the read the way
+                // HttpContent.ReadAsStringAsync does; an error body must stay readable.
             }
         }
 
@@ -477,6 +494,19 @@ internal sealed class HttpClientWrapper
         }
 
         return Encoding.UTF8.GetString(bytes);
+    }
+
+    private static bool PreambleMatches(byte[] bytes, byte[] preamble)
+    {
+        for (var i = 0; i < preamble.Length; i++)
+        {
+            if (bytes[i] != preamble[i])
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private HttpRequestMessage BuildJsonRequest(HttpMethod method, string url, object? body)
