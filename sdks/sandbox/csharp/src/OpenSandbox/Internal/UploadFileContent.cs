@@ -24,6 +24,13 @@ namespace OpenSandbox.Internal;
 /// <see cref="HttpContent"/> copy APIs carry no token. The file part stays streamed - nothing is
 /// buffered in memory - and a seekable source keeps the length delimited like
 /// <see cref="StreamContent"/> does.
+/// <para>
+/// The transport serializes a request body once per hop of a 307/308 redirect. A seekable source
+/// is rewound to its initial position before every serialization, so the redirected hop resends
+/// the whole file part instead of trailing off at EOF. A non-seekable source cannot be replayed
+/// without buffering it, so a second serialization fails with an
+/// <see cref="InvalidOperationException"/> instead of silently sending an empty part.
+/// </para>
 /// </summary>
 internal sealed class UploadFileContent : HttpContent
 {
@@ -31,17 +38,22 @@ internal sealed class UploadFileContent : HttpContent
 
     private readonly Stream _source;
     private readonly CancellationToken _callerToken;
+    private readonly bool _canSeek;
+    private readonly long _initialPosition;
+    private int _serializations;
 
     public UploadFileContent(Stream source, CancellationToken callerToken)
     {
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _callerToken = callerToken;
+        _canSeek = _source.CanSeek;
+        _initialPosition = _canSeek ? _source.Position : 0L;
 
         // Mirror StreamContent: a seekable source lets the multipart content compute a total
         // Content-Length, so the upload stays length-delimited instead of chunked.
-        if (_source.CanSeek)
+        if (_canSeek)
         {
-            Headers.ContentLength = _source.Length - _source.Position;
+            Headers.ContentLength = _source.Length - _initialPosition;
         }
     }
 
@@ -66,6 +78,8 @@ internal sealed class UploadFileContent : HttpContent
     /// </summary>
     internal async Task CopySourceToAsync(Stream destination, CancellationToken transportToken)
     {
+        ReplayOrThrow();
+
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(_callerToken, transportToken);
         var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
         try
@@ -95,14 +109,38 @@ internal sealed class UploadFileContent : HttpContent
 
     protected override bool TryComputeLength(out long length)
     {
-        if (_source.CanSeek)
+        if (_canSeek)
         {
-            length = _source.Length - _source.Position;
+            length = _source.Length - _initialPosition;
             return true;
         }
 
         length = -1L;
         return false;
+    }
+
+    /// <summary>
+    /// Prepares the source for one serialization. A seekable source is rewound to the position it
+    /// had when the content was created, so every hop of a redirect resends the complete part with
+    /// the length announced up front. A non-seekable source can only be streamed once; refusing
+    /// the replay is better than resending an empty part under the original Content-Length.
+    /// </summary>
+    private void ReplayOrThrow()
+    {
+        var serialization = Interlocked.Increment(ref _serializations);
+        if (_canSeek)
+        {
+            _source.Position = _initialPosition;
+            return;
+        }
+
+        if (serialization > 1)
+        {
+            throw new InvalidOperationException(
+                "The upload source stream cannot be replayed, but the transport tried to serialize "
+                + "the request body again (a 307/308 redirect resends the body once per hop). Pass "
+                + "a seekable stream so it can be rewound, or disable redirects on the transfer client.");
+        }
     }
 
     protected override void Dispose(bool disposing)

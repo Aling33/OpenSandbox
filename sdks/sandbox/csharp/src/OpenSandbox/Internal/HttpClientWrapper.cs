@@ -604,7 +604,11 @@ internal sealed class HttpClientWrapper
             {
                 try
                 {
-                    var content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    // The transfer path sends with ResponseHeadersRead on the timeout-less transfer
+                    // client, so a marked wake-timeout body is not buffered: read it through the
+                    // caller-token path like every other transfer error body, or a stalled body
+                    // would outlive the caller's cancellation.
+                    var content = await ReadContentStringAsync(response.Content, cancellationToken).ConfigureAwait(false);
                     var requestId = response.Headers.TryGetValues(Constants.RequestIdHeader, out var ids)
                         ? ids.FirstOrDefault()
                         : null;

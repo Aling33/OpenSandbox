@@ -528,6 +528,8 @@ The `ConnectionConfig` class manages API server connection settings.
 `RequestTimeoutSeconds` bounds the wait for response headers, not the whole transfer. The deadline starts with the request (so the connect phase is bounded too), is cleared while the request body is written, and is re-armed once the body of the current hop has been sent: a healthy upload or download that keeps making progress is never cut off by it. A download that gets no response headers, or an upload that gets none within the timeout after its body has been sent, fails with a `TaskCanceledException` carrying a `TimeoutException` instead of hanging (the Go SDK's `ResponseHeaderTimeout` contract); a caller cancellation still surfaces as an `OperationCanceledException` with the caller's token. All non-transfer calls keep the whole-call request timeout.
 
 A request body that never finishes being sent, and a response body that stops making progress after the headers have arrived, are bounded only by the `CancellationToken` you pass to the call, so pass one when a transfer needs an end-to-end cap. The upload guarantee assumes the HTTP handler streams the request body (for example `SocketsHttpHandler` on .NET 5+): the default `HttpClientHandler` on .NET Framework buffers the request body before sending it, so a slow but progressing upload can still count against the header timeout there.
+
+A 307/308 redirect resends the request body once per hop. A seekable upload source (`FileStream`, `MemoryStream`, ...) is rewound and resent in full; a non-seekable source cannot be replayed without buffering it, so the upload fails with a clear error instead of sending an empty file part to the redirected endpoint.
 :::
 
 | Parameter | Description | Default | Environment Variable |

@@ -322,6 +322,82 @@ public class FilesystemTransferTimeoutTests
             "the second hop's body send has to outlive the request timeout");
     }
 
+    [Fact]
+    public async Task RedirectedUploadResendsTheWholeFilePart()
+    {
+        // A real 307 through the loopback server with the real multipart upload shape: the
+        // transport re-serializes the body for the second hop, so the file part must be rewound
+        // and the redirected request must carry byte-for-byte the same body as the first hop.
+        await using var server = new LoopbackHttpServer();
+        byte[]? firstHopBody = null;
+        byte[]? secondHopBody = null;
+        server.OnRequest(async (stream, head, _) =>
+        {
+            firstHopBody = await ReadRequestBodyBytesAsync(stream, head);
+            await WriteRedirectAsync(stream, "/files/upload?hop=2");
+        });
+        server.OnRequest(async (stream, head, _) =>
+        {
+            secondHopBody = await ReadRequestBodyBytesAsync(stream, head);
+            await WriteResponseAsync(stream, "ok");
+        });
+        var serving = server.ServeAsync();
+
+        var (files, provider) = CreateFiles(server.Port);
+        using var _ = provider;
+
+        var payload = new byte[96 * 1024];
+        for (var i = 0; i < payload.Length; i++)
+        {
+            payload[i] = (byte)(i % 251);
+        }
+
+        using var source = new MemoryStream(payload);
+        await files.WriteFilesAsync(new[] { new WriteEntry { Path = "/tmp/redirected.bin", Data = source } });
+
+        firstHopBody.Should().NotBeNull();
+        secondHopBody.Should().NotBeNull("the redirect must resend the request to the new location");
+        secondHopBody.Should().Equal(
+            firstHopBody,
+            "every hop of a redirect must carry the same complete multipart body");
+        await serving;
+    }
+
+    [Fact]
+    public async Task RedirectedUploadWithNonSeekableSourceFailsInsteadOfSendingAnEmptyPart()
+    {
+        // A non-seekable source cannot be rewound for the second hop of a 307, and replaying it
+        // would send an empty file part under the original Content-Length. The upload must fail
+        // with a clear error instead.
+        await using var server = new LoopbackHttpServer();
+        var firstHopBytes = -1L;
+        server.OnRequest(async (stream, head, _) =>
+        {
+            firstHopBytes = (await ReadRequestBodyBytesAsync(stream, head)).Length;
+            await WriteRedirectAsync(stream, "/files/upload?hop=2");
+        });
+        var serving = server.ServeIgnoringClientAbortsAsync();
+
+        var (files, provider) = CreateFiles(server.Port);
+        using var _ = provider;
+
+        using var source = new NonSeekableStream(new MemoryStream(new byte[64 * 1024]));
+        var elapsed = Stopwatch.StartNew();
+        var exception = await FluentActions.Awaiting(() => files.WriteFilesAsync(
+                new[] { new WriteEntry { Path = "/tmp/not-replayable.bin", Data = source } }))
+            .Should().ThrowAsync<Exception>();
+        elapsed.Stop();
+
+        MessageChain(exception.Which).Should().Contain(
+            "cannot be replayed",
+            "a redirect must surface the non-replayable source instead of silently truncating it");
+        firstHopBytes.Should().BeGreaterThan(0);
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "the replay refusal must fail the upload promptly instead of waiting on the server");
+        await serving;
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData(0)]
@@ -404,6 +480,31 @@ public class FilesystemTransferTimeoutTests
         elapsed.Elapsed.Should().BeLessThan(
             ResponseBound,
             "a caller token must release a transfer error body that stops making progress");
+        await serving;
+    }
+
+    [Fact]
+    public async Task WakeRetryExhaustionBodyReadHonorsCallerCancellation()
+    {
+        // GetBytesAsync sends through the transfer path, so a marked wake-timeout body is not
+        // buffered by the transport. When the wake retry budget is exhausted, reading that stalled
+        // body must stay bounded by the caller token instead of hanging forever.
+        await using var server = new LoopbackHttpServer();
+        server.OnRequest((stream, _, cancellationToken) => WriteStalledWakeTimeoutAsync(stream, cancellationToken));
+        var serving = server.ServeIgnoringClientAbortsAsync();
+
+        var (files, provider) = CreateFiles(server.Port, wakeMaxAttempts: 1);
+        using var _ = provider;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        var elapsed = Stopwatch.StartNew();
+        await FluentActions.Awaiting(() => files.ReadBytesAsync("/tmp/wake.bin", null, cts.Token))
+            .Should().ThrowAsync<OperationCanceledException>();
+        elapsed.Stop();
+
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "the exhausted wake retry must read the marked 503 body under the caller token");
         await serving;
     }
 
@@ -497,6 +598,43 @@ public class FilesystemTransferTimeoutTests
     }
 
     [Fact]
+    public async Task UploadFileContentRewindsASeekableSourceBeforeEachSerialization()
+    {
+        // The transport serializes the body once per hop of a 307/308; without the rewind the
+        // second serialization would copy from EOF and send an empty (or truncated) file part.
+        var payload = new byte[5000];
+        for (var i = 0; i < payload.Length; i++)
+        {
+            payload[i] = (byte)(i % 256);
+        }
+
+        using var source = new MemoryStream(payload);
+        using var content = new UploadFileContent(source, CancellationToken.None);
+
+        using var first = new MemoryStream();
+        await content.CopySourceToAsync(first, CancellationToken.None);
+        using var second = new MemoryStream();
+        await content.CopySourceToAsync(second, CancellationToken.None);
+
+        first.ToArray().Should().Equal(payload);
+        second.ToArray().Should().Equal(payload, "a redirected hop must resend the whole part");
+    }
+
+    [Fact]
+    public async Task UploadFileContentRefusesToReplayANonSeekableSource()
+    {
+        using var source = new NonSeekableStream(new MemoryStream(new byte[1024]));
+        using var content = new UploadFileContent(source, CancellationToken.None);
+
+        await content.CopySourceToAsync(Stream.Null, CancellationToken.None);
+
+        var exception = await FluentActions.Awaiting(() => content.CopySourceToAsync(Stream.Null, CancellationToken.None))
+            .Should().ThrowAsync<InvalidOperationException>();
+        exception.Which.Message.Should().Contain("cannot be replayed");
+        exception.Which.Message.Should().Contain("seekable", "the error must name the fix");
+    }
+
+    [Fact]
     public async Task ReadContentStringAsyncDecodesTheContentCharset()
     {
         // One code path on every TFM: the bytes are read with the caller token and decoded with
@@ -523,18 +661,19 @@ public class FilesystemTransferTimeoutTests
             "a byte order mark is not part of the text");
     }
 
-    private static (ISandboxFiles Files, HttpClientProvider Provider) CreateFiles(int port)
+    private static (ISandboxFiles Files, HttpClientProvider Provider) CreateFiles(int port, int? wakeMaxAttempts = null)
     {
-        var (stack, provider) = CreateStack(port);
+        var (stack, provider) = CreateStack(port, wakeMaxAttempts);
         return (stack.Files, provider);
     }
 
-    private static (ExecdStack Stack, HttpClientProvider Provider) CreateStack(int port)
+    private static (ExecdStack Stack, HttpClientProvider Provider) CreateStack(int port, int? wakeMaxAttempts = null)
     {
         var config = new ConnectionConfig(new ConnectionConfigOptions
         {
             Domain = FormattableString.Invariant($"127.0.0.1:{port}"),
             RequestTimeoutSeconds = RequestTimeoutSeconds,
+            WakeMaxAttempts = wakeMaxAttempts,
         });
 
         var provider = new HttpClientProvider(config, NullLoggerFactory.Instance);
@@ -564,6 +703,65 @@ public class FilesystemTransferTimeoutTests
 
             remaining -= read;
         }
+    }
+
+    /// <summary>
+    /// Reads and returns the whole request body, including the chunked form a non-seekable upload
+    /// uses (unknown length, no Content-Length).
+    /// </summary>
+    private static async Task<byte[]> ReadRequestBodyBytesAsync(Stream stream, RequestHead head)
+    {
+        if (head.Chunked)
+        {
+            var reader = new BufferedBodyReader(stream, head.BodyPrefix);
+            using var output = new MemoryStream();
+            while (true)
+            {
+                var sizeText = await reader.ReadLineAsync();
+                var size = int.Parse(sizeText.Split(';')[0].Trim(), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+                if (size == 0)
+                {
+                    while ((await reader.ReadLineAsync()).Length > 0)
+                    {
+                        // Consume any trailer headers.
+                    }
+
+                    return output.ToArray();
+                }
+
+                var chunk = new byte[size];
+                await reader.ReadExactlyAsync(chunk);
+                output.Write(chunk, 0, chunk.Length);
+                await reader.ReadLineAsync();
+            }
+        }
+
+        var body = new byte[head.ContentLength];
+        head.BodyPrefix.CopyTo(body, 0);
+        var received = head.BodyPrefix.Length;
+        while (received < head.ContentLength)
+        {
+            var read = await stream.ReadAsync(body.AsMemory(received, head.ContentLength - received), CancellationToken.None);
+            if (read == 0)
+            {
+                throw new IOException("The client closed the connection before sending the full request body.");
+            }
+
+            received += read;
+        }
+
+        return body;
+    }
+
+    private static string MessageChain(Exception exception)
+    {
+        var messages = new List<string>();
+        for (var current = exception; current != null; current = current.InnerException)
+        {
+            messages.Add(current.Message);
+        }
+
+        return string.Join(" | ", messages);
     }
 
     private static async Task WaitForPeerCloseAsync(Stream stream, CancellationToken cancellationToken)
@@ -602,6 +800,30 @@ public class FilesystemTransferTimeoutTests
         await WaitForPeerCloseAsync(stream, cancellationToken);
     }
 
+    private static async Task WriteStalledWakeTimeoutAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        var head = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4096\r\nContent-Type: application/json\r\n"
+            + "OpenSandbox-Wake: expired\r\nRetry-After: 1\r\nConnection: close\r\n\r\n";
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(head), cancellationToken);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes("{\"code\":\"wake_timeout\""), cancellationToken);
+        await stream.FlushAsync(cancellationToken);
+
+        // Close shortly after the caller token dies, so the stalled body read ends even when a
+        // regression drops the token: the test then fails on the exception type instead of
+        // leaving the read (and the test host) blocked forever.
+        using var closeAfter = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, closeAfter.Token);
+        await WaitForPeerCloseAsync(stream, stop.Token);
+    }
+
+    private static async Task WriteRedirectAsync(Stream stream, string location)
+    {
+        var head = FormattableString.Invariant(
+            $"HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(head));
+        await stream.FlushAsync();
+    }
+
     private static async Task WriteSlowBodyAsync(
         Stream stream,
         int contentLength,
@@ -634,6 +856,8 @@ public class FilesystemTransferTimeoutTests
 
         public int ContentLength { get; init; }
 
+        public bool Chunked { get; init; }
+
         public byte[] BodyPrefix { get; init; } = Array.Empty<byte>();
 
         public static async Task<RequestHead> ReadAsync(Stream stream, CancellationToken cancellationToken)
@@ -657,11 +881,16 @@ public class FilesystemTransferTimeoutTests
             var requestLine = lines[0];
             var target = requestLine.Split(' ').ElementAtOrDefault(1) ?? string.Empty;
             var contentLength = 0;
+            var chunked = false;
             foreach (var line in lines)
             {
                 if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
                 {
                     contentLength = int.Parse(line["Content-Length:".Length..].Trim(), CultureInfo.InvariantCulture);
+                }
+                else if (line.StartsWith("Transfer-Encoding:", StringComparison.OrdinalIgnoreCase))
+                {
+                    chunked = line["Transfer-Encoding:".Length..].Contains("chunked", StringComparison.OrdinalIgnoreCase);
                 }
             }
 
@@ -670,6 +899,7 @@ public class FilesystemTransferTimeoutTests
                 RequestLine = requestLine,
                 Path = target.Split('?')[0],
                 ContentLength = contentLength,
+                Chunked = chunked,
                 BodyPrefix = received.Skip(headerEnd + 4).ToArray(),
             };
         }
@@ -772,6 +1002,133 @@ public class FilesystemTransferTimeoutTests
         {
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             return new HttpResponseMessage(HttpStatusCode.OK);
+        }
+    }
+
+    /// <summary>
+    /// Reads a chunked request body from a socket, starting with the bytes already buffered next
+    /// to the request headers.
+    /// </summary>
+    private sealed class BufferedBodyReader
+    {
+        private readonly Stream _stream;
+        private readonly byte[] _buffer;
+        private int _start;
+        private int _end;
+
+        public BufferedBodyReader(Stream stream, byte[] initial)
+        {
+            _stream = stream;
+            _buffer = new byte[Math.Max(initial.Length, 64 * 1024)];
+            initial.CopyTo(_buffer, 0);
+            _start = 0;
+            _end = initial.Length;
+        }
+
+        public async Task<string> ReadLineAsync()
+        {
+            var bytes = new List<byte>(64);
+            while (true)
+            {
+                if (!await FillAsync().ConfigureAwait(false))
+                {
+                    throw new IOException("Unexpected end of a chunked request body.");
+                }
+
+                var value = _buffer[_start++];
+                if (value == (byte)'\n')
+                {
+                    if (bytes.Count > 0 && bytes[^1] == (byte)'\r')
+                    {
+                        bytes.RemoveAt(bytes.Count - 1);
+                    }
+
+                    return Encoding.ASCII.GetString(bytes.ToArray());
+                }
+
+                bytes.Add(value);
+            }
+        }
+
+        public async Task ReadExactlyAsync(byte[] destination)
+        {
+            var offset = 0;
+            while (offset < destination.Length)
+            {
+                if (!await FillAsync().ConfigureAwait(false))
+                {
+                    throw new IOException("Unexpected end of a chunked request body.");
+                }
+
+                var take = Math.Min(_end - _start, destination.Length - offset);
+                Array.Copy(_buffer, _start, destination, offset, take);
+                _start += take;
+                offset += take;
+            }
+        }
+
+        private async Task<bool> FillAsync()
+        {
+            if (_start < _end)
+            {
+                return true;
+            }
+
+            _start = 0;
+            _end = await _stream.ReadAsync(_buffer.AsMemory(), CancellationToken.None).ConfigureAwait(false);
+            return _end > 0;
+        }
+    }
+
+    /// <summary>A read-only wrapper that hides seekability, like a pipe or network source.</summary>
+    private sealed class NonSeekableStream : Stream
+    {
+        private readonly Stream _inner;
+
+        public NonSeekableStream(Stream inner) => _inner = inner;
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            await _inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
+
+#if NETSTANDARD2_1_OR_GREATER || NET5_0_OR_GREATER
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            _inner.ReadAsync(buffer, cancellationToken);
+#endif
+
+        public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override void Flush()
+        {
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _inner.Dispose();
+            }
+
+            base.Dispose(disposing);
         }
     }
 

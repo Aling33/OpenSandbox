@@ -391,6 +391,11 @@ Transfer timeouts:
   making progress after the headers have arrived, are bounded only by the
   `CancellationToken` you pass to the call, so pass one when a transfer needs an
   end-to-end cap.
+- A 307/308 redirect makes the transport resend the request body once per hop. A
+  seekable upload source (`FileStream`, `MemoryStream`, ...) is rewound and resent
+  in full; a non-seekable source cannot be replayed without buffering it, so the
+  upload fails with a clear error instead of sending an empty file part to the
+  redirected endpoint.
 - The upload guarantee assumes the HTTP handler streams the request body (for
   example `SocketsHttpHandler` on .NET 5+). On .NET Framework the default
   `HttpClientHandler` buffers the request body before sending it, so a slow but
