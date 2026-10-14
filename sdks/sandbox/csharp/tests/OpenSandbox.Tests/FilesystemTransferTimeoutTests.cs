@@ -185,6 +185,41 @@ public class FilesystemTransferTimeoutTests
     }
 
     [Fact]
+    public async Task UploadCallerCancellationWhileWaitingForHeadersIsNotATimeout()
+    {
+        // The body has been sent (so the header deadline is armed again) but the server never
+        // answers; a caller that cancels in that window must surface as a cancellation, not as
+        // the deadline firing. The header timeout is far larger than the caller's timer, so the
+        // exception can only come from the caller.
+        await using var server = new LoopbackHttpServer();
+        server.OnRequest(async (stream, head, cancellationToken) =>
+        {
+            await ReadRequestBodyAsync(stream, head);
+            await WaitForPeerCloseAsync(stream, cancellationToken);
+        });
+        var serving = server.ServeIgnoringClientAbortsAsync();
+
+        var (files, provider) = CreateFiles(server.Port, requestTimeoutSeconds: 10);
+        using var _ = provider;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        var upload = files.WriteFilesAsync(
+            new[] { new WriteEntry { Path = "/tmp/f.bin", Data = new byte[1024] } },
+            cts.Token);
+        var elapsed = Stopwatch.StartNew();
+        var exception = await FluentActions.Awaiting(() => upload.WaitAsync(ResponseBound))
+            .Should().ThrowAsync<OperationCanceledException>();
+        elapsed.Stop();
+
+        exception.Which.InnerException.Should().NotBeOfType<TimeoutException>(
+            "a caller cancellation during the header wait must not be reported as the transfer header timeout");
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "the caller token must end the header wait promptly");
+        await serving;
+    }
+
+    [Fact]
     public async Task DownloadStillFailsWhenServerNeverSendsHeaders()
     {
         await using var server = new LoopbackHttpServer();
@@ -204,6 +239,33 @@ public class FilesystemTransferTimeoutTests
         elapsed.Elapsed.Should().BeLessThan(
             ResponseBound,
             "the wait for response headers must stay bounded even though transfers are not capped");
+        await serving;
+    }
+
+    [Fact]
+    public async Task DownloadCallerCancellationWhileWaitingForHeadersIsNotATimeout()
+    {
+        // No request body, so the header deadline is armed from the request itself; a caller
+        // that cancels before it fires must surface as a cancellation, not as the deadline.
+        await using var server = new LoopbackHttpServer();
+        server.OnRequest((stream, _, cancellationToken) => WaitForPeerCloseAsync(stream, cancellationToken));
+        var serving = server.ServeIgnoringClientAbortsAsync();
+
+        var (files, provider) = CreateFiles(server.Port, requestTimeoutSeconds: 10);
+        using var _ = provider;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        var download = files.ReadBytesAsync("/tmp/f.bin", null, cts.Token);
+        var elapsed = Stopwatch.StartNew();
+        var exception = await FluentActions.Awaiting(() => download.WaitAsync(ResponseBound))
+            .Should().ThrowAsync<OperationCanceledException>();
+        elapsed.Stop();
+
+        exception.Which.InnerException.Should().NotBeOfType<TimeoutException>(
+            "a caller cancellation during the header wait must not be reported as the transfer header timeout");
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "the caller token must end the header wait promptly");
         await serving;
     }
 
@@ -669,20 +731,40 @@ public class FilesystemTransferTimeoutTests
         (await HttpClientWrapper.ReadContentStringAsync(bom, CancellationToken.None)).Should().Be(
             "h\u00E9llo",
             "a byte order mark is not part of the text");
+
+        var declaredBom = new ByteArrayContent(
+            new byte[] { 0xEF, 0xBB, 0xBF }.Concat(Encoding.UTF8.GetBytes("h\u00E9llo")).ToArray());
+        declaredBom.Headers.ContentType = new MediaTypeHeaderValue("text/plain") { CharSet = "utf-8" };
+        (await HttpClientWrapper.ReadContentStringAsync(declaredBom, CancellationToken.None)).Should().Be(
+            "h\u00E9llo",
+            "the declared encoding's own byte order mark is not part of the text");
+
+        var foreignBom = new ByteArrayContent(
+            new byte[] { 0xEF, 0xBB, 0xBF }.Concat(Encoding.UTF8.GetBytes("hello")).ToArray());
+        foreignBom.Headers.ContentType = new MediaTypeHeaderValue("text/plain") { CharSet = "iso-8859-1" };
+        (await HttpClientWrapper.ReadContentStringAsync(foreignBom, CancellationToken.None)).Should().Be(
+            "\u00EF\u00BB\u00BFhello",
+            "only the declared charset's own preamble is dropped, matching HttpContent");
     }
 
-    private static (ISandboxFiles Files, HttpClientProvider Provider) CreateFiles(int port, int? wakeMaxAttempts = null)
+    private static (ISandboxFiles Files, HttpClientProvider Provider) CreateFiles(
+        int port,
+        int? wakeMaxAttempts = null,
+        int requestTimeoutSeconds = RequestTimeoutSeconds)
     {
-        var (stack, provider) = CreateStack(port, wakeMaxAttempts);
+        var (stack, provider) = CreateStack(port, wakeMaxAttempts, requestTimeoutSeconds);
         return (stack.Files, provider);
     }
 
-    private static (ExecdStack Stack, HttpClientProvider Provider) CreateStack(int port, int? wakeMaxAttempts = null)
+    private static (ExecdStack Stack, HttpClientProvider Provider) CreateStack(
+        int port,
+        int? wakeMaxAttempts = null,
+        int requestTimeoutSeconds = RequestTimeoutSeconds)
     {
         var config = new ConnectionConfig(new ConnectionConfigOptions
         {
             Domain = FormattableString.Invariant($"127.0.0.1:{port}"),
-            RequestTimeoutSeconds = RequestTimeoutSeconds,
+            RequestTimeoutSeconds = requestTimeoutSeconds,
             WakeMaxAttempts = wakeMaxAttempts,
         });
 

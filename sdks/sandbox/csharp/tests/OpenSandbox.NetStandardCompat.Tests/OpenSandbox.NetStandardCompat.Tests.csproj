@@ -33,6 +33,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\OpenSandbox.Tests\AssemblyInfo.cs" Link="AssemblyInfo.cs" />
     <Compile Include="..\OpenSandbox.Tests\FilesystemTransferTimeoutTests.cs" Link="FilesystemTransferTimeoutTests.cs" />
   </ItemGroup>
 
