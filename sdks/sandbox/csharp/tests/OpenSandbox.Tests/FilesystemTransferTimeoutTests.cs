@@ -239,10 +239,12 @@ public class FilesystemTransferTimeoutTests
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
         var elapsed = Stopwatch.StartNew();
-        await FluentActions.Awaiting(() => files.ReadBytesAsync("/tmp/slow.bin", null, cts.Token))
+        var exception = await FluentActions.Awaiting(() => files.ReadBytesAsync("/tmp/slow.bin", null, cts.Token))
             .Should().ThrowAsync<OperationCanceledException>();
         elapsed.Stop();
 
+        exception.Which.InnerException.Should().NotBeOfType<TimeoutException>(
+            "a caller cancellation must not be reported as the transfer header timeout");
         elapsed.Elapsed.Should().BeLessThan(ResponseBound, "a caller token must still cancel a transfer in flight");
         await serving;
     }
@@ -265,12 +267,14 @@ public class FilesystemTransferTimeoutTests
             delayPerChunk: TimeSpan.FromSeconds(30));
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
         var elapsed = Stopwatch.StartNew();
-        await FluentActions.Awaiting(() => files.WriteFilesAsync(
+        var exception = await FluentActions.Awaiting(() => files.WriteFilesAsync(
                 new[] { new WriteEntry { Path = "/tmp/slow.bin", Data = stalledBody } },
                 cts.Token))
             .Should().ThrowAsync<OperationCanceledException>();
         elapsed.Stop();
 
+        exception.Which.InnerException.Should().NotBeOfType<TimeoutException>(
+            "a caller cancellation must not be reported as the transfer header timeout");
         elapsed.Elapsed.Should().BeLessThan(
             ResponseBound,
             "a caller token must interrupt an upload body read that blocks");
@@ -444,10 +448,12 @@ public class FilesystemTransferTimeoutTests
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
         var download = files.ReadBytesAsync("/tmp/failure.bin", null, cts.Token);
         var elapsed = Stopwatch.StartNew();
-        await FluentActions.Awaiting(() => download.WaitAsync(ResponseBound))
+        var exception = await FluentActions.Awaiting(() => download.WaitAsync(ResponseBound))
             .Should().ThrowAsync<OperationCanceledException>();
         elapsed.Stop();
 
+        exception.Which.InnerException.Should().NotBeOfType<TimeoutException>(
+            "a caller cancellation must not be reported as the transfer header timeout");
         elapsed.Elapsed.Should().BeLessThan(
             ResponseBound,
             "a caller token must release a transfer error body that stops making progress");
@@ -473,10 +479,12 @@ public class FilesystemTransferTimeoutTests
             new[] { new WriteEntry { Path = "/tmp/failure.bin", Data = new byte[1024] } },
             cts.Token);
         var elapsed = Stopwatch.StartNew();
-        await FluentActions.Awaiting(() => upload.WaitAsync(ResponseBound))
+        var exception = await FluentActions.Awaiting(() => upload.WaitAsync(ResponseBound))
             .Should().ThrowAsync<OperationCanceledException>();
         elapsed.Stop();
 
+        exception.Which.InnerException.Should().NotBeOfType<TimeoutException>(
+            "a caller cancellation must not be reported as the transfer header timeout");
         elapsed.Elapsed.Should().BeLessThan(
             ResponseBound,
             "a caller token must release a transfer error body that stops making progress");
@@ -498,10 +506,12 @@ public class FilesystemTransferTimeoutTests
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
         var elapsed = Stopwatch.StartNew();
-        await FluentActions.Awaiting(() => files.ReadBytesAsync("/tmp/wake.bin", null, cts.Token))
+        var exception = await FluentActions.Awaiting(() => files.ReadBytesAsync("/tmp/wake.bin", null, cts.Token))
             .Should().ThrowAsync<OperationCanceledException>();
         elapsed.Stop();
 
+        exception.Which.InnerException.Should().NotBeOfType<TimeoutException>(
+            "a caller cancellation must not be reported as the transfer header timeout");
         elapsed.Elapsed.Should().BeLessThan(
             ResponseBound,
             "the exhausted wake retry must read the marked 503 body under the caller token");
