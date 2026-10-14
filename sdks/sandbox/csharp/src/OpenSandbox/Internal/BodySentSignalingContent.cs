@@ -42,34 +42,38 @@ internal sealed class BodySentSignalingContent : HttpContent
         }
     }
 
-    protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
-    {
-        // A redirect serializes the content once per hop: clear the deadline armed by the
-        // previous hop before this hop's body is sent.
-        _onBodySendStarted();
-#if NET5_0_OR_GREATER
-        await _inner.CopyToAsync(stream, context, CancellationToken.None).ConfigureAwait(false);
-#else
-        await _inner.CopyToAsync(stream).ConfigureAwait(false);
-#endif
-        _onBodySent();
-    }
+    protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+        // The transport gives no token on the pre-.NET 5 API surface (netstandard2.0/2.1, i.e.
+        // .NET Framework); the token-aware override below exists only where the runtime has it.
+        SerializeCoreAsync(stream, context, CancellationToken.None);
 
 #if NET5_0_OR_GREATER
     /// <summary>
     /// Forwards the transport's token so a caller cancellation still interrupts a body read that
     /// blocks (for example a slow producer stream); modern runtimes call this overload.
     /// </summary>
-    protected override async Task SerializeToStreamAsync(
+    protected override Task SerializeToStreamAsync(
         Stream stream,
         TransportContext? context,
         CancellationToken cancellationToken)
+        => SerializeCoreAsync(stream, context, cancellationToken);
+#endif
+
+    private async Task SerializeCoreAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
     {
+        // A redirect serializes the content once per hop: clear the deadline armed by the
+        // previous hop before this hop's body is sent, and re-arm it once the body is on the wire.
         _onBodySendStarted();
+#if NET5_0_OR_GREATER
         await _inner.CopyToAsync(stream, context, cancellationToken).ConfigureAwait(false);
+#else
+        // HttpContent has no token-carrying copy overload before .NET 5, so the transport token
+        // cannot be forwarded here. The file parts copy themselves with the caller token
+        // (UploadFileContent), so cancellation of a blocked producer stays uniform across TFMs.
+        await _inner.CopyToAsync(stream).ConfigureAwait(false);
+#endif
         _onBodySent();
     }
-#endif
 
     protected override bool TryComputeLength(out long length)
     {

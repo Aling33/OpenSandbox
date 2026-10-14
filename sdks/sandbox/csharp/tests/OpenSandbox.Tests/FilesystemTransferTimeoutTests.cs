@@ -15,6 +15,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
 using FluentAssertions;
@@ -168,13 +169,15 @@ public class FilesystemTransferTimeoutTests
         using var _ = provider;
 
         var elapsed = Stopwatch.StartNew();
-        await FluentActions.Awaiting(() => files.WriteFilesAsync(new[]
+        var exception = await FluentActions.Awaiting(() => files.WriteFilesAsync(new[]
             {
                 new WriteEntry { Path = "/tmp/f.bin", Data = new byte[1024] },
             }))
-            .Should().ThrowAsync<OperationCanceledException>();
+            .Should().ThrowAsync<TaskCanceledException>();
         elapsed.Stop();
 
+        exception.Which.InnerException.Should().BeOfType<TimeoutException>(
+            "the header deadline must be distinguishable from caller cancellation");
         elapsed.Elapsed.Should().BeLessThan(
             ResponseBound,
             "a server that stops responding after receiving the body must fail the upload, not hang it");
@@ -192,10 +195,12 @@ public class FilesystemTransferTimeoutTests
         using var _ = provider;
 
         var elapsed = Stopwatch.StartNew();
-        await FluentActions.Awaiting(() => files.ReadBytesAsync("/tmp/f.bin"))
-            .Should().ThrowAsync<OperationCanceledException>();
+        var exception = await FluentActions.Awaiting(() => files.ReadBytesAsync("/tmp/f.bin"))
+            .Should().ThrowAsync<TaskCanceledException>();
         elapsed.Stop();
 
+        exception.Which.InnerException.Should().BeOfType<TimeoutException>(
+            "the header deadline must be distinguishable from caller cancellation");
         elapsed.Elapsed.Should().BeLessThan(
             ResponseBound,
             "the wait for response headers must stay bounded even though transfers are not capped");
@@ -400,6 +405,122 @@ public class FilesystemTransferTimeoutTests
             ResponseBound,
             "a caller token must release a transfer error body that stops making progress");
         await serving;
+    }
+
+    [Fact]
+    public async Task UploadConnectPhaseIsBoundedByTheHeaderDeadline()
+    {
+        // Until the first body byte is serialized there is no body send to clear the deadline:
+        // without arming it up front, a connect phase that never completes would hang an upload.
+        using var handler = new StallingSendHandler();
+        using var shared = new HttpClient { Timeout = TimeSpan.FromSeconds(RequestTimeoutSeconds) };
+        using var transfer = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+        var wrapper = new HttpClientWrapper(
+            shared,
+            "http://127.0.0.1:1",
+            transferHttpClient: transfer,
+            transferHeaderTimeout: TimeSpan.FromSeconds(RequestTimeoutSeconds));
+
+        var content = new TrackingContent(4096);
+        using var request = new HttpRequestMessage(HttpMethod.Post, "http://127.0.0.1:1/files/upload")
+        {
+            Content = content,
+        };
+
+        var elapsed = Stopwatch.StartNew();
+        var exception = await FluentActions.Awaiting(() => wrapper.SendTransferAsync(request))
+            .Should().ThrowAsync<TaskCanceledException>();
+        elapsed.Stop();
+
+        exception.Which.InnerException.Should().BeOfType<TimeoutException>(
+            "the header deadline must be distinguishable from caller cancellation");
+        content.Serializations.Should().Be(
+            0,
+            "the connect phase must be bounded before the body is serialized");
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "the connect phase must be bounded by the header deadline for uploads too");
+    }
+
+    [Fact]
+    public async Task UploadFileContentInterruptsABlockedProducerRead()
+    {
+        // This is the manual copy loop that also runs on the netstandard2.0/2.1 builds: the
+        // caller token must reach the producer read, not just the socket, or an upload whose
+        // source blocks would hang on those targets.
+        var producer = new SlowReadStream(
+            totalBytes: 1024 * 1024,
+            chunkBytes: 256 * 1024,
+            delayPerChunk: TimeSpan.FromSeconds(30));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        using var content = new UploadFileContent(producer, cts.Token);
+
+        var elapsed = Stopwatch.StartNew();
+        await FluentActions.Awaiting(() => content.CopySourceToAsync(Stream.Null, CancellationToken.None))
+            .Should().ThrowAsync<OperationCanceledException>();
+        elapsed.Stop();
+
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "a caller token must interrupt a producer read that blocks");
+    }
+
+    [Fact]
+    public async Task UploadFileContentInterruptsABlockedDestinationWrite()
+    {
+        using var source = new MemoryStream(new byte[512 * 1024]);
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        using var content = new UploadFileContent(source, cts.Token);
+        var sink = new SlowWriteStream(chunkBytes: 64 * 1024, delayPerChunk: TimeSpan.FromSeconds(30));
+
+        var elapsed = Stopwatch.StartNew();
+        await FluentActions.Awaiting(() => content.CopySourceToAsync(sink, CancellationToken.None))
+            .Should().ThrowAsync<OperationCanceledException>();
+        elapsed.Stop();
+
+        elapsed.Elapsed.Should().BeLessThan(
+            ResponseBound,
+            "the caller token must reach the destination write as well");
+    }
+
+    [Fact]
+    public void UploadFileContentKeepsSeekableUploadsLengthDelimited()
+    {
+        // StreamContent derives the part's Content-Length from a seekable source; the
+        // replacement content must do the same or multipart uploads would turn chunked.
+        using var source = new MemoryStream(new byte[10]);
+        source.Position = 4;
+
+        using var content = new UploadFileContent(source, CancellationToken.None);
+
+        content.Headers.ContentLength.Should().Be(6);
+    }
+
+    [Fact]
+    public async Task ReadContentStringAsyncDecodesTheContentCharset()
+    {
+        // One code path on every TFM: the bytes are read with the caller token and decoded with
+        // the charset of the Content-Type.
+        var latin1 = new ByteArrayContent(new[] { (byte)0xE9 });
+        latin1.Headers.ContentType = new MediaTypeHeaderValue("text/plain") { CharSet = "iso-8859-1" };
+        (await HttpClientWrapper.ReadContentStringAsync(latin1, CancellationToken.None)).Should().Be("\u00E9");
+
+        var quoted = new ByteArrayContent(Encoding.Unicode.GetBytes("h\u00E9llo"));
+        quoted.Headers.ContentType = new MediaTypeHeaderValue("text/plain") { CharSet = "\"utf-16\"" };
+        (await HttpClientWrapper.ReadContentStringAsync(quoted, CancellationToken.None)).Should().Be("h\u00E9llo");
+
+        var unknown = new ByteArrayContent(Encoding.UTF8.GetBytes("h\u00E9llo"));
+        unknown.Headers.ContentType = new MediaTypeHeaderValue("text/plain") { CharSet = "x-unknown-charset" };
+        (await HttpClientWrapper.ReadContentStringAsync(unknown, CancellationToken.None)).Should().Be(
+            "h\u00E9llo",
+            "an unknown charset falls back to the UTF-8 default");
+
+        var bom = new ByteArrayContent(
+            new byte[] { 0xEF, 0xBB, 0xBF }.Concat(Encoding.UTF8.GetBytes("h\u00E9llo")).ToArray());
+        bom.Headers.ContentType = new MediaTypeHeaderValue("text/plain");
+        (await HttpClientWrapper.ReadContentStringAsync(bom, CancellationToken.None)).Should().Be(
+            "h\u00E9llo",
+            "a byte order mark is not part of the text");
     }
 
     private static (ISandboxFiles Files, HttpClientProvider Provider) CreateFiles(int port)
@@ -642,6 +763,46 @@ public class FilesystemTransferTimeoutTests
         }
     }
 
+    /// <summary>Stalls like a connect that never completes, without touching the request body.</summary>
+    private sealed class StallingSendHandler : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }
+    }
+
+    /// <summary>Counts body serializations so a test can prove the body was never touched.</summary>
+    private sealed class TrackingContent : ByteArrayContent
+    {
+        public TrackingContent(int size)
+            : base(new byte[size])
+        {
+        }
+
+        public int Serializations { get; private set; }
+
+#if NET5_0_OR_GREATER
+        protected override Task SerializeToStreamAsync(
+            Stream stream,
+            TransportContext? context,
+            CancellationToken cancellationToken)
+        {
+            Serializations++;
+            return base.SerializeToStreamAsync(stream, context, cancellationToken);
+        }
+#endif
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+        {
+            Serializations++;
+            return base.SerializeToStreamAsync(stream, context);
+        }
+    }
+
     private sealed class SlowWriteStream : Stream
     {
         private readonly int _chunkBytes;
@@ -667,21 +828,23 @@ public class FilesystemTransferTimeoutTests
             set => throw new NotSupportedException();
         }
 
-        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         {
             var written = 0;
-            while (written < buffer.Length)
+            while (written < count)
             {
                 await Task.Delay(_delayPerChunk, cancellationToken);
-                written += Math.Min(_chunkBytes, buffer.Length - written);
+                written += Math.Min(_chunkBytes, count - written);
             }
         }
 
-        // ByteArrayContent serializes through the array-based overload; it has to be the
-        // token-aware one so a canceled deadline interrupts the write instead of being
+#if NETSTANDARD2_1_OR_GREATER || NET5_0_OR_GREATER
+        // Modern runtimes copy through the memory-based overload; it forwards to the token-aware
+        // array-based write above so a canceled deadline interrupts the write instead of being
         // silently dropped by the sync path.
-        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
-            WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
+            new(WriteAsync(buffer.ToArray(), 0, buffer.Length, cancellationToken));
+#endif
 
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 
@@ -725,7 +888,7 @@ public class FilesystemTransferTimeoutTests
             set => _position = value;
         }
 
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         {
             if (_position >= Length)
             {
@@ -733,14 +896,29 @@ public class FilesystemTransferTimeoutTests
             }
 
             await Task.Delay(_delayPerChunk, cancellationToken);
-            var size = (int)Math.Min(Math.Min(buffer.Length, _chunkBytes), Length - _position);
-            buffer.Span.Slice(0, size).Fill(0x61);
+            var size = (int)Math.Min(Math.Min(count, _chunkBytes), Length - _position);
+            for (var i = 0; i < size; i++)
+            {
+                buffer[offset + i] = 0x61;
+            }
             _position += size;
             return size;
         }
 
+#if NETSTANDARD2_1_OR_GREATER || NET5_0_OR_GREATER
+        // Modern runtimes read through the memory-based overload; forward it to the token-aware
+        // array-based read above.
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var chunk = new byte[buffer.Length];
+            var size = await ReadAsync(chunk, 0, chunk.Length, cancellationToken).ConfigureAwait(false);
+            chunk.AsSpan(0, size).CopyTo(buffer.Span);
+            return size;
+        }
+#endif
+
         public override int Read(byte[] buffer, int offset, int count) =>
-            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+            ReadAsync(buffer, offset, count, CancellationToken.None).GetAwaiter().GetResult();
 
         public override void Flush()
         {

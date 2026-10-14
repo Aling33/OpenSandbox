@@ -155,7 +155,7 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles
             var metadataContent = new StringContent(metadataJson, Encoding.UTF8, "application/json");
             form.Add(metadataContent, "metadata", "metadata");
 
-            var fileContent = CreateFileContent(entry.Data);
+            var fileContent = CreateFileContent(entry.Data, cancellationToken);
             form.Add(fileContent, "file", fileName);
         }
 
@@ -356,14 +356,16 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles
         await _client.PostAsync("/files/permissions", body, cancellationToken).ConfigureAwait(false);
     }
 
-    private static HttpContent CreateFileContent(object? data)
+    private static HttpContent CreateFileContent(object? data, CancellationToken cancellationToken)
     {
         return data switch
         {
             null => new ByteArrayContent(Array.Empty<byte>()),
             string str => new StringContent(str, Encoding.UTF8),
             byte[] bytes => new ByteArrayContent(bytes),
-            Stream stream => new StreamContent(stream),
+            // Unlike StreamContent, this part binds the caller token to the producer read, so
+            // cancelling an upload interrupts a source stream that blocks mid-read on every TFM.
+            Stream stream => new UploadFileContent(stream, cancellationToken),
             _ => throw new InvalidArgumentException($"Unsupported file data type: {data.GetType().FullName}")
         };
     }

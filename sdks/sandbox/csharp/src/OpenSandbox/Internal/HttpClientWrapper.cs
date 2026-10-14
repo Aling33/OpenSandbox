@@ -284,11 +284,16 @@ internal sealed class HttpClientWrapper
     /// When a transfer client is configured, the transfer is not capped by the connection request
     /// timeout, so a large file or a slow link is not aborted while data keeps flowing. A positive
     /// header timeout still bounds the wait for response headers: for a request without a body the
-    /// deadline starts with the request, and for an upload it starts once the body of the current
-    /// hop has been sent (a redirect re-arms it per hop), so a server that stops responding fails
-    /// the transfer instead of hanging it. Without a header timeout the transfer is bounded only
-    /// by the caller token. The response body is read with the caller token; a caller that wants
-    /// the whole transfer bounded passes a CancellationToken.
+    /// deadline starts with the request, and for an upload it also starts with the request - which
+    /// bounds the connect phase (DNS, TCP, TLS, pool wait) - but is cleared while the body is
+    /// being written and re-armed once the body of the current hop has been sent (a redirect
+    /// re-arms it per hop), so a server that stops responding fails the transfer instead of
+    /// hanging it while a slow upload never counts its own body time. When the deadline expires
+    /// the transfer fails with a <see cref="TaskCanceledException"/> carrying a
+    /// <see cref="TimeoutException"/>, distinctly from a caller cancellation, which surfaces as an
+    /// <see cref="OperationCanceledException"/> with the caller's token. Without a header timeout
+    /// the transfer is bounded only by the caller token. The response body is read with the
+    /// caller token; a caller that wants the whole transfer bounded passes a CancellationToken.
     /// </summary>
     public async Task<HttpResponseMessage> SendTransferAsync(
         HttpRequestMessage request,
@@ -318,11 +323,10 @@ internal sealed class HttpClientWrapper
         }
 
         var headerDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        if (request.Content is null)
-        {
-            headerDeadline.CancelAfter(headerTimeout);
-        }
-        else
+        // Armed before the send for uploads too: until the first body byte is serialized it bounds
+        // the connect phase; the body signals below clear it again while the body is written.
+        headerDeadline.CancelAfter(headerTimeout);
+        if (request.Content is not null)
         {
             // The header deadline stays off while the body is being written - a large file or a
             // slow link must not count its own upload time against it - and is cleared again
@@ -337,6 +341,15 @@ internal sealed class HttpClientWrapper
         {
             _logger.LogDebug("HTTP {Method} {Url} (transfer)", request.Method, request.RequestUri);
             return await transferClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headerDeadline.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && headerDeadline.IsCancellationRequested)
+        {
+            // The header deadline, not the caller, ended the send. Keep the two apart the way
+            // HttpClient.Timeout does on modern runtimes: a TaskCanceledException with a
+            // TimeoutException inside.
+            var message = FormattableString.Invariant(
+                $"The transfer request did not receive response headers within {headerTimeout}.");
+            throw new TaskCanceledException(message, new TimeoutException(message));
         }
         finally
         {
@@ -415,12 +428,13 @@ internal sealed class HttpClientWrapper
     /// Reads a response body as a string with the caller token. Transfer responses are sent with
     /// <see cref="HttpCompletionOption.ResponseHeadersRead"/>, so their bodies are not buffered
     /// by the transport and a stalled body must stay cancellable instead of blocking the caller.
+    /// The bytes are read in chunks with the token and decoded with the charset of the
+    /// Content-Type (a byte order mark, then UTF-8, when it is missing; UTF-8 when it is
+    /// unknown) - one code path on every target framework, instead of a netstandard-only
+    /// fallback that CI could not reach.
     /// </summary>
     internal static async Task<string> ReadContentStringAsync(HttpContent content, CancellationToken cancellationToken)
     {
-#if NET5_0_OR_GREATER
-        return await content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-#else
         var bytes = await ReadContentBytesAsync(content, cancellationToken).ConfigureAwait(false);
         var charset = content.Headers.ContentType?.CharSet;
         if (!string.IsNullOrEmpty(charset))
@@ -435,8 +449,36 @@ internal sealed class HttpClientWrapper
             }
         }
 
+        // Mirror HttpContent.ReadAsStringAsync: without a declared charset a byte order mark
+        // picks the encoding and is not part of the text.
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        {
+            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+        }
+
+        if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0x00 && bytes[3] == 0x00)
+        {
+            return new UTF32Encoding(bigEndian: false, byteOrderMark: false).GetString(bytes, 4, bytes.Length - 4);
+        }
+
+        if (bytes.Length >= 4 && bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0xFE && bytes[3] == 0xFF)
+        {
+            return new UTF32Encoding(bigEndian: true, byteOrderMark: false).GetString(bytes, 4, bytes.Length - 4);
+        }
+
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+        {
+            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        {
+            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+
         return Encoding.UTF8.GetString(bytes);
-#endif
+    }
+
     private HttpRequestMessage BuildJsonRequest(HttpMethod method, string url, object? body)
     {
         var request = new HttpRequestMessage(method, url);
