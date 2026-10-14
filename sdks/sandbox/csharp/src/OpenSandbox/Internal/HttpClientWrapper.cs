@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using OpenSandbox.Config;
 using OpenSandbox.Core;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -33,6 +36,21 @@ internal sealed class HttpClientWrapper
     private readonly string _baseUrl;
     private readonly IReadOnlyDictionary<string, string> _defaultHeaders;
     private readonly ILogger _logger;
+    private readonly WakeRetryOptions _wakeRetry;
+
+    /// <summary>
+    /// The gateway emits <c>Retry-After: 1</c> on wake-timeout responses; used
+    /// as the fallback wait when a marked response arrives without the header.
+    /// </summary>
+    private static readonly TimeSpan WakeDefaultRetryAfter = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Fixed operational ceiling for server-supplied <c>Retry-After</c> waits.
+    /// Not configurable: ignoring a server's back-pressure signal is never a
+    /// safe default, and the 60s guard only defends against a pathological
+    /// header.
+    /// </summary>
+    private static readonly TimeSpan RetryAfterCap = TimeSpan.FromSeconds(60);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -47,7 +65,8 @@ internal sealed class HttpClientWrapper
         IReadOnlyDictionary<string, string>? defaultHeaders = null,
         ILogger? logger = null,
         HttpClient? transferHttpClient = null,
-        TimeSpan? transferHeaderTimeout = null)
+        TimeSpan? transferHeaderTimeout = null,
+        WakeRetryOptions? wakeRetry = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _transferHttpClient = transferHttpClient;
@@ -55,12 +74,18 @@ internal sealed class HttpClientWrapper
         _baseUrl = baseUrl?.TrimEnd('/') ?? throw new ArgumentNullException(nameof(baseUrl));
         _defaultHeaders = defaultHeaders ?? new Dictionary<string, string>();
         _logger = logger ?? NullLogger.Instance;
+        _wakeRetry =
+            wakeRetry ??
+            new WakeRetryOptions(
+                enabled: true,
+                maxAttempts: Constants.DefaultWakeMaxAttempts,
+                overallDeadline: TimeSpan.FromSeconds(Constants.DefaultWakeOverallDeadlineSeconds));
     }
 
     public string BaseUrl => _baseUrl;
 
     public HttpClientWrapper WithBaseUrl(string baseUrl) =>
-        new(_httpClient, baseUrl, _defaultHeaders, _logger, _transferHttpClient, _transferHeaderTimeout);
+        new(_httpClient, baseUrl, _defaultHeaders, _logger, _transferHttpClient, _transferHeaderTimeout, _wakeRetry);
 
     public async Task<T> GetAsync<T>(
         string path,
@@ -69,10 +94,14 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path, queryParams);
         _logger.LogDebug("HTTP GET {Url}", url);
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        ApplyDefaultHeaders(request);
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(
+            () =>
+            {
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                ApplyDefaultHeaders(request);
+                return request;
+            },
+            cancellationToken).ConfigureAwait(false);
         return await HandleResponseAsync<T>(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -87,10 +116,14 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path, queryParams);
         _logger.LogDebug("HTTP GET {Url}", url);
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        ApplyDefaultHeaders(request);
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(
+            () =>
+            {
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                ApplyDefaultHeaders(request);
+                return request;
+            },
+            cancellationToken).ConfigureAwait(false);
         var headers = response.Headers.ToDictionary(h => h.Key, h => h.Value.FirstOrDefault() ?? string.Empty, StringComparer.OrdinalIgnoreCase);
         var body = await HandleResponseAsync<T>(response, cancellationToken).ConfigureAwait(false);
         return (body, headers);
@@ -103,10 +136,14 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path, queryParams);
         _logger.LogDebug("HTTP GET {Url}", url);
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        ApplyDefaultHeaders(request);
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(
+            () =>
+            {
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                ApplyDefaultHeaders(request);
+                return request;
+            },
+            cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -117,16 +154,7 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path);
         _logger.LogDebug("HTTP POST {Url}", url);
-        using var request = new HttpRequestMessage(HttpMethod.Post, url);
-        ApplyDefaultHeaders(request);
-
-        if (body != null)
-        {
-            var json = JsonSerializer.Serialize(body, JsonOptions);
-            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-        }
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(() => BuildJsonRequest(HttpMethod.Post, url, body), cancellationToken).ConfigureAwait(false);
         return await HandleResponseAsync<T>(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -137,16 +165,7 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path);
         _logger.LogDebug("HTTP POST {Url}", url);
-        using var request = new HttpRequestMessage(HttpMethod.Post, url);
-        ApplyDefaultHeaders(request);
-
-        if (body != null)
-        {
-            var json = JsonSerializer.Serialize(body, JsonOptions);
-            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-        }
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(() => BuildJsonRequest(HttpMethod.Post, url, body), cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -157,16 +176,7 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path);
         _logger.LogDebug("HTTP PATCH {Url}", url);
-        using var request = new HttpRequestMessage(PatchMethod, url);
-        ApplyDefaultHeaders(request);
-
-        if (body != null)
-        {
-            var json = JsonSerializer.Serialize(body, JsonOptions);
-            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-        }
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(() => BuildJsonRequest(PatchMethod, url, body), cancellationToken).ConfigureAwait(false);
         return await HandleResponseAsync<T>(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -177,16 +187,7 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path);
         _logger.LogDebug("HTTP PATCH {Url}", url);
-        using var request = new HttpRequestMessage(PatchMethod, url);
-        ApplyDefaultHeaders(request);
-
-        if (body != null)
-        {
-            var json = JsonSerializer.Serialize(body, JsonOptions);
-            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-        }
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(() => BuildJsonRequest(PatchMethod, url, body), cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -197,10 +198,14 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path, queryParams);
         _logger.LogDebug("HTTP DELETE {Url}", url);
-        using var request = new HttpRequestMessage(HttpMethod.Delete, url);
-        ApplyDefaultHeaders(request);
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(
+            () =>
+            {
+                var request = new HttpRequestMessage(HttpMethod.Delete, url);
+                ApplyDefaultHeaders(request);
+                return request;
+            },
+            cancellationToken).ConfigureAwait(false);
         return await HandleResponseAsync<T>(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -211,10 +216,14 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path, queryParams);
         _logger.LogDebug("HTTP DELETE {Url}", url);
-        using var request = new HttpRequestMessage(HttpMethod.Delete, url);
-        ApplyDefaultHeaders(request);
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(
+            () =>
+            {
+                var request = new HttpRequestMessage(HttpMethod.Delete, url);
+                ApplyDefaultHeaders(request);
+                return request;
+            },
+            cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -225,13 +234,7 @@ internal sealed class HttpClientWrapper
     {
         var url = BuildUrl(path);
         _logger.LogDebug("HTTP DELETE {Url}", url);
-        using var request = new HttpRequestMessage(HttpMethod.Delete, url);
-        ApplyDefaultHeaders(request);
-
-        var json = JsonSerializer.Serialize(body, JsonOptions);
-        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithWakeRetryAsync(() => BuildJsonRequest(HttpMethod.Delete, url, body), cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
@@ -251,18 +254,27 @@ internal sealed class HttpClientWrapper
         CancellationToken cancellationToken = default)
     {
         var url = BuildUrl(path, queryParams);
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        ApplyDefaultHeaders(request);
-
-        if (headers != null)
-        {
-            foreach (var header in headers)
+        // Buffered download: the request is trivially replayable, so it goes
+        // through the wake retry like the JSON reads (streaming downloads via
+        // GetStreamAsync stay single-shot) and each attempt is sent on the
+        // transfer path, so the download is not capped by the connection
+        // request timeout.
+        using var response = await SendWithWakeRetryAsync(
+            () =>
             {
-                request.Headers.TryAddWithoutValidation(header.Key, header.Value);
-            }
-        }
-
-        using var response = await SendTransferAsync(request, cancellationToken).ConfigureAwait(false);
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                ApplyDefaultHeaders(request);
+                if (headers != null)
+                {
+                    foreach (var header in headers)
+                    {
+                        request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                    }
+                }
+                return request;
+            },
+            cancellationToken,
+            SendTransferAsync).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         return await ReadContentBytesAsync(response.Content, cancellationToken).ConfigureAwait(false);
     }
@@ -425,6 +437,156 @@ internal sealed class HttpClientWrapper
 
         return Encoding.UTF8.GetString(bytes);
 #endif
+    private HttpRequestMessage BuildJsonRequest(HttpMethod method, string url, object? body)
+    {
+        var request = new HttpRequestMessage(method, url);
+        ApplyDefaultHeaders(request);
+        if (body != null)
+        {
+            var json = JsonSerializer.Serialize(body, JsonOptions);
+            request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+        }
+        return request;
+    }
+
+    /// <summary>
+    /// Whether the response is the OSEP-0024 wake-timeout answer.
+    /// <para>
+    /// Recognition is header-only on a 503: the gateway strips
+    /// <c>OpenSandbox-Wake</c> from every upstream response, so a matching
+    /// marker proves the gateway parked the request and never forwarded it.
+    /// The JSON <c>code</c> in the body is documentation for humans, not a
+    /// recognition signal — a forged body without the header follows the
+    /// SDK's existing (bare 503) rules untouched.
+    /// </para>
+    /// </summary>
+    private static bool IsWakeTimeoutResponse(HttpResponseMessage response)
+    {
+        return (int)response.StatusCode == 503 &&
+               response.Headers.TryGetValues(Constants.WakeMarkerHeader, out var values) &&
+               string.Equals(values.FirstOrDefault(), Constants.WakeMarkerExpired, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Effective wake retry wait for a marked response: the parsed
+    /// <c>Retry-After</c> (delta-seconds or HTTP-date) capped at the
+    /// operational ceiling, or the 1-second fallback when the header is
+    /// missing or unparseable.
+    /// </summary>
+    private static TimeSpan ResolveWakeRetryAfter(HttpResponseMessage response)
+    {
+        TimeSpan? parsed = null;
+        if (response.Headers.TryGetValues("Retry-After", out var values))
+        {
+            var raw = values.FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(raw))
+            {
+                var trimmed = raw.Trim();
+                if (int.TryParse(trimmed, out var seconds))
+                {
+                    parsed = seconds <= 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(seconds);
+                }
+                else if (
+                    // HTTP dates are fixed-format RFC1123; parse with the
+                    // invariant culture (with a loose invariant fallback) so
+                    // hosts running a non-Gregorian culture still parse them.
+                    DateTimeOffset.TryParseExact(
+                        trimmed,
+                        "R",
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.None,
+                        out var exact) ||
+                    DateTimeOffset.TryParse(
+                        trimmed,
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.None,
+                        out exact))
+                {
+                    var delta = exact - DateTimeOffset.UtcNow;
+                    parsed = delta < TimeSpan.Zero ? TimeSpan.Zero : delta;
+                }
+            }
+        }
+
+        var wait = parsed ?? WakeDefaultRetryAfter;
+        return wait > RetryAfterCap ? RetryAfterCap : wait;
+    }
+
+    /// <summary>
+    /// Sends a request, applying the OSEP-0024 wake retry contract.
+    /// <para>
+    /// On a marked wake-timeout response the original request is rebuilt and
+    /// resent after waiting per <c>Retry-After</c> (JSON bodies are
+    /// re-serializable and the download requests are replayable, so replay is
+    /// always safe), until the sandbox is <c>Running</c> or the policy budget is exhausted;
+    /// exhaustion throws <see cref="SandboxWakeTimeoutException"/> while the
+    /// server-side resume continues in the background. Every other response —
+    /// including a bare 503 — is returned untouched. <paramref name="sender"/>
+    /// selects the transport per attempt: the shared client by default, or
+    /// <see cref="SendTransferAsync"/> so downloads are not capped by the
+    /// connection request timeout.
+    /// </para>
+    /// </summary>
+    private async Task<HttpResponseMessage> SendWithWakeRetryAsync(
+        Func<HttpRequestMessage> requestFactory,
+        CancellationToken cancellationToken,
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>>? sender = null)
+    {
+        sender ??= (request, token) => _httpClient.SendAsync(request, token);
+        if (!_wakeRetry.Enabled)
+        {
+            using var singleRequest = requestFactory();
+            return await sender(singleRequest, cancellationToken).ConfigureAwait(false);
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var attempts = 0;
+        while (true)
+        {
+            using var request = requestFactory();
+            var response = await sender(request, cancellationToken).ConfigureAwait(false);
+            if (!IsWakeTimeoutResponse(response))
+            {
+                return response;
+            }
+
+            attempts++;
+            var elapsed = stopwatch.Elapsed;
+            var retryAfter = ResolveWakeRetryAfter(response);
+            // Budget checks bound retries, not a committed resume: the
+            // server-side restore is never canceled by giving up here.
+            var exhausted = attempts >= _wakeRetry.MaxAttempts ||
+                            (_wakeRetry.OverallDeadline.HasValue &&
+                             retryAfter > _wakeRetry.OverallDeadline.Value - elapsed);
+            if (exhausted)
+            {
+                try
+                {
+                    var content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    var requestId = response.Headers.TryGetValues(Constants.RequestIdHeader, out var ids)
+                        ? ids.FirstOrDefault()
+                        : null;
+                    throw new SandboxWakeTimeoutException(
+                        attempts,
+                        elapsed,
+                        requestId: requestId,
+                        rawBody: content);
+                }
+                finally
+                {
+                    // Every other path disposes the response via using; the
+                    // exhaustion throw must not leak the connection either.
+                    response.Dispose();
+                }
+            }
+
+            _logger.LogInformation(
+                "Wake retry: marked 503 received; restore still in progress (attempt={Attempt}, retryAfter={RetryAfterMs}ms)",
+                attempts,
+                retryAfter.TotalMilliseconds);
+            response.Dispose();
+            await Task.Delay(retryAfter, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private string BuildUrl(string path, Dictionary<string, string?>? queryParams = null)
