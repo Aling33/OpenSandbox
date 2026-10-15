@@ -54,6 +54,13 @@ func TestHealthGateAddonDown(t *testing.T) {
 	reason, down = gate.DownReason()
 	require.True(t, down)
 	require.Contains(t, reason, "missing seed")
+
+	// The latch is type-enforced: a down addon cannot be resurrected by a
+	// late SetReady(true) (e.g. a future restart/watch path) — that would
+	// surface ready:true + mitmCaDown:true. Only a fresh process clears it.
+	gate.SetReady(true)
+	gate.MarkStackReady()
+	require.True(t, gate.MitmPending(), "SetReady(true) must be a no-op while latched down")
 }
 
 func TestHealthGateCAFingerprint(t *testing.T) {

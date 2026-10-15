@@ -40,6 +40,12 @@ type testCA struct {
 }
 
 func generateTestCA(t *testing.T, cn string) testCA {
+	return generateTestCAWith(t, cn, nil)
+}
+
+// generateTestCAWith materializes one self-signed certificate (CA by default)
+// whose template `mutate` may adjust (validity window, IsCA, key usage, ...).
+func generateTestCAWith(t *testing.T, cn string, mutate func(*x509.Certificate)) testCA {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
@@ -51,6 +57,9 @@ func generateTestCA(t *testing.T, cn string) testCA {
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	if mutate != nil {
+		mutate(tmpl)
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	require.NoError(t, err)
@@ -82,15 +91,25 @@ func TestSeedPinnedCAMaterializesConfdirPair(t *testing.T) {
 	// Fingerprint must equal the SHA-256 over the certificate DER.
 	require.Equal(t, ca.fingerprint(t), fp)
 
-	// The confdir pair materialized under the names mitmdump loads.
+	// The confdir materializes the mitmproxy contract: ONE bundle file
+	// holding the certificate AND the private key (CertStore.from_pem loads
+	// both from mitmproxy-ca.pem — a key-only file makes mitmdump exit at
+	// startup), plus the public certificate copy.
+	bundle, err := os.ReadFile(filepath.Join(confDir, confCAKeyName))
+	require.NoError(t, err)
+	require.Equal(t, string(combineCAPEM(ca.certPEM, ca.keyPEM)), string(bundle))
+	first, rest := pem.Decode(bundle)
+	require.NotNil(t, first)
+	require.Equal(t, "CERTIFICATE", first.Type, "bundle must lead with the certificate")
+	second, _ := pem.Decode(rest)
+	require.NotNil(t, second)
+	require.Equal(t, "EC PRIVATE KEY", second.Type, "bundle must carry the private key")
 	cert, err := os.ReadFile(filepath.Join(confDir, mitmCACertName))
 	require.NoError(t, err)
 	require.Equal(t, string(ca.certPEM), string(cert))
-	key, err := os.ReadFile(filepath.Join(confDir, confCAKeyName))
-	require.NoError(t, err)
-	require.Equal(t, string(ca.keyPEM), string(key))
 
-	// Private key mode 0600; ownership handed to the mitmdump user.
+	// The bundle carries the private key: mode 0600; ownership handed to the
+	// mitmdump user.
 	keyInfo, err := os.Stat(filepath.Join(confDir, confCAKeyName))
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0o600), keyInfo.Mode().Perm())
@@ -131,11 +150,12 @@ func TestSeedPinnedCAReplacesForeignConfdirCA(t *testing.T) {
 	confDir := filepath.Join(t.TempDir(), ".mitmproxy")
 	require.NoError(t, os.MkdirAll(confDir, 0o755))
 
-	// A previously generated (foreign) CA occupies the confdir; the pinned
-	// copy must win — mitmdump would otherwise load the wrong keypair.
+	// A previously generated (foreign) CA occupies the confdir in the real
+	// layout (bundle + public cert); the pinned copy must win — mitmdump
+	// would otherwise load the wrong keypair.
 	foreign := generateTestCA(t, "generated-ca")
+	require.NoError(t, os.WriteFile(filepath.Join(confDir, confCAKeyName), combineCAPEM(foreign.certPEM, foreign.keyPEM), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(confDir, mitmCACertName), foreign.certPEM, 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(confDir, confCAKeyName), foreign.keyPEM, 0o600))
 
 	fp, err := SeedPinnedCA(seedDir, confDir, os.Getuid(), os.Getgid())
 	require.NoError(t, err)
@@ -183,6 +203,45 @@ func TestSeedPinnedCARejectsMissingOrUnloadableSeed(t *testing.T) {
 	// Nothing may be materialized on any failure path.
 	_, statErr := os.Stat(confDir)
 	require.True(t, os.IsNotExist(statErr), "failed seed must not create the confdir")
+}
+
+func TestSeedPinnedCARejectsNonCAOrExpired(t *testing.T) {
+	confDir := filepath.Join(t.TempDir(), ".mitmproxy")
+
+	seed := func(ca testCA) error {
+		dir := writeSeedDir(t, ca)
+		_, err := SeedPinnedCA(dir, confDir, os.Getuid(), os.Getgid())
+		return err
+	}
+
+	// A leaf certificate (no IsCA, no keyCertSign) cannot sign interception
+	// certificates; seeding it would fail every handshake silently.
+	leaf := generateTestCAWith(t, "leaf", func(c *x509.Certificate) {
+		c.IsCA = false
+		c.KeyUsage = x509.KeyUsageDigitalSignature
+	})
+	err := seed(leaf)
+	require.ErrorContains(t, err, "is not a CA")
+
+	// Not yet valid.
+	future := generateTestCAWith(t, "future", func(c *x509.Certificate) {
+		c.NotBefore = time.Now().Add(time.Hour)
+		c.NotAfter = time.Now().Add(2 * time.Hour)
+	})
+	err = seed(future)
+	require.ErrorContains(t, err, "not valid until")
+
+	// Expired.
+	expired := generateTestCAWith(t, "expired", func(c *x509.Certificate) {
+		c.NotBefore = time.Now().Add(-2 * time.Hour)
+		c.NotAfter = time.Now().Add(-time.Hour)
+	})
+	err = seed(expired)
+	require.ErrorContains(t, err, "expired")
+
+	// Nothing may be materialized on any failure path.
+	_, statErr := os.Stat(confDir)
+	require.True(t, os.IsNotExist(statErr), "rejected seeds must not create the confdir")
 }
 
 func TestConfdirCAFingerprint(t *testing.T) {

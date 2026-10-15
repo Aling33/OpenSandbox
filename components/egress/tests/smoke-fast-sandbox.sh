@@ -506,13 +506,13 @@ else
   # endpoint IS the policy surface, deny-first on registration).
   set_binding a 10.10.0.5 7 runtime-a-2 att-a-2 '{"defaultAction":"deny"}'
   # No interception may be installed: the DNAT table stays absent.
-  if nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q '10.10.0.5'; then
+  if nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '; then
     fail "addon-down must not install per-subject interception rules"
   fi
   pass "addon-down fail-closed (healthz 503 + status signal, policy serving, no interception)"
 
   ###############################################################################
-  info "Test 11b: pinned CA seeding -> confdir pair + fingerprint observability"
+  info "Test 11b: pinned CA seeding -> confdir bundle + fingerprint observability"
   # Provision the pool-pinned CA exactly as the platform Secret mount would:
   # `tls.crt` + `tls.key` on a read-only seed mount.
   CA_SEED_DIR="$(mktemp -d /tmp/osb-mitm-ca-seed.XXXXXX)"
@@ -522,19 +522,28 @@ else
     -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,digitalSignature" >/dev/null 2>&1
   SEED_FP="$(openssl x509 -in "${CA_SEED_DIR}/tls.crt" -noout -fingerprint -sha256 | sed 's/^.*=//' | tr -d ':' | tr 'A-Z' 'a-z')"
+  [ -n "${SEED_FP}" ] || fail "could not fingerprint the pinned CA (openssl failed)"
 
   kill "${EGRESS_PID}" 2>/dev/null
   wait "${EGRESS_PID}" 2>/dev/null || true
   EGRESS_PID=""
+  # Drop any confdir CA left by a previous run so the materialization
+  # assertion below is meaningful (config.yaml must survive: mitmdump
+  # auto-loads it).
+  rm -f /var/lib/mitmproxy/.mitmproxy/mitmproxy-ca.pem \
+        /var/lib/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem
   EGRESS_MITM=1 start_egress
 
-  # The seed materialized the confdir pair under the names mitmdump loads;
-  # healthz mirrors the pinned CA's fingerprint.
+  # The seed materialized the confdir CA bundle mitmdump loads (one file
+  # holding certificate + private key); the certificate copy's fingerprint
+  # must equal the pinned seed, and healthz mirrors it.
   wait_for 20 "pinned CA seeded into confdir" test -s /var/lib/mitmproxy/.mitmproxy/mitmproxy-ca.pem
   [ -s /var/lib/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem ] || fail "confdir cert missing after seeding"
+  mat_fp="$(openssl x509 -in /var/lib/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem -noout -fingerprint -sha256 | sed 's/^.*=//' | tr -d ':' | tr 'A-Z' 'a-z')"
+  [ "${mat_fp}" = "${SEED_FP}" ] || fail "materialized confdir cert ${mat_fp} must equal the pinned cert ${SEED_FP}"
   got_fp="$(healthz_fingerprint)"
   [ "${got_fp}" = "${SEED_FP}" ] || fail "healthz fingerprint ${got_fp} must equal the pinned CA fingerprint ${SEED_FP}"
-  pass "pinned CA seeded (confdir pair + healthz fingerprint ${SEED_FP:0:12}...)"
+  pass "pinned CA seeded (confdir bundle + fingerprint ${SEED_FP:0:12}...)"
 
   # Subject a registers (deny-first): the per-subject DNAT is installed at
   # registration.
@@ -671,6 +680,21 @@ else
   out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "interception must resume after mitmdump restart; got: ${out}"
   pass "mitmdump death recovery (503 -> auto-restart -> interception resumes)"
+
+ ###############################################################################
+  info "Test 11c: up -> down transition removes the previous generation's interception table"
+  # Subject a's DNAT is live at this point (an up generation). Restarting
+  # without the seed must latch the addon down AND remove the interception
+  # table — stale rules would keep DNATing 80/443 to a now-unserved mitm
+  # port (blackhole).
+  if ! nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '; then
+    fail "precondition: subject a's interception rule must be installed before the up->down transition"
+  fi
+  CA_SEED_DIR="" EXPECT_MITM_DOWN=1 EGRESS_MITM=1 start_egress
+  if nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '; then
+    fail "up->down transition must remove the interception table (stale DNAT = blackhole)"
+  fi
+  pass "up->down transition removed the interception table (no blackhole)"
 
 ###############################################################################
   info "Test 12: MITM-mode restart recovery (DNAT rebuild + pinned CA stability + action replay)"

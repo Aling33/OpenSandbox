@@ -72,7 +72,11 @@ EXT_CIDR="10.99.0.0/24"
 EXT_CT_NETNS="osb-fc-ext"
 
 RULES_DIR="${WORK_DIR}/rules"
-SEED_DIR="${WORK_DIR}/mitm-ca-seed"     # pinned-CA seed mount (tls.crt/tls.key)
+# The pinned-CA seed mount lives in the ASSET cache (not the scratch WORK_DIR):
+# a stable keypair keeps the rootfs template cache key (which embeds the
+# pinned fingerprint) hitting across runs instead of forcing a full template
+# rebuild every CI invocation.
+SEED_DIR="${ASSET_DIR}/mitm-ca-seed"    # pinned-CA seed mount (tls.crt/tls.key)
 VM_ROOTFS="${WORK_DIR}/vm-rootfs.ext4"  # firecracker rootfs image
 VM_ROOTFS_MNT="${WORK_DIR}/vm-rootfs-mnt"
 VM_SERIAL="${WORK_DIR}/fc-process.log"
@@ -173,11 +177,14 @@ mkdir -p "${ASSET_DIR}" "${WORK_DIR}" "${RULES_DIR}" "${SEED_DIR}"
 info "Provisioning the pool-pinned MITM CA (seed mount, OSEP-0022)"
 # Exactly the platform Secret layout: one `tls.crt` + `tls.key` keypair on a
 # read-only seed mount, consumed via OPENSANDBOX_EGRESS_MITM_CA_SEED_DIR.
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-  -keyout "${SEED_DIR}/tls.key" -out "${SEED_DIR}/tls.crt" \
-  -subj "/CN=e2e-pinned-ca" \
-  -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "keyUsage=critical,keyCertSign,digitalSignature" >/dev/null 2>&1
+# Persisted in ASSET_DIR so repeat runs reuse the same pinned CA.
+if [ ! -s "${SEED_DIR}/tls.crt" ] || [ ! -s "${SEED_DIR}/tls.key" ]; then
+  openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -keyout "${SEED_DIR}/tls.key" -out "${SEED_DIR}/tls.crt" \
+    -subj "/CN=e2e-pinned-ca" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,digitalSignature" >/dev/null 2>&1
+fi
 SEED_FP="$(openssl x509 -in "${SEED_DIR}/tls.crt" -noout -fingerprint -sha256 | sed 's/^.*=//' | tr -d ':' | tr 'A-Z' 'a-z')"
 [ -n "${SEED_FP}" ] || fail "could not fingerprint the pinned CA"
 pass "pinned CA provisioned (fingerprint ${SEED_FP:0:12}...)"

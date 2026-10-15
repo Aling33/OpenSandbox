@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
@@ -34,16 +35,23 @@ import (
 // the pool-pinned CA keypair arrives on a read-only seed mount
 // (constants.EnvMitmCaSeedDir, `tls.crt` + `tls.key` entries) and is copied
 // idempotently into the writable confdir under the names mitmdump actually
-// loads — confCAKeyName (private key) + mitmCACertName (certificate).
-// mitmdump loads a confdir CA when present and only generates when missing;
-// in this profile it must never generate.
+// loads — confCAKeyName, a single file holding the certificate AND the
+// private key (mitmproxy's CertStore.from_pem scans this one file for both
+// PEM blocks; a key-only file makes mitmdump exit at startup), plus
+// mitmCACertName (the public certificate copy). mitmdump loads a confdir CA
+// when present and only generates when missing; in this profile it must
+// never generate.
 
 const (
 	// SeedCACertName / SeedCAKeyName are the pinned-CA Secret entries on the
 	// read-only seed mount (Kubernetes tls-Secret conventions).
 	SeedCACertName = "tls.crt"
 	SeedCAKeyName  = "tls.key"
-	// confCAKeyName is the private-key name mitmdump loads from the confdir.
+	// confCAKeyName is the CA bundle mitmdump loads from the confdir: ONE
+	// file containing both the certificate and the private key, in the shape
+	// mitmproxy's own generate-on-start produces. Order matters for our own
+	// tooling: the certificate goes first, so the first PEM block is a
+	// CERTIFICATE.
 	confCAKeyName = "mitmproxy-ca.pem"
 )
 
@@ -77,14 +85,24 @@ func seedPinnedCA(certPEM, keyPEM []byte, confDir string, uid, gid int) (string,
 	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
 		return "", fmt.Errorf("pinned CA keypair (%s + %s): %w", SeedCACertName, SeedCAKeyName, err)
 	}
-	fp, err := pemCertFingerprint(certPEM)
+	cert, err := parseCertificatePEM(certPEM)
 	if err != nil {
 		return "", fmt.Errorf("pinned CA certificate: %w", err)
 	}
+	// A certificate that cannot actually sign (non-CA, missing keyCertSign)
+	// or is outside its validity window would seed cleanly and pass every
+	// consistency check while every intercepted TLS handshake fails client
+	// verification — exactly the silent failure the fail-closed design
+	// exists to prevent. Refuse it at the seed.
+	if err := validateCACertificate(cert); err != nil {
+		return "", err
+	}
+	fp := certFingerprint(cert)
+	bundle := combineCAPEM(certPEM, keyPEM)
 
 	// Idempotent: a confdir already holding the exact pinned pair is left
 	// untouched, so restarts keep the files (and their inodes) stable.
-	if samePinnedPair(confDir, certPEM, keyPEM, fp) {
+	if samePinnedPair(confDir, certPEM, bundle) {
 		return fp, nil
 	}
 
@@ -92,11 +110,12 @@ func seedPinnedCA(certPEM, keyPEM []byte, confDir string, uid, gid int) (string,
 		return "", fmt.Errorf("mkdir confdir %s: %w", confDir, err)
 	}
 	// mitmdump runs as an unprivileged user; files written here by root must
-	// be readable by it (the key is mode 0600, so ownership is not optional).
+	// be readable by it (the bundle carries the private key, mode 0600, so
+	// ownership is not optional).
 	if err := os.Chown(confDir, uid, gid); err != nil {
 		return "", fmt.Errorf("chown confdir %s: %w", confDir, err)
 	}
-	if err := writeConfCAFile(confDir, confCAKeyName, keyPEM, 0o600, uid, gid); err != nil {
+	if err := writeConfCAFile(confDir, confCAKeyName, bundle, 0o600, uid, gid); err != nil {
 		return "", fmt.Errorf("seed %s: %w", confCAKeyName, err)
 	}
 	if err := writeConfCAFile(confDir, mitmCACertName, certPEM, 0o644, uid, gid); err != nil {
@@ -107,21 +126,17 @@ func seedPinnedCA(certPEM, keyPEM []byte, confDir string, uid, gid int) (string,
 }
 
 // samePinnedPair reports whether the confdir already materializes the pinned
-// pair (cert fingerprint equal AND key bytes identical).
-func samePinnedPair(confDir string, certPEM, keyPEM []byte, fp string) bool {
+// pair (bundle and certificate files byte-identical to the seed).
+func samePinnedPair(confDir string, certPEM, bundle []byte) bool {
+	existingBundle, err := os.ReadFile(filepath.Join(confDir, confCAKeyName))
+	if err != nil || !bytes.Equal(existingBundle, bundle) {
+		return false
+	}
 	existingCert, err := os.ReadFile(filepath.Join(confDir, mitmCACertName))
 	if err != nil {
 		return false
 	}
-	existingKey, err := os.ReadFile(filepath.Join(confDir, confCAKeyName))
-	if err != nil {
-		return false
-	}
-	if !bytes.Equal(existingKey, keyPEM) {
-		return false
-	}
-	existingFP, err := pemCertFingerprint(existingCert)
-	return err == nil && existingFP == fp
+	return bytes.Equal(existingCert, certPEM)
 }
 
 // ConfdirCAFingerprint returns the SHA-256 fingerprint of the certificate in
@@ -143,16 +158,64 @@ func ConfdirCAFingerprint(confDir string) (string, error) {
 // pemCertFingerprint returns the lowercase hex SHA-256 fingerprint of the
 // first certificate in a PEM bundle.
 func pemCertFingerprint(certPEM []byte) (string, error) {
+	cert, err := parseCertificatePEM(certPEM)
+	if err != nil {
+		return "", err
+	}
+	return certFingerprint(cert), nil
+}
+
+// parseCertificatePEM decodes and parses the first certificate in a PEM bundle.
+func parseCertificatePEM(certPEM []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
-		return "", fmt.Errorf("no CERTIFICATE PEM block")
+		return nil, fmt.Errorf("no CERTIFICATE PEM block")
 	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return "", fmt.Errorf("parse certificate: %w", err)
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// validateCACertificate rejects certificates that cannot serve as an
+// interception trust anchor: a non-CA or keyCertSign-less certificate, or one
+// outside its validity window, would seed cleanly and pass every consistency
+// check while all intercepted TLS handshakes fail client verification.
+func validateCACertificate(cert *x509.Certificate) error {
+	name := cert.Subject.CommonName
+	if !cert.IsCA {
+		return fmt.Errorf("pinned CA certificate %q is not a CA (basicConstraints IsCA=false)", name)
 	}
+	if cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return fmt.Errorf("pinned CA certificate %q lacks the keyCertSign key usage", name)
+	}
+	now := time.Now()
+	if now.Before(cert.NotBefore) {
+		return fmt.Errorf("pinned CA certificate %q is not valid until %s", name, cert.NotBefore.UTC().Format(time.RFC3339))
+	}
+	if now.After(cert.NotAfter) {
+		return fmt.Errorf("pinned CA certificate %q expired at %s", name, cert.NotAfter.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+// certFingerprint returns the lowercase hex SHA-256 fingerprint over the DER.
+func certFingerprint(cert *x509.Certificate) string {
 	sum := sha256.Sum256(cert.Raw)
-	return hex.EncodeToString(sum[:]), nil
+	return hex.EncodeToString(sum[:])
+}
+
+// combineCAPEM builds the single-file confdir CA bundle mitmproxy loads:
+// certificate first (so the first PEM block is a CERTIFICATE), then the
+// private key — the same shape mitmproxy's own generate-on-start writes, and
+// the only shape its CertStore.from_pem accepts (it scans the one file for
+// both the CERTIFICATE and the private-key PEM blocks).
+func combineCAPEM(certPEM, keyPEM []byte) []byte {
+	cert := bytes.TrimRight(certPEM, "\n")
+	key := bytes.TrimRight(keyPEM, "\n")
+	out := make([]byte, 0, len(cert)+len(key)+2)
+	out = append(out, cert...)
+	out = append(out, '\n', '\n')
+	out = append(out, key...)
+	out = append(out, '\n')
+	return out
 }
 
 // writeConfCAFile atomically materializes one confdir file (temp + rename so

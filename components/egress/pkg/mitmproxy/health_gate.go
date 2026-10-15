@@ -56,9 +56,19 @@ func (g *HealthGate) MarkStackReady() {
 }
 
 func (g *HealthGate) SetReady(v bool) {
-	if g != nil {
-		g.ready.Store(v)
+	if g == nil {
+		return
 	}
+	// Addon-down latch: a latched-down addon cannot be resurrected by a
+	// late SetReady(true) (e.g. a future restart/watch path) — that would
+	// surface the contradictory ready:true + mitmCaDown:true state. Only a
+	// fresh process (new gate) clears the latch.
+	if v {
+		if _, down := g.DownReason(); down {
+			return
+		}
+	}
+	g.ready.Store(v)
 }
 
 func (g *HealthGate) MitmPending() bool {

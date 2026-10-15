@@ -96,15 +96,16 @@ func purgeStaleExportedCAFrom(rootDir string) {
 }
 
 func SyncRootCA(confDirEnv, home string) error {
-	return exportRootCA(confDirEnv, home, constants.OpenSandboxRootDir, true)
+	return exportRootCA(confDirEnv, home, constants.OpenSandboxRootDir)
 }
 
-// Sidecar-only export path. The fast-sandbox profile seeds its pinned CA from
-// a read-only mount instead (cacert_seed.go) and exports nothing: the
-// guest trusts the template-baked certificate, so there is no per-sandbox
-// CA delivery, trust seeding, or stale-export purge (OSEP-0022).
-
-func exportRootCA(confDirEnv, home, rootDir string, installSystemTrust bool) error {
+// exportRootCA is the sidecar-only export path (the fast-sandbox profile
+// seeds its pinned CA from a read-only mount instead — cacert_seed.go — and
+// exports nothing: the guest trusts the template-baked certificate, so there
+// is no per-sandbox CA delivery, trust seeding, or stale-export purge,
+// OSEP-0022). It also installs the CA into the egress container's own system
+// trust store: sidecar upstream validation uses it.
+func exportRootCA(confDirEnv, home, rootDir string) error {
 	src, err := waitMitmCACertPath(confDirEnv, home)
 	if err != nil {
 		return err
@@ -118,9 +119,6 @@ func exportRootCA(confDirEnv, home, rootDir string, installSystemTrust bool) err
 	}
 	log.Infof("[mitmproxy] copied root CA to %s", dst)
 
-	if !installSystemTrust {
-		return nil
-	}
 	if err := installMitmCAInSystemTrust(dst); err != nil {
 		return fmt.Errorf("install mitm CA into system trust store: %w", err)
 	}
