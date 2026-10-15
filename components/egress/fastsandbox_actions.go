@@ -25,7 +25,9 @@
 //	                   policy as pending; activate immediately when the
 //	                   subject is already active (a plain input update does
 //	                   not replay Hooks). A JSON-null input removes the
-//	                   policy and reverts to deny-first.
+//	                   policy and reverts to deny-first. A key held by a
+//	                   different live subject is a stale-subject takeover
+//	                   (OSEP-0022): the previous owner goes first.
 //	LIFECYCLE_HOOK     sandbox.runtime-ready only confirms the deny-first
 //	                   install (idempotent); sandbox.data-plane-ready applies
 //	                   the pending policy -> active. Unknown Hooks are
@@ -152,7 +154,7 @@ func (s *fastSandboxPolicyServer) applySetBinding(env *actionhandler.Envelope) (
 	}
 	state, err := s.reg.RegisterAndEnforce(subj, subject.SubjectKey{SourceIP: att.IP}, fence, func() error {
 		return s.OnRegistered(subj, att)
-	})
+	}, s.takeoverStaleSubject)
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("deny-first install: %w", err)
 	}

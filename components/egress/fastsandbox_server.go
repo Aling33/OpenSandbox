@@ -364,7 +364,20 @@ func (s *fastSandboxPolicyServer) setMitmRedirect(subj subject.Subject, att acti
 // teardown step undone, and the caller keeps the subject registered so the
 // retried terminal cleanup re-runs everything (no double gateway release, no
 // stale rules).
-func (s *fastSandboxPolicyServer) OnUnloaded(subj subject.Subject, att actionhandler.NetworkAttachment) error {
+func (s *fastSandboxPolicyServer) OnUnloaded(subj subject.Subject, _ actionhandler.NetworkAttachment) error {
+	if err := s.unloadEnforcement(subj); err != nil {
+		return err
+	}
+	log.Infof("subject %s enforcement removed", subj)
+	return nil
+}
+
+// unloadEnforcement performs the full teardown shared by REMOVE_BINDING
+// (OnUnloaded) and stale-subject takeover: nft removal first (a transient
+// failure leaves every other step undone so the caller retries whole), then
+// the per-subject state, the gateway DNS refcount, and the MITM entry. Does
+// not touch the registry — safe to run under the registry write lock.
+func (s *fastSandboxPolicyServer) unloadEnforcement(subj subject.Subject) error {
 	nftCtx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 	defer cancel()
 	if err := s.nft.Remove(nftCtx, subj); err != nil {
@@ -373,7 +386,21 @@ func (s *fastSandboxPolicyServer) OnUnloaded(subj subject.Subject, att actionhan
 	s.dropSubjectState(subj)
 	s.releaseGatewayDNSRedirect(subj)
 	s.removeMitmRedirect(subj)
-	log.Infof("subject %s enforcement removed", subj)
+	return nil
+}
+
+// takeoverStaleSubject implements the OSEP-0022 stale-subject defense: an
+// incoming SET_BINDING claimed the dispatch key of a still-live subject —
+// authoritative that the previous owner is gone. The stale nft rules must go
+// first (they match the slot IP: until removed, first-match dispatch would
+// send the successor's traffic to the stale policy). Runs under the registry
+// write lock, which evicts the stale subject in the same critical section; a
+// failure fails the successor's registration (the Fastlet retries).
+func (s *fastSandboxPolicyServer) takeoverStaleSubject(stale subject.Subject) error {
+	if err := s.unloadEnforcement(stale); err != nil {
+		return err
+	}
+	log.Infof("subject %s taken over (dispatch key claimed by successor)", stale)
 	return nil
 }
 

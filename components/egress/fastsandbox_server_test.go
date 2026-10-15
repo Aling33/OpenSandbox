@@ -455,6 +455,187 @@ func TestActionsHookForUnregisteredSubjectConflict(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Stale-subject takeover on slot reuse (OSEP-0022)
+// ---------------------------------------------------------------------------
+
+// TestActionsSetBindingTakeoverOnSlotReuse: a SET_BINDING claiming a live
+// subject's IP tears the stale subject down and registers the successor
+// deny-first; a late REMOVE_BINDING for the stale subject stays a no-op.
+func TestActionsSetBindingTakeoverOnSlotReuse(t *testing.T) {
+	srv, reg, nft := fastSandboxTestServer(t)
+	inst := &fakeMitmInstaller{}
+	srv.mitmInstall = inst.install
+	srv.mitmRemove = inst.remove
+
+	staleUID, takeUID := "u-stale", "u-take"
+	stale, succ := subject.FromSandboxUID(staleUID), subject.FromSandboxUID(takeUID)
+	input := `{"defaultAction":"deny","egress":[{"action":"allow","target":"stale.com"}]}`
+	setBindingAndReady(t, srv, reg, staleUID, testIP, &input)
+
+	// the stale subject owns a vault slice
+	vault := srv.vaultFor(stale)
+	_, err := vault.Create(credentialvault.CreateRequest{}, reg.EffectivePolicy(stale))
+	require.NoError(t, err)
+
+	// a new sandbox's SET_BINDING claims the reused slot IP: takeover
+	succInput := `{"defaultAction":"deny","egress":[{"action":"allow","target":"succ.com"}]}`
+	rec := doAction(t, srv, bindBody(t, takeUID, testIP, "runtime-2", "attachment-2", 1, &succInput))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// successor deny-first and owning the dispatch key
+	require.Equal(t, subject.StateDenying, mustState(reg.Get(succ)))
+	assert.Nil(t, reg.EffectivePolicy(succ), "successor must be deny-first until its own data-plane-ready")
+	got, ok := reg.Resolve(subject.SubjectKey{SourceIP: netip.MustParseAddr(testIP)})
+	require.True(t, ok)
+	assert.Equal(t, succ, got)
+	nft.mu.Lock()
+	require.Contains(t, nft.denyFirst, succ)
+	nft.mu.Unlock()
+
+	// stale subject fully torn down
+	_, ok = reg.Get(stale)
+	assert.False(t, ok)
+	nft.mu.Lock()
+	require.Equal(t, []subject.Subject{stale}, nft.removed)
+	nft.mu.Unlock()
+	srv.mu.Lock()
+	_, hasStaleVault := srv.vaults[stale]
+	srv.mu.Unlock()
+	assert.False(t, hasStaleVault, "the stale vault memory slice must be dropped")
+
+	// gateway refcount and MITM maps hold only the successor
+	srv.gwMu.Lock()
+	gws := make(map[subject.Subject]netip.Addr, len(srv.gatewayDNSRefs))
+	for gs, g := range srv.gatewayDNSRefs {
+		gws[gs] = g
+	}
+	srv.gwMu.Unlock()
+	assert.Equal(t, map[subject.Subject]netip.Addr{succ: netip.MustParseAddr(testGW)}, gws)
+	srv.mitmMu.Lock()
+	_, hasStaleMitm := srv.mitmEntries[stale]
+	_, hasSuccMitm := srv.mitmEntries[succ]
+	srv.mitmMu.Unlock()
+	assert.False(t, hasStaleMitm)
+	assert.True(t, hasSuccMitm)
+
+	// the successor's lifecycle completes normally
+	rec = doAction(t, srv, hookBody(t, takeUID, "runtime-2", "attachment-2", constants.HookDataPlaneReady))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, subject.StateActive, mustState(reg.Get(succ)))
+	assert.Equal(t, "allow", reg.EffectivePolicy(succ).Evaluate("succ.com"))
+
+	// a late REMOVE_BINDING for the stale subject: no-op, successor untouched
+	nft.mu.Lock()
+	removedBefore := len(nft.removed)
+	nft.mu.Unlock()
+	rec = doAction(t, srv, removeBody(t, staleUID, testFenceR, testFenceA))
+	require.Equal(t, http.StatusOK, rec.Code)
+	_, ok = reg.Get(succ)
+	require.True(t, ok)
+	require.Equal(t, subject.StateActive, mustState(reg.Get(succ)))
+	nft.mu.Lock()
+	assert.Equal(t, removedBefore, len(nft.removed), "the stale removal must not touch enforcement")
+	nft.mu.Unlock()
+	got, ok = reg.Resolve(subject.SubjectKey{SourceIP: netip.MustParseAddr(testIP)})
+	require.True(t, ok)
+	assert.Equal(t, succ, got)
+}
+
+// TestActionsSetBindingTakeoverDuplicateIdempotent: a duplicate SET_BINDING
+// for the SAME UID on the same IP stays an idempotent no-op (not a takeover).
+func TestActionsSetBindingTakeoverDuplicateIdempotent(t *testing.T) {
+	srv, reg, nft := fastSandboxTestServer(t)
+	input := `{"defaultAction":"deny"}`
+	s := setBindingAndReady(t, srv, reg, testUID, testIP, &input)
+	nft.mu.Lock()
+	denyFirstAfterSetup := len(nft.denyFirst)
+	nft.mu.Unlock()
+
+	// retried delivery of the same SET_BINDING (same fence, same key)
+	rec := doAction(t, srv, bindBody(t, testUID, testIP, testFenceR, testFenceA, 1, &input))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, subject.StateActive, mustState(reg.Get(s)))
+	nft.mu.Lock()
+	assert.Equal(t, denyFirstAfterSetup, len(nft.denyFirst), "no deny-first re-install")
+	assert.Empty(t, nft.removed, "own-key re-claim must not tear anything down")
+	nft.mu.Unlock()
+}
+
+// TestActionsSetBindingTakeoverNftFailureFailClosed: a failed stale teardown
+// fails the takeover; the retry converges.
+func TestActionsSetBindingTakeoverNftFailureFailClosed(t *testing.T) {
+	srv, reg, nft := fastSandboxTestServer(t)
+	staleUID, takeUID := "u-stale", "u-take"
+	stale, succ := subject.FromSandboxUID(staleUID), subject.FromSandboxUID(takeUID)
+	input := `{"defaultAction":"deny"}`
+	setBindingAndReady(t, srv, reg, staleUID, testIP, &input)
+	_, err := srv.vaultFor(stale).Create(credentialvault.CreateRequest{}, reg.EffectivePolicy(stale))
+	require.NoError(t, err)
+
+	nft.mu.Lock()
+	nft.removeErr = errors.New("nft busy")
+	nft.mu.Unlock()
+	rec := doAction(t, srv, bindBody(t, takeUID, testIP, "runtime-2", "attachment-2", 1, strPtr(`{"defaultAction":"deny"}`)))
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+
+	// fail-closed: the stale subject keeps the slot
+	require.Equal(t, subject.StateActive, mustState(reg.Get(stale)))
+	_, ok := reg.Get(succ)
+	assert.False(t, ok)
+	got, ok := reg.Resolve(subject.SubjectKey{SourceIP: netip.MustParseAddr(testIP)})
+	require.True(t, ok)
+	assert.Equal(t, stale, got)
+	srv.mu.Lock()
+	_, hasStaleVault := srv.vaults[stale]
+	srv.mu.Unlock()
+	assert.True(t, hasStaleVault, "the stale vault must be untouched")
+
+	// the retry converges
+	nft.mu.Lock()
+	nft.removeErr = nil
+	nft.mu.Unlock()
+	rec = doAction(t, srv, bindBody(t, takeUID, testIP, "runtime-2", "attachment-2", 1, strPtr(`{"defaultAction":"deny"}`)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, subject.StateDenying, mustState(reg.Get(succ)))
+	_, ok = reg.Get(stale)
+	assert.False(t, ok)
+}
+
+// TestActionsSetBindingTakeoverGatewayRefcountConsistent: gateway refcount
+// and MITM table stay consistent across the swap.
+func TestActionsSetBindingTakeoverGatewayRefcountConsistent(t *testing.T) {
+	reg := subject.NewRegistry(nil, nil)
+	nft := &fakeNft{}
+	srv := newFastSandboxPolicyServer(context.Background(), reg, nft)
+	var installs, removes int
+	srv.dnsRedirectInstall = func(netip.Addr, int) error { installs++; return nil }
+	srv.dnsRedirectRemove = func() error { removes++; return nil }
+	inst := &fakeMitmInstaller{}
+	srv.mitmInstall = inst.install
+	srv.mitmRemove = inst.remove
+
+	staleUID, takeUID := "u-stale", "u-take"
+	input := `{"defaultAction":"deny"}`
+	rec := doAction(t, srv, bindBody(t, staleUID, testIP, testFenceR, testFenceA, 1, &input))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, 1, installs)
+
+	rec = doAction(t, srv, bindBody(t, takeUID, testIP, "runtime-2", "attachment-2", 1, &input))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	assert.Equal(t, 2, installs, "the successor reinstalls the shared gateway redirect")
+	assert.Equal(t, 1, removes, "the stale subject releases its refcount exactly once")
+	srv.gwMu.Lock()
+	_, hasStale := srv.gatewayDNSRefs[subject.FromSandboxUID(staleUID)]
+	succ, hasSucc := srv.gatewayDNSRefs[subject.FromSandboxUID(takeUID)]
+	srv.gwMu.Unlock()
+	assert.False(t, hasStale)
+	assert.True(t, hasSucc)
+	assert.Equal(t, netip.MustParseAddr(testGW), succ)
+	require.Equal(t, []iptables.MitmRedirectEntry{{SandboxIP: netip.MustParseAddr(testIP), Gateway: netip.MustParseAddr(testGW)}}, inst.snapshot())
+}
+
+// ---------------------------------------------------------------------------
 // Envelope validation
 // ---------------------------------------------------------------------------
 
