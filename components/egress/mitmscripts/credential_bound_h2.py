@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import h2.config
-import h2.connection
 import h2.errors
 import h2.events
 import h2.exceptions

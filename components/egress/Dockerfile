@@ -123,11 +123,12 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
 
 # Python mitmproxy (transparent mode): mitmdump runs as user mitmproxy; iptables skips this uid.
 # /var/lib/mitmproxy is mitm's home, used as the confdir (CA + config.yaml live under .mitmproxy/).
+COPY components/egress/requirements-mitmproxy.txt /tmp/requirements-mitmproxy.txt
 RUN useradd -r -u 10042 -d /var/lib/mitmproxy -s /usr/sbin/nologin mitmproxy \
     && mkdir -p /var/lib/mitmproxy/.mitmproxy \
     && chown -R mitmproxy:mitmproxy /var/lib/mitmproxy \
     && pip3 install --no-cache-dir --break-system-packages \
-        'mitmproxy==11.0.2' 'h2==4.1.0' 'hyperframe==6.0.1' \
+        -r /tmp/requirements-mitmproxy.txt \
     && (command -v mitmdump && mitmdump --version) \
     && mkdir -p /var/egress/mitmscripts
 
@@ -157,10 +158,12 @@ COPY components/egress/mitmscripts /var/egress/mitmscripts
 # The mitmdump addon is loaded by the mitmproxy user (uid 10042): normalize
 # permissions so a restrictive build umask (e.g. 027) can never leave the
 # scripts unreadable to it. Check the installed libraries against the same
-# exact-version gate used by the H2 adapter, before producing the image.
+# interpreter and exact-version gate used by the H2 adapter before producing
+# the image.
 RUN chmod -R a+rX /var/egress/mitmscripts \
     && PYTHONPATH=/var/egress/mitmscripts python3 -c \
-        'from credential_bound_h2 import dependency_versions_supported; raise SystemExit(0 if dependency_versions_supported() else "unsupported H2 dependency versions")'
+        'import sys; from credential_bound_h2 import PINS, dependency_versions_supported; \
+         raise SystemExit(0 if dependency_versions_supported() else f"unsupported H2 runtime: interpreter={sys.implementation.name}, sys.version={sys.version!r}; required CPython 3.10/3.11 and packages={PINS}")'
 
 # Supervisor wraps the egress binary: restarts on crash with backoff and
 # forwards SIGTERM gracefully. The cleanup hook runs only as pre-start; the

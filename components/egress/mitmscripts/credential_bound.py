@@ -138,7 +138,6 @@ class _H2Transport:
     owner: Any
     task: asyncio.Task
     token: AdmissionToken
-    opening_io: Any
     connected_io: Any = None
     connect_error_io: Any = None
     close_io: Any = None
@@ -508,7 +507,7 @@ class LiveRuntime:
         item = _H2Transport(
             adapter=adapter, root=adapter.http_layer, handler=handler, client=client,
             connection=conn, owner=owner, task=current.handler,
-            token=adapter.token, opening_io=current,
+            token=adapter.token,
         )
         if not self._h2_ownership_current(item):
             raise ValueError(_H2_OWNERSHIP_ERROR)

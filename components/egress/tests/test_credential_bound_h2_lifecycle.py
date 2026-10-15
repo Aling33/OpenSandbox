@@ -528,7 +528,7 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
 
     def test_current_io_replacement_fires_exactly_once(self):
         f = self.fixture()
-        opening = f.item.opening_io
+        opening = f.handler.transports[f.item.connection]
         self.assertIsNone(opening.writer)
         f.establish()
         current = f.handler.transports[f.item.connection]
@@ -641,7 +641,6 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
     def test_server_hooks_capture_task_without_adapter_close(self):
         f = self.fixture(observe_before_start=False)
         self.assertFalse(f.item.close_consumed)
-        self.assertIsNone(f.item.opening_io.writer)
         self.assertIsNotNone(f.item.connected_io.writer)
         self.assertIs(f.item.task, f.handler.transports[f.item.connection].handler)
         f.close()

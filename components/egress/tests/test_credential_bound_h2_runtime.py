@@ -607,7 +607,7 @@ class RuntimeHarness:
         wait_for(lambda: (state := self.state()) and
                         state.get("registry_connections") == 0 and state.get("registry_requests") == 0 and
                         state.get("runtime_connections") == 0 and state.get("adapters") == 0 and
-                        state.get("upstream_tasks") == 0 and state.get("cleanup_blocked") == 0,
+                        state.get("upstream_tasks") == 0,
                         timeout=10, message="production registry/adapter/upstream cleanup did not converge")
         self.expect_origin_closed()
 

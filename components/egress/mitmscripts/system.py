@@ -1521,7 +1521,7 @@ def _requestheaders_live_h2(live: Any, flow: http.HTTPFlow) -> None:
         adapter is None or token is None or adapter.token is not token
         or getattr(ctx.options, "ssl_insecure", False)
         or getattr(getattr(flow, "server_conn", None), "via", None) is not None
-        or (adapter is not None and getattr(adapter.http_layer.context.server, "via", None) is not None)
+        or getattr(adapter.http_layer.context.server, "via", None) is not None
     ):
         _abort_live_h2(live, flow, adapter)
         return

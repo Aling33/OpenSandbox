@@ -88,8 +88,7 @@ def snapshot():
             "registry_requests": live.registry.request_count,
             "runtime_connections": len(live._connections),
             "adapters": len(live._h2),
-            "upstream_tasks": len(live._h2_transports),
-            "cleanup_blocked": len(live._h2_cleanup_blocked)}
+            "upstream_tasks": len(live._h2_transports)}
 
 
 async def observe():
