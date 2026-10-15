@@ -130,4 +130,15 @@ func TestStatusResponseJSON(t *testing.T) {
 	assert.Contains(t, string(raw), `"apiVersion":"sandbox.fast.io/actions/v1"`)
 	assert.Contains(t, string(raw), `"ready":true`)
 	assert.Contains(t, string(raw), `"instanceId":"egress-1-2a3b"`)
+	// Additive pinned-CA fields are omitted when unset (MITM disabled).
+	assert.NotContains(t, string(raw), "mitmCa")
+
+	raw, err = json.Marshal(StatusResponse{
+		APIVersion: APIVersion, Ready: false, InstanceID: "egress-1-2a3b",
+		MitmCaFingerprint: "abc123", MitmCaDown: true, MitmCaError: "pinned CA unavailable",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"mitmCaFingerprint":"abc123"`)
+	assert.Contains(t, string(raw), `"mitmCaDown":true`)
+	assert.Contains(t, string(raw), `"mitmCaError":"pinned CA unavailable"`)
 }

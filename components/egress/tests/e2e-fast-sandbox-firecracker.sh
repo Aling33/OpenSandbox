@@ -36,9 +36,11 @@
 #                 mitm CA into the system trust store, then curls
 #                 https://ext.test through the egress MITM (real TLS check).
 #
-# The CA delivery is real: fastlet loop-mounts the VM rootfs and writes the
-# CA exported by egress (the /opt/opensandbox/mitm-ca shared-volume contract,
-# fast-sandbox issue #19) before the VM boots.
+# The CA is the pinned trust anchor (OSEP-0022): the script provisions the
+# pool-pinned keypair (`tls.crt`/`tls.key` seed mount), egress seeds it into
+# its confdir and never generates a CA of its own, and the same certificate
+# is baked into the VM rootfs trust store at template-build time (the
+# template-baking analog). No CA is delivered at sandbox-create time.
 #
 # Requires: root, KVM (/dev/kvm), docker, nft, iproute2, unsquashfs
 # (squashfs-tools). Run on a bare-metal Linux host with network access to
@@ -70,7 +72,7 @@ EXT_CIDR="10.99.0.0/24"
 EXT_CT_NETNS="osb-fc-ext"
 
 RULES_DIR="${WORK_DIR}/rules"
-CA_ROOT="${WORK_DIR}/opensandbox"       # mounted at /opt/opensandbox
+SEED_DIR="${WORK_DIR}/mitm-ca-seed"     # pinned-CA seed mount (tls.crt/tls.key)
 VM_ROOTFS="${WORK_DIR}/vm-rootfs.ext4"  # firecracker rootfs image
 VM_ROOTFS_MNT="${WORK_DIR}/vm-rootfs-mnt"
 VM_SERIAL="${WORK_DIR}/fc-process.log"
@@ -104,7 +106,7 @@ pod_ns() { nsenter --net="/proc/${FASTLET_PID}/ns/net" "$@"; }
 
 require() {
   [ "$(id -u)" = "0" ] || fail "requires root (loop mounts, netns, nft)"
-  for c in docker nft ip nsenter curl wget python3 mkfs.ext4; do
+  for c in docker nft ip nsenter curl wget python3 mkfs.ext4 openssl; do
     command -v "${c}" >/dev/null || fail "missing required command: ${c}"
   done
   [ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "/dev/kvm not accessible (KVM required)"
@@ -165,7 +167,20 @@ require
 
 ARCH="$(uname -m)"
 [ "${ARCH}" = "x86_64" ] || [ "${ARCH}" = "aarch64" ] || fail "unsupported arch: ${ARCH}"
-mkdir -p "${ASSET_DIR}" "${WORK_DIR}" "${RULES_DIR}" "${CA_ROOT}/mitm-ca"
+mkdir -p "${ASSET_DIR}" "${WORK_DIR}" "${RULES_DIR}" "${SEED_DIR}"
+
+# ---------------------------------------------------------------------------
+info "Provisioning the pool-pinned MITM CA (seed mount, OSEP-0022)"
+# Exactly the platform Secret layout: one `tls.crt` + `tls.key` keypair on a
+# read-only seed mount, consumed via OPENSANDBOX_EGRESS_MITM_CA_SEED_DIR.
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  -keyout "${SEED_DIR}/tls.key" -out "${SEED_DIR}/tls.crt" \
+  -subj "/CN=e2e-pinned-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,digitalSignature" >/dev/null 2>&1
+SEED_FP="$(openssl x509 -in "${SEED_DIR}/tls.crt" -noout -fingerprint -sha256 | sed 's/^.*=//' | tr -d ':' | tr 'A-Z' 'a-z')"
+[ -n "${SEED_FP}" ] || fail "could not fingerprint the pinned CA"
+pass "pinned CA provisioned (fingerprint ${SEED_FP:0:12}...)"
 
 # ---------------------------------------------------------------------------
 info "Preparing assets (firecracker + kernel + rootfs)"
@@ -203,8 +218,10 @@ info "assets: firecracker ${FC_VERSION}, kernel $(basename "${KERNEL_PATH}"), ro
 info "Building the VM rootfs (ubuntu CI image + CA bootstrap)"
 # bump ROOTFS_TEMPLATE_VERSION whenever the bootstrap script changes: the
 # template is cached on disk and the parameterized bootstrap must reach
-# every VM (a stale template silently curls the wrong target).
-ROOTFS_TEMPLATE_VERSION=6
+# every VM (a stale template silently curls the wrong target). The pinned-CA
+# fingerprint is part of the cache key: a new pinned CA must rebuild the
+# template, or the guest would trust a CA egress no longer signs with.
+ROOTFS_TEMPLATE_VERSION="7-${SEED_FP:0:12}"
 if [ ! -f "${VM_ROOTFS}" ] \
    || [ "$(cat "${ASSET_DIR}/rootfs-template.version" 2>/dev/null || true)" != "${ROOTFS_TEMPLATE_VERSION}" ]; then
   UNSQUASH_DIR="${WORK_DIR}/unsquash"
@@ -250,9 +267,8 @@ ip route add default via "${GW_IP}" 2>/dev/null || true
 echo "nameserver 10.30.0.1" > /etc/resolv.conf
 console "network up"
 console "installing CA into system trust"
-mkdir -p /usr/local/share/ca-certificates
-cp /opt/opensandbox/mitm-ca/mitmproxy-ca-cert.pem \
-   /usr/local/share/ca-certificates/opensandbox-mitm.crt
+# The pinned CA certificate is baked into the rootfs at template-build time
+# (the template-builder analog); bootstrapping only refreshes the trust store.
 update-ca-certificates > /dev/console 2>&1
 console "CA installed"
 console "curl https://${TARGET}/"
@@ -270,8 +286,12 @@ cat /opt/result-deny.txt > /dev/console
 while true; do sleep 3600; done
 BOOT
   chmod +x "${UNSQUASH_DIR}/${VM_BOOTSTRAP}"
-  # the CA slot where fastlet delivers the cert (empty until delivery)
-  mkdir -p "${UNSQUASH_DIR}/opt/opensandbox/mitm-ca"
+  # Bake the pinned CA certificate into the guest trust-store source dir at
+  # template-build time (OSEP-0022: no per-sandbox CA delivery; the guest
+  # trusts the pinned CA from the first boot).
+  mkdir -p "${UNSQUASH_DIR}/usr/local/share/ca-certificates"
+  cp -f "${SEED_DIR}/tls.crt" \
+    "${UNSQUASH_DIR}/usr/local/share/ca-certificates/opensandbox-mitm.crt"
 
   truncate -s 1G "${VM_ROOTFS}"
   mkfs.ext4 -q -F -d "${UNSQUASH_DIR}" "${VM_ROOTFS}"
@@ -296,7 +316,6 @@ FASTLET_CT_ID="$(docker run -d --name "${FASTLET_CT}" \
   --device /dev/kvm \
   -v /var/run/netns:/var/run/netns:rslave \
   -v "${RULES_DIR}:/var/egress/rules" \
-  -v "${CA_ROOT}:/opt/opensandbox" \
   -v "${WORK_DIR}:${WORK_DIR}" \
   -v "${SCRIPT_DIR}:${SCRIPT_DIR}" \
   ubuntu:24.04 sleep infinity)"
@@ -374,14 +393,15 @@ printf '%s\n' '10.99.0.9' > "${RULES_DIR}/deny.always"
 EGRESS_CT_ID="$(docker run -d --name "${EGRESS_CT}" \
   --network "container:${FASTLET_CT}" --privileged \
   -v "${RULES_DIR}:/var/egress/rules" \
-  -v "${CA_ROOT}:/opt/opensandbox" \
   -v "${MITM_HOME}:/var/lib/mitmproxy" \
+  -v "${SEED_DIR}:/var/egress/mitm-ca-seed:ro" \
   -e OPENSANDBOX_EGRESS_PROFILE=fast-sandbox \
   -e OPENSANDBOX_EGRESS_DNS_UPSTREAM="${BRIDGE_GW}:${DNS_UPSTREAM_PORT}" \
   -e OPENSANDBOX_EGRESS_DNS_UPSTREAM_PROBE=allow.test \
   -e OPENSANDBOX_EGRESS_HTTP_ADDR="127.0.0.1:${POLICY_PORT}" \
   -e OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true \
   -e OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE=true \
+  -e OPENSANDBOX_EGRESS_MITM_CA_SEED_DIR=/var/egress/mitm-ca-seed \
   "${EGRESS_IMAGE}")"
 
 # wait_for_egress: healthz with a container-log dump on failure (the egress
@@ -406,6 +426,12 @@ wait_for_egress() {
   fail "egress did not become ready (healthz)"
 }
 wait_for_egress
+# The addon must be up on the PINNED CA: /healthz mirrors its fingerprint
+# (OSEP-0022 observability); a mismatch here is a template↔pool mispairing.
+egress_fp="$(pod_exec curl -s "http://127.0.0.1:${POLICY_PORT}/healthz" | sed -n 's/.*"mitmCaFingerprint":"\([0-9a-f]*\)".*/\1/p')"
+[ "${egress_fp}" = "${SEED_FP}" ] || fail "egress fingerprint '${egress_fp}' must equal the pinned CA '${SEED_FP}'"
+T0_CA_READY="$(ts)"
+pass "egress up on the pinned CA (fingerprint ${egress_fp:0:12}...)"
 
 # ---------------------------------------------------------------------------
 # Two sandbox VMs with DIFFERENT policies — the deployment's real terminal
@@ -477,17 +503,6 @@ EOF
   pod_exec curl -sSf -XPOST "http://127.0.0.1:${POLICY_PORT}/_fastlet/v1/actions" -d "${body}" >/dev/null
 }
 
-# deliver_ca <rootfs> <mnt> : fastlet loop-mount write of the egress CA
-deliver_ca() {
-  local rootfs="$1" mnt="$2"
-  mkdir -p "${mnt}"
-  mount -o loop "${rootfs}" "${mnt}"
-  mkdir -p "${mnt}/opt/opensandbox/mitm-ca"
-  cp -f "${CA_ROOT}/mitm-ca/mitmproxy-ca-cert.pem" \
-    "${mnt}/opt/opensandbox/mitm-ca/mitmproxy-ca-cert.pem"
-  umount "${mnt}"
-}
-
 # boot_vm <uid> <netns> <rootfs> <tap> <target> <api-sock> <serial> -> sets
 # FC_PID, T3_INSTANCE_START
 boot_vm() {
@@ -541,8 +556,6 @@ info "Binding the sandbox subjects (SET_BINDING -> deny-first)"
 T_SLOT_WRITE="$(ts)"
 bind_subject vm1 "${VM_IP1}" veth-fc1 10.30.0.1 '{"defaultAction":"deny","egress":[{"action":"allow","target":"'"${VM_TARGET1}"'"},{"action":"allow","target":"10.99.0.2"}]}'
 bind_subject vm2 "${VM_IP2}" veth-fc2 10.30.0.2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"'"${VM_TARGET2}"'"},{"action":"allow","target":"10.99.0.2"}]}'
-wait_for 30 "CA exported by egress" test -s "${CA_ROOT}/mitm-ca/mitmproxy-ca-cert.pem"
-T0_CA_EXPORT="$(ts)"
 for ip in "${VM_IP1}" "${VM_IP2}"; do
   local_elapsed=0
   while [ "${local_elapsed}" -lt 30 ]; do
@@ -559,7 +572,7 @@ for ip in "${VM_IP1}" "${VM_IP2}"; do
   }
 done
 T_DNAT_READY="$(ts)"
-pass "egress up; CA exported at ${T0_CA_EXPORT}; both subjects registered deny-first (DNAT ready at ${T_DNAT_READY})"
+pass "egress up on the pinned CA; both subjects registered deny-first (DNAT ready at ${T_DNAT_READY})"
 
 # ---------------------------------------------------------------------------
 info "Activating policies (data-plane-ready)"
@@ -568,14 +581,10 @@ activate_subject vm2
 pass "policies active (vm1=${VM_TARGET1}, vm2=${VM_TARGET2})"
 
 # ---------------------------------------------------------------------------
-info "Preparing the VM rootfs images (template copy + CA delivery per VM)"
+info "Preparing the VM rootfs images (template copies; pinned CA baked at build time)"
 cp -f "${VM_ROOTFS}" "${VM_ROOTFS1}"
 cp -f "${VM_ROOTFS}" "${VM_ROOTFS2}"
-T1_DELIVERY_START="$(ts)"
-deliver_ca "${VM_ROOTFS1}" "${VM_ROOTFS_MNT1}"
-deliver_ca "${VM_ROOTFS2}" "${VM_ROOTFS_MNT2}"
-T2_DELIVERY_DONE="$(ts)"
-pass "CA delivered into both VM rootfs images (+$(awk "BEGIN{printf \"%.1f\", ${T2_DELIVERY_DONE}-${T1_DELIVERY_START}}")s)"
+pass "VM rootfs images prepared (pinned CA baked in the template, no per-VM delivery)"
 
 # ---------------------------------------------------------------------------
 info "Booting both firecracker microVMs (in their netns)"
@@ -668,15 +677,14 @@ pass "deny-path enforced at the Pod INPUT chain in both real VMs"
 
 echo
 echo "=== phase timing (vm1; all wall-clock on the host unless noted) ==="
-echo "  egress start -> CA export:       $(awk "BEGIN{printf \"%.3f\", ${T0_CA_EXPORT}-${T_EGRESS_START}}")s"
+echo "  egress start -> pinned CA ready: $(awk "BEGIN{printf \"%.3f\", ${T0_CA_READY}-${T_EGRESS_START}}")s"
 echo "  SET_BINDING -> subjects DNAT:   $(awk "BEGIN{printf \"%.3f\", ${T_DNAT_READY}-${T_SLOT_WRITE}}")s"
-echo "  CA export -> delivery done:      $(awk "BEGIN{printf \"%.3f\", ${T2_DELIVERY_DONE}-${T0_CA_EXPORT}}")s"
 echo "  vm1 InstanceStart -> bootstrap:  $(awk "BEGIN{printf \"%.3f\", ${T4_BOOTSTRAP}-${T3_VM1}}")s   (kernel boot)"
 echo "  vm1 bootstrap -> CA installed:   $(awk "BEGIN{printf \"%.3f\", ${T5_CA_HOST}-${T4_BOOTSTRAP}}")s   (net cfg + CA install)"
 echo "  vm1 CA installed -> curl result: $(awk "BEGIN{printf \"%.3f\", ${T6_CURL_DONE}-${T5_CA_HOST}}")s   (TLS round trip)"
 echo "  vm1 InstanceStart -> curl:       $(awk "BEGIN{printf \"%.3f\", ${T6_CURL_DONE}-${T3_VM1}}")s   (VM total)"
 echo "  vm2 InstanceStart -> curl:       $(awk "BEGIN{printf \"%.3f\", ${T6_VM2_DONE}-${T3_VM2}}")s   (VM total, parallel)"
-echo "  end-to-end (CA export -> vm1 curl): $(awk "BEGIN{printf \"%.3f\", ${T6_CURL_DONE}-${T0_CA_EXPORT}}")s"
+echo "  end-to-end (pinned CA ready -> vm1 curl): $(awk "BEGIN{printf \"%.3f\", ${T6_CURL_DONE}-${T0_CA_READY}}")s"
 if [ -n "${T4_KERNEL_TS}" ] && [ -n "${T5_CA_TS}" ] && [ -n "${T6_CA_CURL_TS}" ]; then
   echo "--- guest-clock deltas (CA cost inside the VM) ---"
   echo "  kernel start -> CA install:     $(awk "BEGIN{printf \"%.3f\", ${T5_CA_TS}-${T4_KERNEL_TS}}")s (guest clock)"

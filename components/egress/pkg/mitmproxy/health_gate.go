@@ -17,6 +17,7 @@ package mitmproxy
 import (
 	"context"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,9 +25,21 @@ import (
 )
 
 // HealthGate: /healthz stays 503 until MarkStackReady when transparent mitm is required (env enabled).
+//
+// The fast-sandbox profile adds the addon-down latch (OSEP-0022 pinned CA):
+// MarkDown records a permanent addon failure (missing or unloadable pinned
+// CA, or the startup consistency check failing) — /healthz keeps returning
+// 503 with an explicit reason while the rest of egress keeps serving policy
+// actions. First failure wins: the down state is a startup latch, only a
+// process restart can clear it. The pinned CA fingerprint rides along so
+// /healthz and the actions status payload can mirror it.
 type HealthGate struct {
 	required bool
 	ready    atomic.Bool
+
+	mu         sync.Mutex
+	downReason string
+	caFp       string
 }
 
 func NewHealthGate() *HealthGate {
@@ -53,6 +66,51 @@ func (g *HealthGate) MitmPending() bool {
 		return false
 	}
 	return g.required && !g.ready.Load()
+}
+
+// MarkDown latches the addon-down state and unsets readiness. The first
+// reason wins (later restart attempts cannot clear it).
+func (g *HealthGate) MarkDown(reason string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	if g.downReason == "" {
+		g.downReason = reason
+	}
+	g.mu.Unlock()
+	g.ready.Store(false)
+}
+
+// DownReason returns the latched addon-down reason and whether the addon is down.
+func (g *HealthGate) DownReason() (string, bool) {
+	if g == nil {
+		return "", false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.downReason, g.downReason != ""
+}
+
+// SetCAFingerprint records the pinned CA fingerprint for the observability
+// surfaces (/healthz, actions status payload). Empty = none provisioned.
+func (g *HealthGate) SetCAFingerprint(fp string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.caFp = fp
+	g.mu.Unlock()
+}
+
+// CAFingerprint returns the pinned CA fingerprint ("" when none).
+func (g *HealthGate) CAFingerprint() string {
+	if g == nil {
+		return ""
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.caFp
 }
 
 // WaitReady polls until the gate is ready, ctx is cancelled, or 30s elapses.
