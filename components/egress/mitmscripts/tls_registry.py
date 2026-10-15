@@ -27,8 +27,9 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from host_selectors import Selector
+from static_passthrough import StaticPassthrough
 from revision_receiver import Receiver, Revision, Snapshot
-from tls_decision import Generation, Reason, TLSSelectorView, classify, compile_view
+from tls_decision import Generation, Reason, TLSSelectorView, _classify, compile_view
 
 RegistryAction = Literal["deny", "passthrough", "decrypt"]
 RegistryReason = Reason | Literal["registry_exhausted", "admission_disabled"]
@@ -155,6 +156,8 @@ class BoundConnectionRegistry:
         self._generation: Generation | None = None
         self._closed = False
         self._publication_owned = False
+        # Installed once by the publication owner before exposing admission.
+        self._static_config: StaticPassthrough | None = None
         # Installation-only IPC owners set this once before exposing the pair.
         self._admission_disabled = False
         self._entries: dict[int, AdmissionToken] = {}
@@ -288,12 +291,13 @@ class BoundConnectionRegistry:
                 return AdmissionResult("deny", "admission_disabled")
             if self._closed:
                 return AdmissionResult("deny", "snapshot_missing")
-            result = classify(
+            result = _classify(
                 identity=identity,
                 sni=sni,
                 ech_hidden=ech_hidden,
                 static_passthrough=static_passthrough,
                 view=self._view,
+                _static_config=self._static_config,
                 destination_port=destination_port,
             )
             if result.action != "needs_registry":

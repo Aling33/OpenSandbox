@@ -235,11 +235,8 @@ def load(_loader: Any) -> None:
     # The live credential-bound mode never runs with insecure upstream
     # verification: check the effective option before the receiver starts.
     # The installation-only receiver keeps the legacy escape hatch.
-    if _live_admission_requested() and any(
-        getattr(ctx.options, name, False)
-        for name in ("ssl_insecure", "ignore_hosts", "allow_hosts")
-    ):
-        _fatal_revision_runtime()
+    if _live_admission_requested():
+        _validate_live_options()
     receiver = server = runtime = None
     try:
         from revision_ipc import Server
@@ -299,8 +296,15 @@ def configure(updated: set) -> None:
         return
     if _live_runtime is None and not _live_admission_requested():
         return
-    if any(getattr(ctx.options, name, False) for name in
-           ("ssl_insecure", "ignore_hosts", "allow_hosts")):
+    _validate_live_options()
+
+
+def _validate_live_options() -> None:
+    if any(getattr(ctx.options, name, False) for name in ("ignore_hosts", "allow_hosts")):
+        from static_passthrough import NATIVE_OPTIONS_ERROR
+
+        raise SystemExit(NATIVE_OPTIONS_ERROR) from None
+    if getattr(ctx.options, "ssl_insecure", False):
         _fatal_revision_runtime()
 
 

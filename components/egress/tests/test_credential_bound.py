@@ -980,6 +980,21 @@ class CredentialBoundEnvTest(unittest.TestCase):
                 with mock.patch.dict(os_environ(), {}, clear=True):
                     system.configure({option})  # Legacy options stay supported.
 
+    def test_native_option_diagnostics_name_migration_without_values(self) -> None:
+        for option in ("ignore_hosts", "allow_hosts"):
+            system = _load_system_module()
+            setattr(system.ctx.options, option, ["private-sensitive.example"])
+            live = {LIVE_ENV["tls_capacity"]: "64", LIVE_ENV["request_capacity"]: "256",
+                    LIVE_ENV["drain_timeout"]: "5"}
+            with mock.patch.dict(os_environ(), self._env(live), clear=True):
+                for action in (lambda: system.load(None), lambda: system.configure({option})):
+                    with self.assertRaises(SystemExit) as raised:
+                        action()
+                    message = str(raised.exception)
+                    self.assertIn("OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS", message)
+                    self.assertNotIn("private-sensitive.example", message)
+                    self.assertIn("must be empty", message)
+
     def test_partial_live_bundle_fails_closed(self) -> None:
         system = _load_system_module()
         partial = {LIVE_ENV["tls_capacity"]: "64"}

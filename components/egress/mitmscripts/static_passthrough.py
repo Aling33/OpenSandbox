@@ -16,12 +16,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from host_selectors import Selector, parse_canonical
 
 ENV = "OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS"
 MAX_BYTES = 65536
 MAX_SELECTORS = 256
 ERROR = "credential proxy: invalid " + ENV
+NATIVE_OPTIONS_ERROR = "credential proxy: live ignore_hosts/allow_hosts must be empty; use " + ENV
 
 
 def validate_selectors(value: object) -> tuple[Selector, ...]:
@@ -46,6 +48,16 @@ def validate_selectors(value: object) -> tuple[Selector, ...]:
     except (AttributeError, TypeError, ValueError):
         raise ValueError(ERROR) from None
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class StaticPassthrough:
+    """One startup-owned, validated tuple; not an untrusted classifier input."""
+
+    selectors: tuple[Selector, ...]
+
+    def __post_init__(self) -> None:
+        validate_selectors(self.selectors)
 
 
 def parse_handoff(raw: str | None) -> tuple[Selector, ...]:

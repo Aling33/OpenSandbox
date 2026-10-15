@@ -493,11 +493,13 @@ class RuntimeHarness:
         environment = self.ipc.env(self.drain_seconds)
         # A caller's unrelated mitmproxy/proxy configuration must not select a
         # different origin, chained proxy, legacy credential pull or TLS keys.
+        # ipc.env() supplies the controlled empty static passthrough handoff.
         environment = {key: value for key, value in environment.items()
                        if key not in ("SSLKEYLOGFILE", "MITMPROXY_SSLKEYLOGFILE")
                        and not key.startswith("H2_PRODUCTION_")
                        and (not key.startswith("OPENSANDBOX_")
-                            or key.startswith("OPENSANDBOX_EGRESS_REVISION_"))}
+                            or key.startswith("OPENSANDBOX_EGRESS_REVISION_")
+                            or key == "OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS")}
         environment.update(H2_PRODUCTION_OBSERVATIONS=str(self.root),
                            H2_PRODUCTION_SCENARIO=self.scenario)
         executable = str(Path(sys.executable).parent / "mitmdump")

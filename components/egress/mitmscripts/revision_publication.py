@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from decision_snapshot import validate
 from host_selectors import Selector
-from static_passthrough import validate_selectors
+from static_passthrough import StaticPassthrough
 from revision_receiver import Receiver, Revision, RevisionError, Snapshot
 from tls_decision import TLSSelectorView, compile_view
 from tls_registry import AdmissionToken, BoundConnectionRegistry, RegistryError
@@ -55,7 +55,8 @@ class RevisionPublisher:
         drain_timeout_seconds: int = 30,
         static_passthrough: tuple[Selector, ...] = (),
     ) -> None:
-        self._static_passthrough = validate_selectors(static_passthrough)
+        static_config = StaticPassthrough(static_passthrough)
+        self._static_passthrough = static_config.selectors
         self._receiver = Receiver(
             control_generation, subject_generation, validate,
             max_snapshot_bytes=max_snapshot_bytes, max_abort_records=max_abort_records,
@@ -64,6 +65,7 @@ class RevisionPublisher:
             capacity=capacity, receiver=self._receiver, request_capacity=request_capacity,
             drain_timeout_seconds=drain_timeout_seconds,
         )
+        self._registry._static_config = static_config
         self._receiver._publication_owned = True
         self._registry._publication_owned = True
         self._pending_view: TLSSelectorView | None = None

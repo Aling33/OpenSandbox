@@ -47,7 +47,7 @@ from typing import Any
 from mitmproxy import ctx
 from host_selectors import Selector
 from revision_publication import LiveReceiver
-from static_passthrough import ENV as PASSTHROUGH_ENV, ERROR as PASSTHROUGH_ERROR, parse_handoff
+from static_passthrough import ENV as PASSTHROUGH_ENV, ERROR as PASSTHROUGH_ERROR, NATIVE_OPTIONS_ERROR, parse_handoff
 from tls_registry import (
     AdmissionResult,
     AdmissionToken,
@@ -884,8 +884,9 @@ def enabled() -> bool:
 
 def validate_live_options() -> None:
     """Native pre-TLS selectors must never bypass live admission."""
-    if any(getattr(ctx.options, name, False) for name in
-           ("ssl_insecure", "ignore_hosts", "allow_hosts")):
+    if any(getattr(ctx.options, name, False) for name in ("ignore_hosts", "allow_hosts")):
+        raise SystemExit(NATIVE_OPTIONS_ERROR)
+    if getattr(ctx.options, "ssl_insecure", False):
         _fatal()
 
 
