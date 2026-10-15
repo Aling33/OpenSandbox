@@ -63,7 +63,7 @@ type fastSandboxPolicyServer struct {
 	// in the registry: DNS dispatch must keep denying (fail closed) while the
 	// policy has not been made effective.
 	pendingPolicies map[subject.Subject]*policy.NetworkPolicy
-	vaults          map[subject.Subject]*credentialvault.Store
+	vaults          map[subject.Subject]vaultEntry
 	// subjAtt records the latest network attachment, used for terminal
 	// cleanup (gateway refcounts) even when the REMOVE_BINDING envelope omits
 	// the attachment block.
@@ -103,7 +103,7 @@ func newFastSandboxPolicyServer(ctx context.Context, reg *subject.MemoryRegistry
 		ctx:                ctx,
 		reg:                reg,
 		nft:                nft,
-		vaults:             make(map[subject.Subject]*credentialvault.Store),
+		vaults:             make(map[subject.Subject]vaultEntry),
 		pendingPolicies:    make(map[subject.Subject]*policy.NetworkPolicy),
 		subjAtt:            make(map[subject.Subject]actionhandler.NetworkAttachment),
 		gatewayDNSRefs:     make(map[subject.Subject]netip.Addr),
@@ -220,6 +220,7 @@ func (s *fastSandboxPolicyServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(constants.ActionsStatusPath, s.handleActionsStatus)
 	mux.HandleFunc(constants.ActionsDispatchPath, s.handleActions)
+	mux.HandleFunc(constants.VaultRelayPathPrefix, s.handleVaultRelay)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		if s.mitmGate != nil && s.mitmGate.MitmPending() {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -282,19 +283,44 @@ func (s *fastSandboxPolicyServer) applyPolicy(subj subject.Subject, pol *policy.
 	return nil
 }
 
+// vaultEntry binds a vault store to the registration fence it was
+// materialized under.
+type vaultEntry struct {
+	store *credentialvault.Store
+	fence subject.Fencing
+}
+
 // vaultFor returns the memory-only per-subject vault, created on first use.
+// A store is only valid under the fence it was created with: a mismatch
+// (same-UID rebind without REMOVE_BINDING, or a TOCTOU store materialized
+// against an unregistered subject) is dropped, never inherited — a reset
+// never carries old credentials into a new sandbox (OSEP-0022). The fence is
+// read under s.mu, serialized with the rebind purge in applySetBinding.
 func (s *fastSandboxPolicyServer) vaultFor(subj subject.Subject) *credentialvault.Store {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if v, ok := s.vaults[subj]; ok {
-		return v
+	fence, _ := s.reg.Fence(subj)
+	return s.vaultForLocked(subj, fence)
+}
+
+// vaultForLocked implements vaultFor; callers hold s.mu.
+func (s *fastSandboxPolicyServer) vaultForLocked(subj subject.Subject, fence subject.Fencing) *credentialvault.Store {
+	if e, ok := s.vaults[subj]; ok {
+		if fence != (subject.Fencing{}) && e.fence == fence {
+			return e.store
+		}
+		delete(s.vaults, subj)
 	}
-	// Fast Sandbox profile: no token/mitm gating; the loopback listener is
-	// sandbox-unreachable. The vault holds complete revisions memory-only
-	// until the OSEP-0022 relay surface adds egress-local persistence.
 	v := credentialvault.NewStore(nil, func() bool { return true })
-	s.vaults[subj] = v
+	s.vaults[subj] = vaultEntry{store: v, fence: fence}
 	return v
+}
+
+// dropVault purges the subject's vault slice (rebind cleanup).
+func (s *fastSandboxPolicyServer) dropVault(subj subject.Subject) {
+	s.mu.Lock()
+	delete(s.vaults, subj)
+	s.mu.Unlock()
 }
 
 // OnRegistered implements subject.LifecycleHooks: deny-first enforcement

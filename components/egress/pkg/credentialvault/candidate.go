@@ -57,7 +57,7 @@ func (v *Store) PrepareCreate(req CreateRequest, pol *policy.NetworkPolicy) (*Mu
 	if v.exists {
 		return nil, ErrExists
 	}
-	credentials, bindings, err := v.buildCreate(req, pol)
+	credentials, bindings, err := v.buildCreate(req, pol, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -207,11 +207,12 @@ func (c *MutationCandidate) closeLocked() {
 func (v *Store) buildCreate(
 	req CreateRequest,
 	pol *policy.NetworkPolicy,
+	revision int64,
 ) (map[string]record, map[string]Binding, error) {
 	credentials := make(map[string]record, len(req.Credentials))
 	bindings := make(map[string]Binding, len(req.Bindings))
 	for _, credential := range req.Credentials {
-		record, err := v.normalizeCredential(credential, 1)
+		record, err := v.normalizeCredential(credential, revision)
 		if err != nil {
 			return nil, nil, err
 		}

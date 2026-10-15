@@ -150,6 +150,14 @@ func (s *fastSandboxPolicyServer) applySetBinding(env *actionhandler.Envelope) (
 			return http.StatusBadRequest, fmt.Errorf("invalid binding input policy: %v", err)
 		}
 	}
+	// A fence change is a rebind: discard ALL prior per-subject state. The
+	// registry drops its entry inside RegisterAndEnforce; the vault slice
+	// must go too, or the old instance's credentials would survive into the
+	// successor's flows. Same-UID actions serialize per subject.
+	if old, ok := s.reg.Fence(subj); ok && !old.Matches(fence) {
+		s.dropVault(subj)
+		log.Infof("subject %s: rebind (%s -> %s), vault slice purged", subj, old.RuntimeInstanceID, fence.RuntimeInstanceID)
+	}
 	state, err := s.reg.RegisterAndEnforce(subj, subject.SubjectKey{SourceIP: att.IP}, fence, func() error {
 		return s.OnRegistered(subj, att)
 	})
