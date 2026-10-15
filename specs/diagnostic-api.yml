@@ -13,11 +13,11 @@ info:
     observability schema for OpenSandbox. Structured telemetry, long-term
     retention, filtering, pagination, and streaming may be provided separately.
 
-    Successful responses return a JSON descriptor whose diagnostic payload is
-    either embedded inline or made available through a download URL. The diagnostic
-    payload itself is display-oriented `text/plain` content. Clients should not
-    parse individual payload lines as a stable schema. Servers may impose
-    implementation-defined retention and response size limits.
+    Successful log and event responses return a JSON descriptor whose diagnostic
+    payload is either embedded inline or made available through a download URL.
+    The diagnostic payload itself is display-oriented `text/plain` content. Clients
+    should not parse individual payload lines as a stable schema. Servers may
+    impose implementation-defined retention and response size limits.
 
     ## Authentication
 
