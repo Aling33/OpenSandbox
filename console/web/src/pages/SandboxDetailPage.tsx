@@ -41,29 +41,27 @@ export function SandboxDetailPage() {
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [endpointLoading, setEndpointLoading] = useState(false);
 
-  const api = useMemo(
-    () =>
-      isAdminProxy && id
-        ? {
-            get: () => adminApi.getSandbox(id, adminTenant),
-            remove: () => adminApi.removeSandbox(id, adminTenant),
-            renew: (expiresAt: string) => adminApi.renewSandbox(id, adminTenant, expiresAt),
-            pause: () => adminApi.pauseSandbox(id, adminTenant),
-            resume: () => adminApi.resumeSandbox(id, adminTenant),
-            endpoint: (port: number) => adminApi.sandboxEndpoint(id, adminTenant, port),
-          }
-        : id
-          ? {
-              get: () => sandboxApi.get(id),
-              remove: () => sandboxApi.remove(id),
-              renew: (expiresAt: string) => sandboxApi.renewExpiration(id, expiresAt),
-              pause: () => sandboxApi.pause(id),
-              resume: () => sandboxApi.resume(id),
-              endpoint: (port: number) => sandboxApi.endpoint(id, port),
-            }
-          : null,
-    [adminTenant, id, isAdminProxy],
-  );
+  const api = useMemo(() => {
+    if (!id) return null;
+    if (isAdminProxy) {
+      return {
+        get: () => adminApi.getSandbox(id, adminTenant),
+        remove: () => adminApi.removeSandbox(id, adminTenant),
+        renew: (expiresAt: string) => adminApi.renewSandbox(id, adminTenant, expiresAt),
+        pause: () => adminApi.pauseSandbox(id, adminTenant),
+        resume: () => adminApi.resumeSandbox(id, adminTenant),
+        endpoint: (port: number) => adminApi.sandboxEndpoint(id, adminTenant, port),
+      };
+    }
+    return {
+      get: () => sandboxApi.get(id),
+      remove: () => sandboxApi.remove(id),
+      renew: (expiresAt: string) => sandboxApi.renewExpiration(id, expiresAt),
+      pause: () => sandboxApi.pause(id),
+      resume: () => sandboxApi.resume(id),
+      endpoint: (port: number) => sandboxApi.endpoint(id, port),
+    };
+  }, [adminTenant, id, isAdminProxy]);
 
   const load = useCallback(async () => {
     if (!api) return;

@@ -80,11 +80,20 @@ export function sandboxStateTagColor(state?: string | null): string | undefined 
 /** 日志 level（含 zap 的 warn / Python 单字母 I）→ ANSI 前景色转义。 */
 export function logLevelAnsi(level: string): string {
   const u = level.toUpperCase();
-  if (u === 'ERROR' || u === 'ERR' || u === 'FATAL' || u === 'PANIC' || u === 'CRITICAL' || u === 'E') {
+  if (
+    u === 'ERROR' ||
+    u === 'ERR' ||
+    u === 'FATAL' ||
+    u === 'PANIC' ||
+    u === 'CRITICAL' ||
+    u === 'E' ||
+    u === 'C' ||
+    u === 'F'
+  ) {
     return LOG_ANSI.red;
   }
   if (u === 'WARN' || u === 'WARNING' || u === 'W') return LOG_ANSI.yellow;
-  if (u === 'DEBUG' || u === 'TRACE' || u === 'D') return LOG_ANSI.blue;
+  if (u === 'DEBUG' || u === 'TRACE' || u === 'D' || u === 'T') return LOG_ANSI.blue;
   if (u === 'INFO' || u === 'I') return LOG_ANSI.green;
   return LOG_ANSI.reset;
 }

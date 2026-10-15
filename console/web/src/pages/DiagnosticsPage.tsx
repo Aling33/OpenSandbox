@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import { Alert, Input, Select, Space, Tabs, Typography, message } from 'antd';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
 import { ApiError, adminApi, sandboxApi } from '../api/client';
@@ -30,6 +30,13 @@ export function DiagnosticsPage() {
   const [scope, setScope] = useState('runtime');
   const [events, setEvents] = useState<DiagnosticContentResponse | null>(null);
   const [loadingEvents, setLoadingEvents] = useState(false);
+  const requestSeq = useRef(0);
+
+  useEffect(() => {
+    requestSeq.current += 1;
+    setEvents(null);
+    setLoadingEvents(false);
+  }, [sandboxId, tenant, scope]);
 
   useEffect(() => {
     const id = searchParams.get('sandboxId');
@@ -66,14 +73,22 @@ export function DiagnosticsPage() {
       message.warning('请输入 Sandbox ID');
       return;
     }
+    if (user?.role === 'admin' && !tenant.trim()) {
+      message.warning('Admin 查看事件需指定 tenant');
+      setEvents(null);
+      return;
+    }
+    const seq = ++requestSeq.current;
     setLoadingEvents(true);
     try {
       const data =
-        user?.role === 'admin' && tenant.trim()
+        user?.role === 'admin'
           ? await adminApi.diagnosticEvents(sandboxId.trim(), tenant.trim(), scope)
           : await sandboxApi.diagnosticEvents(sandboxId.trim(), scope);
+      if (seq !== requestSeq.current) return;
       setEvents(data);
     } catch (e) {
+      if (seq !== requestSeq.current) return;
       if (e instanceof ApiError && e.status === 404) {
         message.info('诊断 API 未返回数据');
       } else {
@@ -81,7 +96,7 @@ export function DiagnosticsPage() {
       }
       setEvents(null);
     } finally {
-      setLoadingEvents(false);
+      if (seq === requestSeq.current) setLoadingEvents(false);
     }
   };
 

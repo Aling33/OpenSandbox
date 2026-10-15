@@ -14,7 +14,7 @@
 
 import { Button, Form, Input, Modal, Space, Table, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { SandboxStateTag } from '../components/SemanticTags';
 import { ApiError, adminApi, sandboxApi, snapshotApi } from '../api/client';
@@ -22,58 +22,70 @@ import type { Snapshot } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
 import { formatDateTime } from '../utils/format';
 
+function snapshotUnavailable(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 403 || error.status === 404 || error.status === 501);
+}
+
 export function SnapshotsPage() {
   const { user } = useAuth();
   const [loading, setLoading] = useState(false);
   const [items, setItems] = useState<Snapshot[]>([]);
   const [unavailable, setUnavailable] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [tenantInput, setTenantInput] = useState('');
   const [adminTenant, setAdminTenant] = useState<string>();
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+  const [total, setTotal] = useState(0);
+  const requestSeq = useRef(0);
+  const appliedTenant = useRef<string | undefined>(undefined);
 
-  const load = async () => {
-    if (user?.role === 'admin') {
-      if (!adminTenant) {
-        setItems([]);
-        return;
-      }
-      setLoading(true);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const next = tenantInput.trim() || undefined;
+      if (appliedTenant.current === next) return;
+      appliedTenant.current = next;
+      setAdminTenant(next);
+      setPage(1);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [tenantInput]);
+
+  const load = useCallback(async () => {
+    if (user?.role === 'admin' && !adminTenant) {
+      setItems([]);
+      setTotal(0);
       setUnavailable(false);
-      try {
-        const data = await adminApi.listSnapshots(adminTenant);
-        setItems(data.items ?? []);
-      } catch (e) {
-        if (e instanceof ApiError && (e.status === 403 || e.status === 501)) {
-          setUnavailable(true);
-          setItems([]);
-        } else {
-          message.error(e instanceof Error ? e.message : '加载失败');
-        }
-      } finally {
-        setLoading(false);
-      }
       return;
     }
-
+    const seq = ++requestSeq.current;
     setLoading(true);
     setUnavailable(false);
     try {
-      const data = await snapshotApi.list();
+      const data =
+        user?.role === 'admin' && adminTenant
+          ? await adminApi.listSnapshots(adminTenant, { page, pageSize })
+          : await snapshotApi.list({ page: String(page), pageSize: String(pageSize) });
+      if (seq !== requestSeq.current) return;
       setItems(data.items ?? []);
+      setTotal(data.pagination?.totalItems ?? data.items?.length ?? 0);
     } catch (e) {
-      if (e instanceof ApiError && (e.status === 403 || e.status === 501)) {
+      if (seq !== requestSeq.current) return;
+      if (snapshotUnavailable(e)) {
         setUnavailable(true);
         setItems([]);
+        setTotal(0);
       } else {
         message.error(e instanceof Error ? e.message : '加载失败');
       }
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
-  };
+  }, [adminTenant, page, pageSize, user?.role]);
 
   useEffect(() => {
     void load();
-  }, [user?.role, adminTenant]);
+  }, [load]);
 
   const onDelete = (id: string) => {
     Modal.confirm({
@@ -148,8 +160,14 @@ export function SnapshotsPage() {
             <Input
               placeholder="tenant 名称"
               style={{ width: 160 }}
-              value={adminTenant}
-              onChange={(e) => setAdminTenant(e.target.value || undefined)}
+              value={tenantInput}
+              onChange={(e) => setTenantInput(e.target.value)}
+              onPressEnter={() => {
+                const next = tenantInput.trim() || undefined;
+                appliedTenant.current = next;
+                setAdminTenant(next);
+                setPage(1);
+              }}
             />
           )}
           {(user?.role === 'tenant' || (user?.role === 'admin' && adminTenant)) && (
@@ -170,7 +188,22 @@ export function SnapshotsPage() {
         </Typography.Paragraph>
       )}
 
-      <Table rowKey="id" loading={loading} columns={columns} dataSource={items} pagination={false} />
+      <Table
+        rowKey="id"
+        loading={loading}
+        columns={columns}
+        dataSource={items}
+        pagination={{
+          current: page,
+          pageSize,
+          total,
+          showSizeChanger: true,
+          onChange: (nextPage, nextSize) => {
+            setPage(nextPage);
+            setPageSize(nextSize);
+          },
+        }}
+      />
 
       <Modal title="从沙箱创建快照" open={createOpen} onCancel={() => setCreateOpen(false)} footer={null}>
         <Form layout="vertical" onFinish={onCreate}>

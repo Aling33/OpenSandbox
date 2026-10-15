@@ -24,7 +24,7 @@ const LEVEL_SOURCE = String.raw`\b(ERROR|ERR|WARN|WARNING|INFO|DEBUG|TRACE|FATAL
 
 /** Python / Jupyter：`[I 2026-09-29 07:21:50,001 ServerApp]` */
 const PYTHON_LOG_RECORD =
-  String.raw`\[([IWEDCTF])\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[,\.]\d+)([A-Za-z][\w.]*)\]`;
+  String.raw`\[([IWEDCTF])\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}[,\.]\d+)\s+([A-Za-z][\w.]*)\]`;
 
 const UNIX_PATH_SOURCE = String.raw`(?:^|[\s"'(])(\/(?:[\w.@~-]+|\/)+[\w.@~-]*)`;
 

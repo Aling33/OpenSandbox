@@ -22,8 +22,8 @@ import './SandboxColoredLogViewer.css';
 type Props = {
   content: string;
   maxHeight?: number;
-  /** 刷新后强制 remount，避免 LazyLog 缓存旧文本 */
-  contentKey?: string;
+  /** 每次成功拉取后递增，避免用文本长度当 key 时等长内容仍显示旧日志 */
+  contentKey: string;
 };
 
 const LOG_VIEWER_STYLE = {
@@ -39,7 +39,7 @@ export function SandboxColoredLogViewer({ content, maxHeight = 420, contentKey }
   return (
     <div className="sandbox-log-viewer">
       <LazyLog
-        key={contentKey ?? text.length}
+        key={contentKey}
         text={text}
         height={maxHeight}
         width="100%"

@@ -42,31 +42,39 @@ export function SandboxLogPanel({
   const [data, setData] = useState<DiagnosticContentResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(false);
+  const [contentVersion, setContentVersion] = useState(0);
   const timerRef = useRef<number | null>(null);
+  const requestSeq = useRef(0);
 
-  const fetchLogs = useCallback(async () => {
+  const fetchLogs = useCallback(async (notify: boolean) => {
     if (!sandboxId.trim()) return;
     if (user?.role === 'admin' && !tenant) {
-      message.warning('Admin 查看日志需指定 tenant');
+      if (notify) message.warning('Admin 查看日志需指定 tenant');
       return;
     }
+    const seq = ++requestSeq.current;
     setLoading(true);
     try {
       const result =
         user?.role === 'admin' && tenant
           ? await adminApi.diagnosticLogs(sandboxId.trim(), tenant, scope)
           : await sandboxApi.diagnosticLogs(sandboxId.trim(), scope);
+      if (seq !== requestSeq.current) return;
       setData(result);
+      setContentVersion((version) => version + 1);
     } catch (e) {
-      setData(null);
-      message.error(e instanceof Error ? e.message : '加载日志失败');
+      if (seq !== requestSeq.current) return;
+      if (notify) {
+        setData(null);
+        message.error(e instanceof Error ? e.message : '加载日志失败');
+      }
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
   }, [sandboxId, scope, tenant, user?.role]);
 
   useEffect(() => {
-    if (autoLoad && sandboxId) void fetchLogs();
+    if (autoLoad && sandboxId) void fetchLogs(true);
   }, [autoLoad, sandboxId, scope, fetchLogs]);
 
   useEffect(() => {
@@ -75,7 +83,7 @@ export function SandboxLogPanel({
       timerRef.current = null;
       return;
     }
-    timerRef.current = window.setInterval(() => void fetchLogs(), 10_000);
+    timerRef.current = window.setInterval(() => void fetchLogs(false), 10_000);
     return () => {
       if (timerRef.current) window.clearInterval(timerRef.current);
     };
@@ -99,7 +107,7 @@ export function SandboxLogPanel({
       <SandboxColoredLogViewer
         content={data.content ?? ''}
         maxHeight={maxHeight}
-        contentKey={`${scope}-${data.content?.length ?? 0}-${loading ? 'loading' : 'idle'}`}
+        contentKey={`${scope}-${contentVersion}`}
       />
     );
   };
@@ -113,7 +121,7 @@ export function SandboxLogPanel({
           style={{ width: 160 }}
           options={DIAGNOSTIC_SCOPES.map((s) => ({ label: s, value: s }))}
         />
-        <Button type="primary" loading={loading} onClick={() => void fetchLogs()}>
+        <Button type="primary" loading={loading} onClick={() => void fetchLogs(true)}>
           刷新
         </Button>
         <Space>

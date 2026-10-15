@@ -211,10 +211,13 @@ export const adminApi = {
       { method: 'POST', body: JSON.stringify(body ?? {}) },
     );
   },
-  listSnapshots: (tenant: string) =>
-    apiRequest<SnapshotListResponse>(
-      `/api/admin/snapshots?tenant=${encodeURIComponent(tenant)}`,
-    ),
+  listSnapshots: (tenant: string, query?: Record<string, string | number | undefined>) => {
+    const params = new URLSearchParams({ tenant });
+    Object.entries(query ?? {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== '') params.set(key, String(value));
+    });
+    return apiRequest<SnapshotListResponse>(`/api/admin/snapshots?${params}`);
+  },
   deleteSnapshot: (snapshotId: string, tenant: string) =>
     apiRequest<void>(
       `/api/admin/snapshots/${encodeURIComponent(snapshotId)}?tenant=${encodeURIComponent(tenant)}`,
