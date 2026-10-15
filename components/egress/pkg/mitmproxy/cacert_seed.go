@@ -101,8 +101,15 @@ func seedPinnedCA(certPEM, keyPEM []byte, confDir string, uid, gid int) (string,
 	bundle := combineCAPEM(certPEM, keyPEM)
 
 	// Idempotent: a confdir already holding the exact pinned pair is left
-	// untouched, so restarts keep the files (and their inodes) stable.
+	// byte-for-byte untouched, so restarts keep the files (and their inodes)
+	// stable — but ownership is still re-asserted: an image upgrade can change
+	// the mitmdump uid while the confdir persists, and a 0600 private-key
+	// bundle the mitmdump user cannot read would surface downstream as a
+	// misleading consistency failure instead of a permission error.
 	if samePinnedPair(confDir, certPEM, bundle) {
+		if err := chownConfCA(confDir, uid, gid); err != nil {
+			return "", err
+		}
 		return fp, nil
 	}
 
@@ -111,7 +118,7 @@ func seedPinnedCA(certPEM, keyPEM []byte, confDir string, uid, gid int) (string,
 	}
 	// mitmdump runs as an unprivileged user; files written here by root must
 	// be readable by it (the bundle carries the private key, mode 0600, so
-	// ownership is not optional).
+	// ownership is not optional). writeConfCAFile chowns each file it lands.
 	if err := os.Chown(confDir, uid, gid); err != nil {
 		return "", fmt.Errorf("chown confdir %s: %w", confDir, err)
 	}
@@ -139,20 +146,27 @@ func samePinnedPair(confDir string, certPEM, bundle []byte) bool {
 	return bytes.Equal(existingCert, certPEM)
 }
 
-// ConfdirCAFingerprint returns the SHA-256 fingerprint of the certificate in
-// the confdir — the CA mitmdump actually loaded. The fast-sandbox startup
-// consistency check (superseded SyncRootCAFastSandbox export) compares it
-// against the pinned fingerprint.
-func ConfdirCAFingerprint(confDir string) (string, error) {
-	certPEM, err := os.ReadFile(filepath.Join(confDir, mitmCACertName))
-	if err != nil {
-		return "", fmt.Errorf("read confdir CA certificate %s: %w", filepath.Join(confDir, mitmCACertName), err)
+// VerifyConfdirPinnedCA is the startup consistency check: BOTH confdir CA
+// files must present a certificate matching the pinned fingerprint — the
+// bundle mitmdump actually loads (confCAKeyName) and the public certificate
+// copy (mitmCACertName). Checking only the copy would miss a swapped bundle
+// (the copy is never read by mitmdump), silently running the addon on a
+// non-pinned CA.
+func VerifyConfdirPinnedCA(confDir, wantFingerprint string) error {
+	for _, name := range []string{confCAKeyName, mitmCACertName} {
+		pemBytes, err := os.ReadFile(filepath.Join(confDir, name))
+		if err != nil {
+			return fmt.Errorf("read confdir %s: %w", name, err)
+		}
+		got, err := pemCertFingerprint(pemBytes)
+		if err != nil {
+			return fmt.Errorf("confdir %s: %w", name, err)
+		}
+		if got != wantFingerprint {
+			return fmt.Errorf("confdir %s certificate %s does not match pinned CA %s", name, got, wantFingerprint)
+		}
 	}
-	fp, err := pemCertFingerprint(certPEM)
-	if err != nil {
-		return "", fmt.Errorf("confdir CA certificate %s: %w", filepath.Join(confDir, mitmCACertName), err)
-	}
-	return fp, nil
+	return nil
 }
 
 // pemCertFingerprint returns the lowercase hex SHA-256 fingerprint of the
@@ -216,6 +230,21 @@ func combineCAPEM(certPEM, keyPEM []byte) []byte {
 	out = append(out, key...)
 	out = append(out, '\n')
 	return out
+}
+
+// chownConfCA re-asserts ownership of the confdir and both CA files (used on
+// the idempotent fast path, where the files already exist but a changed
+// mitmdump uid across image upgrades may have left them root-owned).
+func chownConfCA(confDir string, uid, gid int) error {
+	if err := os.Chown(confDir, uid, gid); err != nil {
+		return fmt.Errorf("chown confdir %s: %w", confDir, err)
+	}
+	for _, name := range []string{confCAKeyName, mitmCACertName} {
+		if err := os.Chown(filepath.Join(confDir, name), uid, gid); err != nil {
+			return fmt.Errorf("chown %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // writeConfCAFile atomically materializes one confdir file (temp + rename so

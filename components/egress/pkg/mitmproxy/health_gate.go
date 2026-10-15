@@ -59,14 +59,15 @@ func (g *HealthGate) SetReady(v bool) {
 	if g == nil {
 		return
 	}
-	// Addon-down latch: a latched-down addon cannot be resurrected by a
-	// late SetReady(true) (e.g. a future restart/watch path) — that would
-	// surface the contradictory ready:true + mitmCaDown:true state. Only a
+	// Hold the lock across the check AND the store: SetReady(true) races
+	// MarkDown from the watcher goroutine (mitmproxy_transparent.go), and a
+	// check-then-act split could interleave into ready:true over a latched
+	// down state. The addon-down latch makes SetReady(true) a no-op — only a
 	// fresh process (new gate) clears the latch.
-	if v {
-		if _, down := g.DownReason(); down {
-			return
-		}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if v && g.downReason != "" {
+		return
 	}
 	g.ready.Store(v)
 }
@@ -79,16 +80,19 @@ func (g *HealthGate) MitmPending() bool {
 }
 
 // MarkDown latches the addon-down state and unsets readiness. The first
-// reason wins (later restart attempts cannot clear it).
+// reason wins (later restart attempts cannot clear it). The latch write and
+// the readiness store complete under the same lock as SetReady's check, so a
+// concurrent SetReady(true) can never interleave into ready:true over a
+// latched down state.
 func (g *HealthGate) MarkDown(reason string) {
 	if g == nil {
 		return
 	}
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.downReason == "" {
 		g.downReason = reason
 	}
-	g.mu.Unlock()
 	g.ready.Store(false)
 }
 

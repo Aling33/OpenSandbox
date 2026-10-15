@@ -177,8 +177,13 @@ mkdir -p "${ASSET_DIR}" "${WORK_DIR}" "${RULES_DIR}" "${SEED_DIR}"
 info "Provisioning the pool-pinned MITM CA (seed mount, OSEP-0022)"
 # Exactly the platform Secret layout: one `tls.crt` + `tls.key` keypair on a
 # read-only seed mount, consumed via OPENSANDBOX_EGRESS_MITM_CA_SEED_DIR.
-# Persisted in ASSET_DIR so repeat runs reuse the same pinned CA.
-if [ ! -s "${SEED_DIR}/tls.crt" ] || [ ! -s "${SEED_DIR}/tls.key" ]; then
+# Persisted in ASSET_DIR so repeat runs reuse the same pinned CA (and the
+# fingerprint-embedded rootfs template cache keeps hitting) — but a reused
+# certificate must still be valid: egress rejects expired CAs at seed time
+# (fail closed, far from this line), so regenerate when missing OR expiring
+# within 24h (the certs are minted with -days 2).
+if [ ! -s "${SEED_DIR}/tls.crt" ] || [ ! -s "${SEED_DIR}/tls.key" ] \
+   || ! openssl x509 -in "${SEED_DIR}/tls.crt" -checkend 86400 >/dev/null 2>&1; then
   openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -keyout "${SEED_DIR}/tls.key" -out "${SEED_DIR}/tls.crt" \
     -subj "/CN=e2e-pinned-ca" \

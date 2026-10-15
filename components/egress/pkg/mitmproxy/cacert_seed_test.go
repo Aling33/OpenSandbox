@@ -161,9 +161,7 @@ func TestSeedPinnedCAReplacesForeignConfdirCA(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ca.fingerprint(t), fp)
 
-	got, err := ConfdirCAFingerprint(confDir)
-	require.NoError(t, err)
-	require.Equal(t, fp, got, "confdir must hold the pinned CA after seeding")
+	require.NoError(t, VerifyConfdirPinnedCA(confDir, fp), "confdir must hold the pinned CA after seeding")
 }
 
 func TestSeedPinnedCARejectsMissingOrUnloadableSeed(t *testing.T) {
@@ -244,21 +242,40 @@ func TestSeedPinnedCARejectsNonCAOrExpired(t *testing.T) {
 	require.True(t, os.IsNotExist(statErr), "rejected seeds must not create the confdir")
 }
 
-func TestConfdirCAFingerprint(t *testing.T) {
+func TestVerifyConfdirPinnedCA(t *testing.T) {
 	confDir := t.TempDir()
-
-	_, err := ConfdirCAFingerprint(confDir)
-	require.Error(t, err, "missing confdir cert must error")
-
 	ca := generateTestCA(t, "pinned-ca")
-	require.NoError(t, os.WriteFile(filepath.Join(confDir, mitmCACertName), ca.certPEM, 0o644))
-	fp, err := ConfdirCAFingerprint(confDir)
-	require.NoError(t, err)
-	require.Equal(t, ca.fingerprint(t), fp)
+	fp := ca.fingerprint(t)
 
-	require.NoError(t, os.WriteFile(filepath.Join(confDir, mitmCACertName), []byte("junk"), 0o644))
-	_, err = ConfdirCAFingerprint(confDir)
-	require.Error(t, err, "unloadable confdir cert must error")
+	// Happy path: bundle and certificate copy both carry the pinned cert.
+	require.NoError(t, os.MkdirAll(confDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(confDir, confCAKeyName), combineCAPEM(ca.certPEM, ca.keyPEM), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(confDir, mitmCACertName), ca.certPEM, 0o644))
+	require.NoError(t, VerifyConfdirPinnedCA(confDir, fp))
+
+	// Defense in depth: swapping ONLY the bundle (the file mitmdump actually
+	// loads) must be caught even though the public certificate copy still
+	// matches — mitmdump never reads the copy.
+	foreign := generateTestCA(t, "swapped-bundle")
+	require.NoError(t, os.WriteFile(filepath.Join(confDir, confCAKeyName), combineCAPEM(foreign.certPEM, foreign.keyPEM), 0o600))
+	err := VerifyConfdirPinnedCA(confDir, fp)
+	require.ErrorContains(t, err, confCAKeyName)
+
+	// And vice versa: a swapped certificate copy is caught too.
+	require.NoError(t, os.WriteFile(filepath.Join(confDir, confCAKeyName), combineCAPEM(ca.certPEM, ca.keyPEM), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(confDir, mitmCACertName), foreign.certPEM, 0o644))
+	err = VerifyConfdirPinnedCA(confDir, fp)
+	require.ErrorContains(t, err, mitmCACertName)
+
+	// Missing bundle.
+	require.NoError(t, os.Remove(filepath.Join(confDir, confCAKeyName)))
+	err = VerifyConfdirPinnedCA(confDir, fp)
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	// Unloadable bundle content.
+	require.NoError(t, os.WriteFile(filepath.Join(confDir, confCAKeyName), []byte("junk"), 0o600))
+	err = VerifyConfdirPinnedCA(confDir, fp)
+	require.Error(t, err)
 }
 
 func (ca testCA) fingerprint(t *testing.T) string {

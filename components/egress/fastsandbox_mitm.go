@@ -87,19 +87,13 @@ func startFastSandboxMitmproxyIfEnabled(gate *mitmproxy.HealthGate) (*mitmTransp
 
 	// Startup consistency check (supersedes the fast-sandbox CA export, which
 	// this profile drops — the guest trusts the template-baked certificate):
-	// the confdir cert mitmdump loaded must be the pinned one; a mismatch
-	// means a CA was generated or swapped behind our back. Fail the addon
-	// closed on either path.
-	got, err := mitmproxy.ConfdirCAFingerprint(confDir)
-	if err != nil {
-		gate.MarkDown(fmt.Sprintf("confdir CA unreadable: %v", err))
+	// BOTH confdir CA files — the bundle mitmdump actually loads and the
+	// public certificate copy — must match the pinned cert; a mismatch means
+	// a CA was generated or swapped behind our back. Fail the addon closed.
+	if err := mitmproxy.VerifyConfdirPinnedCA(confDir, fp); err != nil {
+		gate.MarkDown(fmt.Sprintf("confdir CA mismatch: %v", err))
 		mitmproxy.GracefulShutdown(running, 2*time.Second)
 		return nil, fmt.Errorf("pinned CA consistency check: %w", err)
-	}
-	if got != fp {
-		gate.MarkDown(fmt.Sprintf("confdir CA %s does not match pinned CA %s", got, fp))
-		mitmproxy.GracefulShutdown(running, 2*time.Second)
-		return nil, fmt.Errorf("pinned CA consistency check: confdir cert %s != pinned cert %s", got, fp)
 	}
 	log.Infof("fast-sandbox mitmproxy: pinned CA loaded (fingerprint %s)", fp)
 	return &mitmTransparent{
