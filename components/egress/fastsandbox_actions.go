@@ -25,7 +25,9 @@
 //	                   policy as pending; activate immediately when the
 //	                   subject is already active (a plain input update does
 //	                   not replay Hooks). A JSON-null input removes the
-//	                   policy and reverts to deny-first.
+//	                   policy and reverts to deny-first. A key held by a
+//	                   different live subject is a stale-subject takeover
+//	                   (OSEP-0022): the previous owner goes first.
 //	LIFECYCLE_HOOK     sandbox.runtime-ready only confirms the deny-first
 //	                   install (idempotent); sandbox.data-plane-ready applies
 //	                   the pending policy -> active. Unknown Hooks are
@@ -71,7 +73,10 @@ func newHandlerInstanceID() string {
 
 // handleActionsStatus serves GET /_fastlet/v1/actions/status: the Handler
 // process incarnation probe. ready mirrors the healthz gate (false while the
-// MITM stack is not ready); instanceId is the replay trigger.
+// MITM stack is not ready); instanceId is the replay trigger. The pinned-CA
+// fields are additive observability (OSEP-0022): the CA fingerprint the addon
+// signed with, plus the explicit addon-down signal when the pinned CA is
+// missing or unloadable (the rest of egress keeps serving).
 func (s *fastSandboxPolicyServer) handleActionsStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -82,11 +87,19 @@ func (s *fastSandboxPolicyServer) handleActionsStatus(w http.ResponseWriter, r *
 	if s.mitmGate != nil && s.mitmGate.MitmPending() {
 		ready = false
 	}
-	writeJSON(w, http.StatusOK, actionhandler.StatusResponse{
+	resp := actionhandler.StatusResponse{
 		APIVersion: constants.ActionsAPIVersion,
 		Ready:      ready,
 		InstanceID: s.instanceID,
-	})
+	}
+	if s.mitmGate != nil {
+		resp.MitmCaFingerprint = s.mitmGate.CAFingerprint()
+		if reason, down := s.mitmGate.DownReason(); down {
+			resp.MitmCaDown = true
+			resp.MitmCaError = reason
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleActions serves POST /_fastlet/v1/actions. HTTP 200 is success; any
@@ -150,18 +163,25 @@ func (s *fastSandboxPolicyServer) applySetBinding(env *actionhandler.Envelope) (
 			return http.StatusBadRequest, fmt.Errorf("invalid binding input policy: %v", err)
 		}
 	}
+	// A fence change is a rebind: discard ALL prior per-subject state. The
+	// registry drops its entry inside RegisterAndEnforce; the vault slice
+	// must go too, or the old instance's credentials would survive into the
+	// successor's flows. Same-UID actions serialize per subject.
+	if old, ok := s.reg.Fence(subj); ok && !old.Matches(fence) {
+		s.dropVault(subj)
+		log.Infof("subject %s: rebind (%s -> %s), vault slice purged", subj, old.RuntimeInstanceID, fence.RuntimeInstanceID)
+	}
 	state, err := s.reg.RegisterAndEnforce(subj, subject.SubjectKey{SourceIP: att.IP}, fence, func() error {
 		return s.OnRegistered(subj, att)
-	})
+	}, s.takeoverStaleSubject)
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("deny-first install: %w", err)
 	}
-	s.recordBindingState(subj, att, env.Revision.SpecGeneration)
+	s.recordBindingState(subj, att)
 	if env.Binding.IsRemoval() {
-		// Binding removed from a still-live sandbox: the cached pushes are
-		// stale for the removed binding (a re-added binding gets fresh
-		// pushes) — drop them, never apply them to a policy-less subject.
-		s.dropPendingPushes(subj)
+		// Binding removed from a still-live sandbox: drop the pending policy
+		// (a re-added binding gets a fresh input — never apply the removed
+		// binding's policy to a policy-less subject).
 		s.clearPendingPolicy(subj)
 		if state == subject.StateActive {
 			if err := s.revertToDenyFirst(subj, att); err != nil {
@@ -181,11 +201,6 @@ func (s *fastSandboxPolicyServer) applySetBinding(env *actionhandler.Envelope) (
 		// Deny-first until sandbox.data-plane-ready activates the subject.
 		s.storePendingPolicy(subj, pol)
 	}
-	// Flush cached pushes LAST: a push that landed during the registration
-	// window is newer intent than the binding input, so it overwrites the
-	// pending policy (the lifecycle barrier still holds — it only becomes
-	// effective at data-plane-ready). Vault pushes apply regardless.
-	s.OnRegisteredComplete(subj, att, env.Revision.SpecGeneration)
 	log.Infof("subject %s: SET_BINDING applied (state=%s)", subj, state)
 	return http.StatusOK, nil
 }

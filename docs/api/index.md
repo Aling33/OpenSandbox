@@ -73,9 +73,14 @@ does not cap expiration updates. See [Sandbox expiration](/getting-started/confi
 
 **Sandbox Diagnostics API**
 
-Defines best-effort troubleshooting descriptors for sandbox diagnostic logs and events. The descriptors either embed plain-text diagnostic content inline or return a download URL for the content. This spec does not define a structured audit or observability model.
+Defines structured routing context and best-effort troubleshooting descriptors for
+sandbox diagnostic logs and events. Context identifies the runtime backend and its
+diagnostic identifiers. Log and event descriptors either embed plain-text content
+inline or return a download URL. This spec does not define a structured audit or
+observability model.
 
 **Main Endpoints (base path `/v1`):**
+- `GET /sandboxes/{sandboxId}/diagnostics/context` - Retrieve the runtime backend and backend-defined diagnostic identifiers
 - `GET /sandboxes/{sandboxId}/diagnostics/logs` - Retrieve a diagnostic log content descriptor; `scope` is required
 - `GET /sandboxes/{sandboxId}/diagnostics/events` - Retrieve a diagnostic event content descriptor; `scope` is required
 

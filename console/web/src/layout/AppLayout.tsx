@@ -1,18 +1,26 @@
 // Copyright 2026 The OpenSandbox Authors
-//
+// 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-//
+// 
 //     http://www.apache.org/licenses/LICENSE-2.0
-//
+// 
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { DashboardOutlined, PlusOutlined, UnorderedListOutlined } from '@ant-design/icons';
+import {
+  AppstoreOutlined,
+  CameraOutlined,
+  DashboardOutlined,
+  FileSearchOutlined,
+  LogoutOutlined,
+  PlusOutlined,
+  UnorderedListOutlined,
+} from '@ant-design/icons';
 import { Layout, Menu, Typography } from 'antd';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 
@@ -24,16 +32,19 @@ export function AppLayout() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+
   const isAdmin = user?.role === 'admin';
 
   const items = [
     { key: '/', icon: <DashboardOutlined />, label: '概览' },
     ...(isAdmin
-      ? [{ key: 'admin-sandboxes-later', icon: <UnorderedListOutlined />, label: '沙箱（PR3+）', disabled: true }]
+      ? []
       : [
           { key: '/sandboxes', icon: <UnorderedListOutlined />, label: '沙箱' },
           { key: '/sandboxes/new', icon: <PlusOutlined />, label: '创建沙箱' },
         ]),
+    { key: '/snapshots', icon: <CameraOutlined />, label: '快照' },
+    { key: '/diagnostics', icon: <FileSearchOutlined />, label: '诊断' },
   ];
 
   const selectedKey =
@@ -59,14 +70,26 @@ export function AppLayout() {
           mode="inline"
           selectedKeys={[selectedKey]}
           items={items}
-          onClick={({ key }) => {
-            if (key.startsWith('/')) navigate(key);
-          }}
+          onClick={({ key }) => navigate(key)}
         />
       </Sider>
       <Layout>
-        <Header style={{ background: '#fff', display: 'flex', justifyContent: 'flex-end', paddingInline: 24 }}>
-          <Typography.Link onClick={() => void logout()}>退出</Typography.Link>
+        <Header
+          style={{
+            background: '#fff',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'flex-end',
+            paddingInline: 24,
+            gap: 16,
+          }}
+        >
+          <Typography.Text type="secondary">
+            <AppstoreOutlined /> {user?.namespace ?? 'platform'}
+          </Typography.Text>
+          <Typography.Link onClick={() => void logout()}>
+            <LogoutOutlined /> 退出
+          </Typography.Link>
         </Header>
         <Content style={{ margin: 24 }}>
           <Outlet />

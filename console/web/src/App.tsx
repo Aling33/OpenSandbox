@@ -18,15 +18,42 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 
 import { AuthProvider, RequireAuth } from './auth/AuthContext';
 import { AppLayout } from './layout/AppLayout';
+import { DiagnosticsPage } from './pages/DiagnosticsPage';
 import { LoginPage } from './pages/LoginPage';
 import { OverviewPage } from './pages/OverviewPage';
 import { SandboxCreatePage } from './pages/SandboxCreatePage';
 import { SandboxDetailPage } from './pages/SandboxDetailPage';
 import { SandboxListPage } from './pages/SandboxListPage';
+import { SnapshotsPage } from './pages/SnapshotsPage';
+
+const consoleTheme = {
+  token: {
+    borderRadius: 8,
+    colorPrimary: '#1677ff',
+    fontSize: 14,
+  },
+  components: {
+    Menu: {
+      itemHeight: 40,
+      itemMarginInline: 8,
+      iconSize: 16,
+    },
+    Card: {
+      borderRadiusLG: 10,
+      paddingLG: 20,
+    },
+    Table: {
+      headerBg: '#fafafa',
+    },
+    Breadcrumb: {
+      fontSize: 14,
+    },
+  },
+};
 
 export default function App() {
   return (
-    <ConfigProvider locale={zhCN}>
+    <ConfigProvider locale={zhCN} theme={consoleTheme}>
       <BrowserRouter>
         <AuthProvider>
           <Routes>
@@ -42,6 +69,8 @@ export default function App() {
               <Route path="sandboxes" element={<SandboxListPage />} />
               <Route path="sandboxes/new" element={<SandboxCreatePage />} />
               <Route path="sandboxes/:id" element={<SandboxDetailPage />} />
+              <Route path="snapshots" element={<SnapshotsPage />} />
+              <Route path="diagnostics" element={<DiagnosticsPage />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

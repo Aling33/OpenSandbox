@@ -28,6 +28,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -94,10 +95,44 @@ type record struct {
 	Name       string
 	SourceType string
 	Source     CredentialSource
-	Revision   int64
+	// raw is the credential's source object exactly as delivered — what the
+	// internal relay GET returns so consumers can round-trip the revision.
+	raw      json.RawMessage
+	Revision int64
 }
 
 type CreateRequest struct {
+	Credentials []Credential `json:"credentials"`
+	Bindings    []Binding    `json:"bindings"`
+}
+
+// ReplaceRequest is a full-revision replace (relay PUT): the complete vault
+// JSON plus an optional revision precondition. With no vault present the
+// replace creates one. When expectedRevision is absent, Revision (the relay
+// GET's top-level field) is tolerated as the precondition, so a GET body can
+// be edited and PUT straight back; both present and differing is an error.
+type ReplaceRequest struct {
+	ExpectedRevision *int64 `json:"expectedRevision,omitempty"`
+	Revision         *int64 `json:"revision,omitempty"`
+	CreateRequest
+}
+
+// precondition resolves the effective revision precondition of a replace.
+func (req ReplaceRequest) precondition() (*int64, error) {
+	switch {
+	case req.ExpectedRevision == nil:
+		return req.Revision, nil
+	case req.Revision == nil || *req.Revision == *req.ExpectedRevision:
+		return req.ExpectedRevision, nil
+	default:
+		return nil, fmt.Errorf("ambiguous revision precondition: expectedRevision %d and revision %d differ", *req.ExpectedRevision, *req.Revision)
+	}
+}
+
+// FullRevision is the complete vault revision INCLUDING credential values —
+// the internal relay shape only (what a server-side PATCH merges against).
+type FullRevision struct {
+	Revision    int64        `json:"revision"`
 	Credentials []Credential `json:"credentials"`
 	Bindings    []Binding    `json:"bindings"`
 }
@@ -252,12 +287,40 @@ func (v *Store) Create(req CreateRequest, pol *policy.NetworkPolicy) (State, err
 		return State{}, ErrExists
 	}
 
-	credentials, bindings, err := v.buildCreate(req, pol)
+	credentials, bindings, err := v.buildCreate(req, pol, 1)
 	if err != nil {
 		return State{}, err
 	}
 	v.publishLocked(true, 1, credentials, bindings)
 	return v.sanitizedLocked(), nil
+}
+
+// Replace installs req as the complete vault revision: creates at revision 1
+// when no vault exists, otherwise swaps all credentials and bindings and
+// advances the revision. expectedRevision, when resolved, is the
+// create-or-replace precondition (ErrRevisionConflict on mismatch, including
+// a missing vault). Returns the sanitized state and whether it created.
+func (v *Store) Replace(req ReplaceRequest, pol *policy.NetworkPolicy) (State, bool, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	expected, err := req.precondition()
+	if err != nil {
+		return State{}, false, err
+	}
+	created := !v.exists
+	if expected != nil && (created || *expected != v.revision) {
+		return State{}, false, fmt.Errorf("%w: expectedRevision %d does not match current revision %d", ErrRevisionConflict, *expected, v.revision)
+	}
+	next := int64(1)
+	if !created {
+		next = v.revision + 1
+	}
+	credentials, bindings, err := v.buildCreate(req.CreateRequest, pol, next)
+	if err != nil {
+		return State{}, false, err
+	}
+	v.publishLocked(true, next, credentials, bindings)
+	return v.sanitizedLocked(), created, nil
 }
 
 func (v *Store) Patch(req MutationRequest, pol *policy.NetworkPolicy) (State, error) {
@@ -296,6 +359,33 @@ func (v *Store) Sanitized() (State, error) {
 		return State{}, ErrNotFound
 	}
 	return v.sanitizedLocked(), nil
+}
+
+// Full returns the complete revision including credential values — internal
+// relay surface only; the server strips values on public reads.
+func (v *Store) Full() (FullRevision, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if !v.exists {
+		return FullRevision{}, ErrNotFound
+	}
+	full := FullRevision{
+		Revision:    v.revision,
+		Credentials: make([]Credential, 0, len(v.credentials)),
+		Bindings:    make([]Binding, 0, len(v.bindings)),
+	}
+	for _, r := range v.credentials {
+		full.Credentials = append(full.Credentials, Credential{
+			Name:   r.Name,
+			Source: append(json.RawMessage(nil), r.raw...),
+		})
+	}
+	for _, b := range v.bindings {
+		full.Bindings = append(full.Bindings, cloneBinding(b))
+	}
+	sort.Slice(full.Credentials, func(i, j int) bool { return full.Credentials[i].Name < full.Credentials[j].Name })
+	sort.Slice(full.Bindings, func(i, j int) bool { return full.Bindings[i].Name < full.Bindings[j].Name })
+	return full, nil
 }
 
 func (v *Store) sanitizedLocked() State {
@@ -431,11 +521,12 @@ func (v *Store) normalizeCredential(c Credential, revision int64) (record, error
 	if name == "" {
 		return record{}, fmt.Errorf("credential name cannot be blank")
 	}
-	source, err := v.sources.Create(append(json.RawMessage(nil), c.Source...))
+	raw := append(json.RawMessage(nil), c.Source...)
+	source, err := v.sources.Create(raw)
 	if err != nil {
 		return record{}, fmt.Errorf("credential %q: %w", name, err)
 	}
-	return record{Name: name, SourceType: source.Type(), Source: source, Revision: revision}, nil
+	return record{Name: name, SourceType: source.Type(), Source: source, raw: raw, Revision: revision}, nil
 }
 
 func normalizeBinding(b Binding) (Binding, error) {
