@@ -24,7 +24,7 @@ from attrs import define as _attrs_define
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.diagnostic_backend import DiagnosticBackend
+    from ..models.diagnostic_context_response_backend_identifiers import DiagnosticContextResponseBackendIdentifiers
 
 
 T = TypeVar("T", bound="DiagnosticContextResponse")
@@ -36,18 +36,24 @@ class DiagnosticContextResponse:
 
     Attributes:
         sandbox_id (str): Unique sandbox identifier accepted by the OpenSandbox API.
-        backend (DiagnosticBackend): Runtime backend that currently owns the sandbox.
+        backend_type (str): Implementation-defined backend type.
+        backend_identifiers (DiagnosticContextResponseBackendIdentifiers): Backend-defined identifiers used to correlate
+            this sandbox with
+            backend resources. Keys are scoped to `backendType`; values are strings.
         state (str | Unset): Current OpenSandbox lifecycle state, when available.
     """
 
     sandbox_id: str
-    backend: DiagnosticBackend
+    backend_type: str
+    backend_identifiers: DiagnosticContextResponseBackendIdentifiers
     state: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         sandbox_id = self.sandbox_id
 
-        backend = self.backend.to_dict()
+        backend_type = self.backend_type
+
+        backend_identifiers = self.backend_identifiers.to_dict()
 
         state = self.state
 
@@ -56,7 +62,8 @@ class DiagnosticContextResponse:
         field_dict.update(
             {
                 "sandboxId": sandbox_id,
-                "backend": backend,
+                "backendType": backend_type,
+                "backendIdentifiers": backend_identifiers,
             }
         )
         if state is not UNSET:
@@ -66,18 +73,21 @@ class DiagnosticContextResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.diagnostic_backend import DiagnosticBackend
+        from ..models.diagnostic_context_response_backend_identifiers import DiagnosticContextResponseBackendIdentifiers
 
         d = dict(src_dict)
         sandbox_id = d.pop("sandboxId")
 
-        backend = DiagnosticBackend.from_dict(d.pop("backend"))
+        backend_type = d.pop("backendType")
+
+        backend_identifiers = DiagnosticContextResponseBackendIdentifiers.from_dict(d.pop("backendIdentifiers"))
 
         state = d.pop("state", UNSET)
 
         diagnostic_context_response = cls(
             sandbox_id=sandbox_id,
-            backend=backend,
+            backend_type=backend_type,
+            backend_identifiers=backend_identifiers,
             state=state,
         )
 

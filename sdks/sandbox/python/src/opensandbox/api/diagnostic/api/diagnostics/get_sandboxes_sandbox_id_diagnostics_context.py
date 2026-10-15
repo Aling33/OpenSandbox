@@ -99,8 +99,8 @@ def sync_detailed(
 
      Retrieve structured context for routing further diagnostics of a sandbox.
 
-    `backend.type` identifies the implementation that currently owns the
-    sandbox. `backend.identifiers` contains implementation-defined identifiers
+    `backendType` identifies the implementation that currently owns the
+    sandbox. `backendIdentifiers` contains implementation-defined identifiers
     that may be used to correlate the sandbox with resources in that backend.
     Identifier keys are scoped to the backend type and are not defined by this
     API. The map may be empty when the backend does not expose additional
@@ -140,8 +140,8 @@ def sync(
 
      Retrieve structured context for routing further diagnostics of a sandbox.
 
-    `backend.type` identifies the implementation that currently owns the
-    sandbox. `backend.identifiers` contains implementation-defined identifiers
+    `backendType` identifies the implementation that currently owns the
+    sandbox. `backendIdentifiers` contains implementation-defined identifiers
     that may be used to correlate the sandbox with resources in that backend.
     Identifier keys are scoped to the backend type and are not defined by this
     API. The map may be empty when the backend does not expose additional
@@ -176,8 +176,8 @@ async def asyncio_detailed(
 
      Retrieve structured context for routing further diagnostics of a sandbox.
 
-    `backend.type` identifies the implementation that currently owns the
-    sandbox. `backend.identifiers` contains implementation-defined identifiers
+    `backendType` identifies the implementation that currently owns the
+    sandbox. `backendIdentifiers` contains implementation-defined identifiers
     that may be used to correlate the sandbox with resources in that backend.
     Identifier keys are scoped to the backend type and are not defined by this
     API. The map may be empty when the backend does not expose additional
@@ -215,8 +215,8 @@ async def asyncio(
 
      Retrieve structured context for routing further diagnostics of a sandbox.
 
-    `backend.type` identifies the implementation that currently owns the
-    sandbox. `backend.identifiers` contains implementation-defined identifiers
+    `backendType` identifies the implementation that currently owns the
+    sandbox. `backendIdentifiers` contains implementation-defined identifiers
     that may be used to correlate the sandbox with resources in that backend.
     Identifier keys are scoped to the backend type and are not defined by this
     API. The map may be empty when the backend does not expose additional

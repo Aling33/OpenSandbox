@@ -22,13 +22,13 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="DiagnosticBackendIdentifiers")
+T = TypeVar("T", bound="DiagnosticContextResponseBackendIdentifiers")
 
 
 @_attrs_define
-class DiagnosticBackendIdentifiers:
+class DiagnosticContextResponseBackendIdentifiers:
     """Backend-defined identifiers used to correlate this sandbox with
-    backend resources. Keys are scoped to `type`; values are strings.
+    backend resources. Keys are scoped to `backendType`; values are strings.
 
     """
 
@@ -43,10 +43,10 @@ class DiagnosticBackendIdentifiers:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        diagnostic_backend_identifiers = cls()
+        diagnostic_context_response_backend_identifiers = cls()
 
-        diagnostic_backend_identifiers.additional_properties = d
-        return diagnostic_backend_identifiers
+        diagnostic_context_response_backend_identifiers.additional_properties = d
+        return diagnostic_context_response_backend_identifiers
 
     @property
     def additional_keys(self) -> list[str]:

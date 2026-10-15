@@ -50,8 +50,8 @@ paths:
       description: |
         Retrieve structured context for routing further diagnostics of a sandbox.
 
-        `backend.type` identifies the implementation that currently owns the
-        sandbox. `backend.identifiers` contains implementation-defined identifiers
+        `backendType` identifies the implementation that currently owns the
+        sandbox. `backendIdentifiers` contains implementation-defined identifiers
         that may be used to correlate the sandbox with resources in that backend.
         Identifier keys are scoped to the backend type and are not defined by this
         API. The map may be empty when the backend does not expose additional
@@ -74,20 +74,18 @@ paths:
                   value:
                     sandboxId: fsb-abc123
                     state: Running
-                    backend:
-                      type: fast-sandbox
-                      identifiers: {}
+                    backendType: fast-sandbox
+                    backendIdentifiers: {}
                 kubernetes:
                   summary: Kubernetes sandbox with backend identifiers
                   value:
                     sandboxId: sbx_123
                     state: Running
-                    backend:
-                      type: kubernetes
-                      identifiers:
-                        namespace: default
-                        podName: sandbox-sbx-123
-                        podUid: 86c4fb10-15f7-4c6e-b72e-8dd15d7d5c48
+                    backendType: kubernetes
+                    backendIdentifiers:
+                      namespace: default
+                      podName: sandbox-sbx-123
+                      podUid: 86c4fb10-15f7-4c6e-b72e-8dd15d7d5c48
           headers:
             X-Request-ID:
               $ref: '#/components/headers/XRequestId'
@@ -345,7 +343,7 @@ components:
     DiagnosticContextResponse:
       type: object
       description: Structured context for routing sandbox diagnostics.
-      required: [sandboxId, backend]
+      required: [sandboxId, backendType, backendIdentifiers]
       properties:
         sandboxId:
           type: string
@@ -353,23 +351,15 @@ components:
         state:
           type: string
           description: Current OpenSandbox lifecycle state, when available.
-        backend:
-          $ref: '#/components/schemas/DiagnosticBackend'
-      additionalProperties: false
-    DiagnosticBackend:
-      type: object
-      description: Runtime backend that currently owns the sandbox.
-      required: [type, identifiers]
-      properties:
-        type:
+        backendType:
           type: string
           description: Implementation-defined backend type.
           examples: [fast-sandbox, kubernetes, docker]
-        identifiers:
+        backendIdentifiers:
           type: object
           description: |
             Backend-defined identifiers used to correlate this sandbox with
-            backend resources. Keys are scoped to `type`; values are strings.
+            backend resources. Keys are scoped to `backendType`; values are strings.
           additionalProperties:
             type: string
       additionalProperties: false
