@@ -223,8 +223,21 @@ func (e *Envelope) Fencing() (runtimeInstanceID, attachmentID string) {
 // identifies one Handler process incarnation: a changed value makes the
 // Fastlet invalidate Binding readiness and replay the latest SetBinding
 // followed by the already-reached Hooks.
+//
+// The MitmCa* fields are additive observability (OSEP-0022 pinned CA):
+// consumers unaware of them ignore the extra JSON keys.
 type StatusResponse struct {
 	APIVersion string `json:"apiVersion"`
 	Ready      bool   `json:"ready"`
 	InstanceID string `json:"instanceId"`
+	// MitmCaFingerprint is the pinned MITM CA's SHA-256 fingerprint
+	// (lowercase hex over the DER); empty when MITM is disabled or no CA is
+	// provisioned.
+	MitmCaFingerprint string `json:"mitmCaFingerprint,omitempty"`
+	// MitmCaDown is the explicit MITM-addon-down signal: the pinned CA is
+	// missing or unloadable, the addon refused to start, and the state is
+	// latched until process restart. Policy actions keep serving.
+	MitmCaDown bool `json:"mitmCaDown,omitempty"`
+	// MitmCaError carries the addon-down reason (empty when up).
+	MitmCaError string `json:"mitmCaError,omitempty"`
 }

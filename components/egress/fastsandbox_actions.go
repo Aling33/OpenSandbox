@@ -73,7 +73,10 @@ func newHandlerInstanceID() string {
 
 // handleActionsStatus serves GET /_fastlet/v1/actions/status: the Handler
 // process incarnation probe. ready mirrors the healthz gate (false while the
-// MITM stack is not ready); instanceId is the replay trigger.
+// MITM stack is not ready); instanceId is the replay trigger. The pinned-CA
+// fields are additive observability (OSEP-0022): the CA fingerprint the addon
+// signed with, plus the explicit addon-down signal when the pinned CA is
+// missing or unloadable (the rest of egress keeps serving).
 func (s *fastSandboxPolicyServer) handleActionsStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -84,11 +87,19 @@ func (s *fastSandboxPolicyServer) handleActionsStatus(w http.ResponseWriter, r *
 	if s.mitmGate != nil && s.mitmGate.MitmPending() {
 		ready = false
 	}
-	writeJSON(w, http.StatusOK, actionhandler.StatusResponse{
+	resp := actionhandler.StatusResponse{
 		APIVersion: constants.ActionsAPIVersion,
 		Ready:      ready,
 		InstanceID: s.instanceID,
-	})
+	}
+	if s.mitmGate != nil {
+		resp.MitmCaFingerprint = s.mitmGate.CAFingerprint()
+		if reason, down := s.mitmGate.DownReason(); down {
+			resp.MitmCaDown = true
+			resp.MitmCaError = reason
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleActions serves POST /_fastlet/v1/actions. HTTP 200 is success; any

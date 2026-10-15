@@ -117,10 +117,13 @@ func newFastSandboxPolicyServer(ctx context.Context, reg *subject.MemoryRegistry
 // SetMitm wires the shared mitmproxy into the control plane: the healthz gate
 // and the per-subject interception redirect install/remove. Called once at
 // assembly, before the controller starts; a nil gate (MITM disabled) leaves
-// the lifecycle hooks skipping interception.
+// the lifecycle hooks skipping interception. A non-nil gate with port <= 0 is
+// the addon-down assembly (pinned CA unavailable): the gate stays wired so
+// /healthz and the actions status payload surface the down reason, while the
+// lifecycle hooks skip interception.
 func (s *fastSandboxPolicyServer) SetMitm(gate *mitmproxy.HealthGate, port int, dports []int) {
 	s.mitmGate = gate
-	if gate == nil {
+	if gate == nil || port <= 0 {
 		return
 	}
 	s.mitmInstall = func(entries []iptables.MitmRedirectEntry) error {
@@ -221,16 +224,50 @@ func (s *fastSandboxPolicyServer) Handler() http.Handler {
 	mux.HandleFunc(constants.ActionsStatusPath, s.handleActionsStatus)
 	mux.HandleFunc(constants.ActionsDispatchPath, s.handleActions)
 	mux.HandleFunc(constants.VaultRelayPathPrefix, s.handleVaultRelay)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		if s.mitmGate != nil && s.mitmGate.MitmPending() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte("mitmproxy not ready\n"))
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	return mux
+}
+
+// healthzResponse is the /healthz body: status plus the pinned-CA
+// observability fields (OSEP-0022). The pre-create probe consumes the HTTP
+// status; the body is for operators and dashboards.
+type healthzResponse struct {
+	Status string `json:"status"`
+	// MitmCaFingerprint is the pinned CA's SHA-256 fingerprint (lowercase
+	// hex); empty when MITM is disabled or no CA is provisioned.
+	MitmCaFingerprint string `json:"mitmCaFingerprint,omitempty"`
+	// MitmCaDown is the explicit addon-down signal: the pinned CA is missing
+	// or unloadable, the MITM addon refused to start, and the down state is
+	// latched until process restart.
+	MitmCaDown  bool   `json:"mitmCaDown,omitempty"`
+	MitmCaError string `json:"mitmCaError,omitempty"`
+}
+
+// handleHealthz: 503 while the mitm stack is not ready (pre-create probe) and
+// 503 with an explicit addon-down signal when the pinned CA failed (permanent
+// until process restart) — the runtime driver refuses sandbox creation for
+// both; policy actions keep serving regardless.
+func (s *fastSandboxPolicyServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	if s.mitmGate != nil {
+		if reason, down := s.mitmGate.DownReason(); down {
+			writeJSON(w, http.StatusServiceUnavailable, healthzResponse{
+				Status:      "mitm-addon-down",
+				MitmCaDown:  true,
+				MitmCaError: reason,
+			})
 			return
 		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	return mux
+		if s.mitmGate.MitmPending() {
+			writeJSON(w, http.StatusServiceUnavailable, healthzResponse{Status: "mitmproxy-not-ready"})
+			return
+		}
+		writeJSON(w, http.StatusOK, healthzResponse{
+			Status:            "ok",
+			MitmCaFingerprint: s.mitmGate.CAFingerprint(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, healthzResponse{Status: "ok"})
 }
 
 // handleCredentialVaultActive is the fast-sandbox-profile active vault API: one

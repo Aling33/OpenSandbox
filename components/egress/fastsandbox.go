@@ -63,12 +63,6 @@ import (
 func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.UpstreamProxySpec) {
 	log.Infof("egress profile: fast-sandbox (multi-sandbox control plane)")
 
-	// Erase any stale mitmproxy CA left on the shared volume (root and the
-	// fast-sandbox mount subdir) by a previous egress generation, so a sandbox's
-	// bootstrap can never install a CA this generation no longer signs with
-	// (upstream issue #1370, fast-sandbox issue #19).
-	mitmproxy.PurgeStaleExportedCA()
-
 	otelShutdown, err := telemetry.Init(ctx)
 	if err != nil {
 		log.Warnf("OpenTelemetry metrics disabled (continuing without OTLP): %v", err)
@@ -121,11 +115,27 @@ func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.Upstream
 	// every sandbox. Started BEFORE the HTTP listener so subjects can never
 	// register against a missing interceptor (fail-closed registration); the
 	// per-subject prerouting DNAT is installed by the fast-sandbox server on
-	// registration. A disabled MITM skips the whole block.
+	// registration. A disabled MITM skips the whole block. A pinned-CA failure
+	// is fail-closed scoped to the addon: mitmdump refuses to start, the down
+	// state is surfaced on /healthz and the actions status payload, and the
+	// rest of egress keeps serving policy actions.
 	mitmGate := mitmproxy.NewHealthGate()
 	var fastSandboxMitm *mitmTransparent
-	if mitm, err := startFastSandboxMitmproxyIfEnabled(); err != nil {
-		log.Fatalf("fast-sandbox mitmproxy start failed: %v", err)
+	if mitm, err := startFastSandboxMitmproxyIfEnabled(mitmGate); err != nil {
+		if _, down := mitmGate.DownReason(); !down {
+			// Infrastructure failure (mitmdump binary, user, listen port):
+			// fatal, as before. Only pinned-CA failures are scoped to the
+			// addon-down path below (OSEP-0022).
+			log.Fatalf("fast-sandbox mitmproxy start failed: %v", err)
+		}
+		log.Errorf("fast-sandbox mitmproxy addon down (policy actions keep serving): %v", err)
+		fastSandboxSrv.SetMitm(mitmGate, 0, nil)
+		// MITM down: clear any interception table a previous generation
+		// (running with MITM up) may have left — stale rules would keep
+		// DNATing 80/443 to a now-unserved mitmproxy port (blackhole).
+		if err := iptables.RemoveMitmRedirects(); err != nil {
+			log.Warnf("fast-sandbox mitmproxy: stale redirect table cleanup failed (ignored): %v", err)
+		}
 	} else if mitm != nil {
 		fastSandboxMitm = mitm
 		dports, err := constants.BuildMitmproxyPorts(os.Getenv(constants.EnvMitmproxyExtraPorts))

@@ -111,6 +111,17 @@ const (
 	// appended to the always-on 80,443. Comma-separated. May change or be
 	// removed without notice.
 	EnvMitmproxyExtraPorts = "OPENSANDBOX_EGRESS_MITMPROXY_EXTRA_PORTS"
+	// EnvMitmCaSeedDir (fast-sandbox profile): read-only seed mount holding the
+	// pool-pinned MITM CA keypair as `tls.crt` (certificate) + `tls.key`
+	// (private key). When transparent MITM is enabled the seed is REQUIRED —
+	// egress copies the pinned pair into the writable confdir before mitmdump
+	// starts and NEVER generates a CA in this profile (OSEP-0022 MITM Trust
+	// Anchor). A missing, empty, or unloadable seed fails the MITM addon
+	// closed (healthz + actions status) while the rest of egress keeps
+	// serving; there is NO fallback to generate-on-start. Only pools that
+	// never enable transparent MITM need no CA and are unaffected by this
+	// variable.
+	EnvMitmCaSeedDir = "OPENSANDBOX_EGRESS_MITM_CA_SEED_DIR"
 
 	// EnvUpstreamProxy: chained upstream proxy endpoint ("http://host:port" or
 	// "https://host:port"). When set, the bundled upstream_proxy.py addon is

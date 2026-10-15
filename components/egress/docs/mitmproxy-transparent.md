@@ -58,6 +58,7 @@ Notes:
 
 - In transparent mode, mitmproxy generally recommends matching by IP/range; verify SNI/resolve behavior if using domain regex only.
 - Before mitm, `iptables`, and CA export are ready, `GET /healthz` returns `503 (mitm not ready)` to prevent premature readiness.
+- Under the fast-sandbox profile the CA is not generated at all: it is seeded from the pool-pinned trust anchor — see "Pinned CA seeding (fast-sandbox profile)" below.
 
 ### Static Configuration (config.yaml)
 
@@ -175,6 +176,32 @@ If CA files already exist in `confdir`, mitmproxy reuses them instead of regener
 - `/var/lib/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem` (public cert)
 
 Ensure correct permissions (for example `mitmproxy:mitmproxy`, private key mode `600`).
+
+### 5b) Pinned CA seeding (fast-sandbox profile)
+
+The `fast-sandbox` profile (`OPENSANDBOX_EGRESS_PROFILE=fast-sandbox`) replaces
+generate-on-start with a **pinned, cluster-global, versioned CA**
+(OSEP-0022 "MITM Trust Anchor"): one egress restart no longer rotates the CA,
+so live sandboxes keep passing TLS verification across restarts, Hook replays,
+pause/resume, and snapshot restore.
+
+| Aspect | Behavior |
+|--------|----------|
+| Provisioning | The pool's `FastletTemplate` mounts one pinned `opensandbox-mitm-ca-<version>` Secret read-only as the seed volume; point egress at it with `OPENSANDBOX_EGRESS_MITM_CA_SEED_DIR`. The mount holds `tls.crt` (certificate) + `tls.key` (private key). When transparent MITM is enabled the seed is **required**: there is no fallback to generate-on-start in this profile. |
+| Seeding | At startup (before mitmdump launches) egress validates the keypair — including that the certificate is a CA (`IsCA` + `keyCertSign`) inside its validity window — and copies it **idempotently** into the writable confdir under the names mitmdump loads: `mitmproxy-ca.pem`, a single file holding the certificate AND the private key (mitmproxy's `CertStore` loads both from this one file — a key-only file makes mitmdump exit at startup), plus `mitmproxy-ca-cert.pem` (public certificate copy). mitmdump loads a confdir CA when present and only generates when missing; in this profile it must **never** generate. A confdir already holding the exact pinned pair is left untouched (restart-stable). |
+| Fail-closed, scoped to the addon | A missing, unloadable, or invalid pinned CA fails the **MITM addon only**: it refuses to start and the down state is latched until process restart, surfaced on `/healthz` (503, `"status":"mitm-addon-down"`) and the actions status payload (`"mitmCaDown":true`). The rest of egress keeps serving policy actions. Pools that never enable interception need no CA and are unaffected; the sidecar profile keeps today's generate-on-start behavior unchanged. |
+| Consistency check | After the listener is up, egress re-verifies that the confdir cert it just loaded equals the pinned cert; a mismatch (a CA generated or swapped behind egress's back) fails the addon closed. |
+| Observability | The pinned CA's SHA-256 fingerprint (lowercase hex over the DER) is exposed on `/healthz` (`"mitmCaFingerprint"`) and mirrored in `GET /_fastlet/v1/actions/status`, so a template↔pool Secret mispairing (baked version ≠ pinned version) is visible at a glance instead of surfacing as opaque guest TLS failures. |
+
+```bash
+# Example: seed mount provisioned at /var/egress/mitm-ca-seed (read-only Secret mount)
+export OPENSANDBOX_EGRESS_MITM_CA_SEED_DIR=/var/egress/mitm-ca-seed
+```
+
+The superseded fast-sandbox mechanisms are removed: the `mitm-ca` export
+directory egress used to publish for the fastlet to mount into sandboxes,
+guest trust-store seeding at bootstrap, and the stale-CA purge on restart.
+The export path (`SyncRootCA` + purge) remains **sidecar-only**.
 
 ### 6) Chain Through an Upstream Proxy (Corporate/Forward Egress)
 
@@ -307,7 +334,8 @@ This prevents restart storms where multiple rapid failures queue up cascading re
 
 When transparent mitmproxy is enabled:
 
-- `/healthz` returns **503** until the full mitm stack is ready (process started, listener up, iptables installed, CA exported).
+- `/healthz` returns **503** until the full mitm stack is ready (process started, listener up, iptables installed, CA exported — sidecar; pinned CA seeded — fast-sandbox).
+- Under the fast-sandbox profile, a missing or unloadable pinned CA latches the **addon-down** state: `/healthz` keeps returning 503 with `"status":"mitm-addon-down"` and the reason, while policy actions keep serving (the down state clears only on process restart).
 - On crash, the health gate is set back to not-ready (503) immediately.
 - After a successful restart and listener readiness, the health gate is restored.
 

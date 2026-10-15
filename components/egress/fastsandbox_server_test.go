@@ -823,11 +823,53 @@ func TestFastSandboxServerHealthzMitmGate(t *testing.T) {
 	gate.SetReady(false)
 	rec := doRequest(t, srv, http.MethodGet, "/healthz", "")
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
-	require.Contains(t, rec.Body.String(), "mitmproxy not ready")
+	require.Contains(t, rec.Body.String(), "mitmproxy-not-ready")
 
 	gate.SetReady(true)
 	rec = doRequest(t, srv, http.MethodGet, "/healthz", "")
 	require.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestFastSandboxServerHealthzAddonDown(t *testing.T) {
+	t.Setenv(constants.EnvMitmproxyTransparent, "true")
+	srv, _, _ := fastSandboxTestServer(t)
+	gate := mitmproxy.NewHealthGate()
+	gate.SetCAFingerprint("abc123")
+	gate.MarkDown("pinned CA unavailable: missing seed")
+	// Addon-down assembly: gate wired, no interceptors (port <= 0).
+	srv.SetMitm(gate, 0, nil)
+	require.Nil(t, srv.mitmInstall, "addon-down must not wire interception installers")
+
+	rec := doRequest(t, srv, http.MethodGet, "/healthz", "")
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Contains(t, rec.Body.String(), `"status":"mitm-addon-down"`)
+	require.Contains(t, rec.Body.String(), `"mitmCaDown":true`)
+	require.Contains(t, rec.Body.String(), "pinned CA unavailable")
+
+	rec = doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), `"ready":false`)
+	require.Contains(t, rec.Body.String(), `"mitmCaDown":true`)
+	require.Contains(t, rec.Body.String(), "pinned CA unavailable")
+}
+
+func TestFastSandboxServerStatusPinnedCaObservability(t *testing.T) {
+	srv, _, _ := fastSandboxTestServer(t)
+	gate := mitmproxy.NewHealthGate()
+	gate.SetCAFingerprint("deadbeef")
+	srv.SetMitm(gate, 18081, []int{80, 443})
+
+	rec := doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), `"ready":true`)
+	require.Contains(t, rec.Body.String(), `"mitmCaFingerprint":"deadbeef"`)
+	require.NotContains(t, rec.Body.String(), "mitmCaDown")
+
+	// MITM disabled (nil gate): no CA fields at all.
+	srv2, _, _ := fastSandboxTestServer(t)
+	rec = doRequest(t, srv2, http.MethodGet, constants.ActionsStatusPath, "")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotContains(t, rec.Body.String(), "mitmCa")
 }
 
 // ---------------------------------------------------------------------------
