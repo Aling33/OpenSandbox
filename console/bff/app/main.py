@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.lifecycle import LifecycleClient, bind_http_client
-from app.routes import auth, sandboxes
+from app.routes import auth, sandboxes, snapshots
 
 
 def _validate_config() -> None:
@@ -74,4 +74,5 @@ app.add_middleware(
 api = FastAPI()
 api.include_router(auth.router)
 api.include_router(sandboxes.router)
+api.include_router(snapshots.router)
 app.mount("/api", api)
