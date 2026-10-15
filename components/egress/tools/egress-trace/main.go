@@ -196,10 +196,14 @@ type nftSet struct {
 	Elem  []json.RawMessage `json:"elem"`
 }
 
-type nftTimeoutElem struct {
+type nftElemValue struct {
 	Val     any     `json:"val"`
 	Timeout float64 `json:"timeout"`
 	Expires float64 `json:"expires"`
+}
+
+type nftTimeoutElem struct {
+	Elem nftElemValue `json:"elem"`
 }
 
 type leaseKey struct {
@@ -234,6 +238,13 @@ func (w *nftWatcher) poll() (added, removed []leaseChange, err error) {
 		return nil, nil, err
 	}
 	next := map[leaseKey]float64{}
+	addElem := func(setName, val string, expires float64) {
+		addr, err := netip.ParseAddr(val)
+		if err != nil {
+			return
+		}
+		next[leaseKey{setName, addr.String()}] = expires
+	}
 	for _, obj := range doc.Nftables {
 		var s nftSet
 		if json.Unmarshal(obj["set"], &s) != nil || s.Table != nftTableName {
@@ -242,17 +253,22 @@ func (w *nftWatcher) poll() (added, removed []leaseChange, err error) {
 		for _, raw := range s.Elem {
 			var plain string
 			if json.Unmarshal(raw, &plain) == nil {
-				next[leaseKey{s.Name, plain}] = 0
+				addElem(s.Name, plain, 0)
 				continue
 			}
-			var el nftTimeoutElem
-			if json.Unmarshal(raw, &el) == nil {
-				expires := el.Expires
-				if expires == 0 {
-					expires = el.Timeout
-				}
-				next[leaseKey{s.Name, fmt.Sprintf("%v", el.Val)}] = expires
+			var wrapped nftTimeoutElem
+			if json.Unmarshal(raw, &wrapped) != nil {
+				continue
 			}
+			val, ok := wrapped.Elem.Val.(string)
+			if !ok {
+				continue
+			}
+			expires := wrapped.Elem.Expires
+			if expires == 0 {
+				expires = wrapped.Elem.Timeout
+			}
+			addElem(s.Name, val, expires)
 		}
 	}
 	for k, expires := range next {
@@ -281,8 +297,12 @@ func sortChanges(changes []leaseChange) {
 }
 
 func (w *nftWatcher) hasIP(ip string) (bool, float64) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false, 0
+	}
 	for k, expires := range w.sets {
-		if strings.EqualFold(k.IP, ip) && strings.HasPrefix(k.Set, "allow") {
+		if strings.Contains(strings.ToLower(k.Set), "allow") && k.IP == addr.String() {
 			return true, expires
 		}
 	}
@@ -401,6 +421,11 @@ func runTrace(addr, nftBin string, interval time.Duration, proc string) {
 
 	nftw := newNftWatcher(nftBin)
 	floww := newFlowWatcher(proc)
+
+	// First snapshot is the baseline: existing sets are state, not events.
+	if _, _, err := nftw.poll(); err != nil {
+		warnf("nft: %v", err)
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
