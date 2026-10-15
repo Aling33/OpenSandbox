@@ -5,13 +5,21 @@ A read-only viewer for how the OpenSandbox egress sidecar admits outbound traffi
 ## What it shows
 
 ```text
-12:00:25.100 POLICY mode=allowlist | default=deny rules=2
-         allow *.github.com
+─────────────────────────────────────────────────────────────
+ egress-trace read-only watch of this egress namespace (Ctrl-C to stop)
+ policy     http://127.0.0.1:18080/policy
+ nft table  opensandbox (static sets + DNS-learned leases)
+ sockets    /proc/net/tcp{,6}
+ note       L7 request contents are never logged (by design)
+─────────────────────────────────────────────────────────────
+06:12:32.410 POLICY mode=enforcing default=deny rules=2
          allow pypi.org
-12:00:25.400 LEASE+ set=allow_v4      140.82.121.6                     dns-learned ttl=58s
-12:00:25.700 FLOW   140.82.121.6:443 ESTABLISHED admitted via allow set (ttl 58s)
-12:01:25.400 LEASE- set=allow_v4      140.82.121.6
+         allow *.github.com
+06:12:34.663 FLOW   185.199.111.154:443 ESTABLISHED admitted via lease (ttl 97s)
+06:12:34.920 FLOW   185.199.111.154:443 closed
 ```
+
+Output is colored when stdout is a terminal (green `LEASE+`/admissions, cyan `dns-learned`, yellow TTLs, red denies); pass `-no-color` or redirect to a file for plain text.
 
 Three local signals, polled and merged:
 
@@ -36,7 +44,7 @@ docker exec -it <egress-container> egress-trace probe api.github.com
 docker exec -it <egress-container> egress-trace -interval 250ms
 ```
 
-Flags: `-addr` (policy API, default `http://127.0.0.1:18080`, env `OPENSANDBOX_EGRESS_HTTP_ADDR`), `-nft`, `-interval`, `-proc`.
+Flags: `-addr` (policy API, default `http://127.0.0.1:18080`, env `OPENSANDBOX_EGRESS_HTTP_ADDR`), `-nft`, `-interval`, `-proc`, `-no-color`.
 
 ## probe output
 

@@ -50,12 +50,42 @@ const (
 	policyTimeout = 2 * time.Second
 )
 
+const (
+	cReset  = "\033[0m"
+	cBold   = "\033[1m"
+	cDim    = "\033[2m"
+	cRed    = "\033[31m"
+	cGreen  = "\033[32m"
+	cYellow = "\033[33m"
+	cCyan   = "\033[36m"
+)
+
+var useColor = true
+
+func paint(code, s string) string {
+	if !useColor || s == "" {
+		return s
+	}
+	return code + s + cReset
+}
+
+func stdoutIsTTY() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func stampDim() string {
+	return paint(cDim, stamp())
+}
+
 func main() {
 	addr := flag.String("addr", defaultAddr(), "policy API base URL")
 	nftBin := flag.String("nft", "nft", "nft binary")
 	interval := flag.Duration("interval", time.Second, "poll interval")
 	proc := flag.String("proc", "/proc", "proc mount path")
+	noColor := flag.Bool("no-color", false, "disable colored output")
 	flag.Parse()
+	useColor = !*noColor && stdoutIsTTY()
 
 	if flag.NArg() >= 1 && flag.Arg(0) == "probe" {
 		if flag.NArg() != 2 {
@@ -409,12 +439,17 @@ func isLoopback(ip string) bool {
 }
 
 func runTrace(addr, nftBin string, interval time.Duration, proc string) {
-	fmt.Println("egress-trace: read-only watch of this egress namespace (Ctrl-C to stop)")
-	fmt.Printf("  policy API : %s/policy\n", addr)
-	fmt.Printf("  nft table  : %s (static sets + DNS-learned leases)\n", nftTableName)
-	fmt.Printf("  sockets    : %s/net/tcp{,6} (non-loopback flows)\n", proc)
-	fmt.Println("  note: L7 request contents are not logged by the sidecar (by design).")
-	fmt.Println()
+	bar := paint(cDim, "─────────────────────────────────────────────────────────────")
+	fmt.Println(bar)
+	fmt.Printf(" %s %s\n", paint(cBold, "egress-trace"),
+		paint(cDim, "read-only watch of this egress namespace (Ctrl-C to stop)"))
+	fmt.Printf(" %s %s\n", paint(cDim, fmt.Sprintf("%-10s", "policy")), addr+"/policy")
+	fmt.Printf(" %s %s %s\n", paint(cDim, fmt.Sprintf("%-10s", "nft table")), nftTableName,
+		paint(cDim, "(static sets + DNS-learned leases)"))
+	fmt.Printf(" %s %s\n", paint(cDim, fmt.Sprintf("%-10s", "sockets")), proc+"/net/tcp{,6}")
+	fmt.Printf(" %s %s\n", paint(cDim, fmt.Sprintf("%-10s", "note")),
+		paint(cDim, "L7 request contents are never logged (by design)"))
+	fmt.Println(bar)
 
 	var pol *NetworkPolicy
 	var lastSummary string
@@ -442,9 +477,16 @@ func runTrace(addr, nftBin string, interval time.Duration, proc string) {
 			pol = st.Policy
 			sum := st.Mode + " | " + pol.summary()
 			if sum != lastSummary {
-				fmt.Printf("%s POLICY mode=%s\n", stamp(), sum)
+				fmt.Printf("%s %s %s %s\n", stampDim(), paint(cBold, "POLICY"),
+					paint(cBold, "mode="+st.Mode),
+					paint(cDim, fmt.Sprintf("default=%s rules=%d", pol.DefaultAction, len(pol.Egress))))
 				for _, r := range pol.Egress {
-					fmt.Printf("         %-5s %s\n", r.Action, r.Target)
+					color := cGreen
+					if orDeny(r.Action) == "deny" {
+						color = cRed
+					}
+					fmt.Printf("         %s %s\n", paint(color, fmt.Sprintf("%-5s", orDeny(r.Action))),
+						paint(cBold, r.Target))
 				}
 				lastSummary = sum
 			}
@@ -456,18 +498,33 @@ func runTrace(addr, nftBin string, interval time.Duration, proc string) {
 			}
 		} else {
 			for _, lc := range added {
-				src := "dns-learned"
+				src, srcColor := "dns-learned", cCyan
 				if action, target := pol.matchIP(mustAddr(lc.IP)); action != "" {
 					src = fmt.Sprintf("static rule %s %s", action, target)
+					if action == "deny" {
+						srcColor = cRed
+					} else {
+						srcColor = cGreen
+					}
 				}
 				ttl := ""
 				if lc.Expires > 0 {
-					ttl = fmt.Sprintf(" ttl=%.0fs", lc.Expires)
+					ttl = fmt.Sprintf(" ttl %ds", int(lc.Expires))
 				}
-				fmt.Printf("%s LEASE+ set=%-14s %-44s %s%s\n", stamp(), lc.Set, lc.IP, src, ttl)
+				fmt.Printf("%s %s %s %s %s%s\n",
+					stampDim(),
+					paint(cBold+cGreen, "LEASE+"),
+					paint(cBold, fmt.Sprintf("%-15s", lc.IP)),
+					paint(cDim, "set="+lc.Set),
+					paint(srcColor, src),
+					paint(cYellow, ttl))
 			}
 			for _, lc := range removed {
-				fmt.Printf("%s LEASE- set=%-14s %s\n", stamp(), lc.Set, lc.IP)
+				fmt.Printf("%s %s %s %s\n",
+					stampDim(),
+					paint(cDim, "LEASE-"),
+					paint(cDim, fmt.Sprintf("%-15s", lc.IP)),
+					paint(cDim, "set="+lc.Set))
 			}
 		}
 
@@ -477,18 +534,27 @@ func runTrace(addr, nftBin string, interval time.Duration, proc string) {
 			}
 		} else {
 			for _, f := range established {
-				note := ""
+				note, noteColor := "", cDim
 				if ok, expires := nftw.hasIP(f.IP); ok {
-					note = fmt.Sprintf("admitted via allow set (ttl %.0fs)", expires)
+					note, noteColor = fmt.Sprintf("admitted via lease (ttl %ds)", int(expires)), cGreen
 				} else if action, target := pol.matchIP(mustAddr(f.IP)); action == "allow" {
-					note = "static allow " + target
+					note, noteColor = "static allow "+target, cGreen
 				} else if action == "deny" {
-					note = "UNEXPECTED: static deny target connected"
+					note, noteColor = "UNEXPECTED: static deny target connected", cRed+cBold
 				}
-				fmt.Printf("%s FLOW   %s:%s ESTABLISHED %s\n", stamp(), f.IP, f.Port, note)
+				fmt.Printf("%s %s %s %s %s\n",
+					stampDim(),
+					paint(cBold+cCyan, "FLOW  "),
+					paint(cBold, f.IP+":"+f.Port),
+					paint(cGreen, "ESTABLISHED"),
+					paint(noteColor, note))
 			}
 			for _, f := range closed {
-				fmt.Printf("%s FLOW   %s:%s closed\n", stamp(), f.IP, f.Port)
+				fmt.Printf("%s %s %s %s\n",
+					stampDim(),
+					paint(cDim, "FLOW  "),
+					paint(cDim, f.IP+":"+f.Port),
+					paint(cDim, "closed"))
 			}
 		}
 
@@ -506,7 +572,7 @@ func stamp() string {
 }
 
 func warnf(format string, args ...any) {
-	fmt.Printf("%s WARN   "+format+"\n", append([]any{stamp()}, args...)...)
+	fmt.Printf("%s %s "+format+"\n", append([]any{stampDim(), paint(cYellow, "WARN ")}, args...)...)
 }
 
 func runProbe(addr, domain string) int {
@@ -518,7 +584,13 @@ func runProbe(addr, domain string) int {
 		pol = st.Policy
 	}
 	action, matched := pol.matchDomain(domain)
-	fmt.Printf("policy verdict : %s (matched: %s)\n", strings.ToUpper(action), matched)
+	verdictColor := cRed
+	if action == "allow" {
+		verdictColor = cGreen
+	}
+	fmt.Printf("policy verdict : %s (matched: %s)\n",
+		paint(cBold+verdictColor, strings.ToUpper(action)),
+		paint(cBold, matched))
 
 	r := &net.Resolver{
 		PreferGo: true,
@@ -533,17 +605,17 @@ func runProbe(addr, domain string) int {
 	switch {
 	case err == nil:
 		fmt.Printf("dns resolution : %s\n", strings.Join(addrs, ", "))
-		fmt.Println("outcome        : resolved; expect an nft lease for these IPs and an admitted dial")
+		fmt.Println("outcome        : " + paint(cGreen, "resolved; expect an nft lease for these IPs and an admitted dial"))
 	case isNXDOMAIN(err):
 		fmt.Println("dns resolution : NXDOMAIN")
 		if action == "deny" {
-			fmt.Println("outcome        : denied by policy at the DNS layer (no network attempt will happen)")
+			fmt.Println("outcome        : " + paint(cRed, "denied by policy at the DNS layer (no network attempt will happen)"))
 		} else {
-			fmt.Println("outcome        : allowed by policy but the name does not exist upstream")
+			fmt.Println("outcome        : " + paint(cYellow, "allowed by policy but the name does not exist upstream"))
 		}
 	default:
 		fmt.Printf("dns resolution : error (%v)\n", err)
-		fmt.Println("outcome        : resolver/upstream failure — distinct from a policy denial")
+		fmt.Println("outcome        : " + paint(cRed, "resolver/upstream failure — distinct from a policy denial"))
 	}
 	return 0
 }
