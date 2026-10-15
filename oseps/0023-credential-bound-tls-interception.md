@@ -362,13 +362,33 @@ bindings:
 - leftmost-label wildcard, such as `*.logs.example.com`, matching one or more
   subdomain labels but not the apex.
 
-When `interceptionMode=credential-bound`, startup fails closed if the baked-in
-mitmproxy `ignore_hosts` list is non-empty. The error identifies the migration
-requirement but does not echo sensitive configuration. Operators move intended
-entries to `OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS`. The sidecar
-compiles those selectors to anchored mitmproxy regexes only after validation;
-callers cannot provide raw regex. The legacy regex option remains unchanged for
-`all` mode.
+The experimental live sidecar uses this list directly in its typed TLS
+ClientHello decision hook, never by compiling it into `ignore_hosts` regexes.
+Both effective `ignore_hosts` and `allow_hosts` must be empty at startup and
+remain empty on standard option updates. These native options can bypass the
+TLS hook, including through HTTP Host matching, so even an anchored `:443`
+regex is not an equivalent implementation. Startup failures identify the
+migration variable without echoing its contents. Legacy `all` mode retains its
+existing regex behavior; explicitly setting the new variable outside the live
+runtime is a configuration error. This experimental wiring does not add the
+proposed public `interceptionMode` API or Fast Sandbox support.
+
+Go parses the operator JSON once, normalizes with the shared host-selector
+parser, sorts and deduplicates it, and freezes the result for the process
+lifetime. Unset means an empty list; explicit empty text, `null`, non-arrays,
+non-string entries, malformed Unicode and trailing JSON values are rejected.
+Input and canonical output are limited to 64 KiB each, with at most 256 entries
+before deduplication. The child receives exactly one controlled canonical JSON
+array, including `[]` for an empty configuration; missing handoff is fatal.
+Python validates canonical ASCII, sorted uniqueness and limits without doing
+its own Unicode normalization. Static configuration does not enter the decision
+snapshot schema or digest and cannot be hot-reloaded. Non-empty static selectors
+with a configured chained upstream proxy are rejected, preserving the existing
+opaque-tunnel incompatibility.
+
+This change does not close all addon or native-option escape paths. In
+particular, existing `tcp_hosts` can route traffic outside HTTP credential
+processing; its broader L7 implications are a separate hardening task.
 
 Vault create and PATCH compare every HTTPS/443 binding host selector against
 every static pass-through selector using semantic intersection:
@@ -380,9 +400,15 @@ every static pass-through selector using semantic intersection:
 | wildcard | exact | the exact host is a non-apex member of the wildcard |
 | wildcard | wildcard | their suffix languages are nested or equal; one normalized base is equal to or a subdomain of the other |
 
-Any overlap rejects the complete candidate revision before prepare/commit. The
-same shared selector parser, normalizer, matcher, and intersection function are
-used by Go validation and the addon decision snapshot; probe-based overlap
+Any overlap rejects the complete candidate revision before Go sends IPC
+prepare, and before Policy persistence or nft application. The common Store
+candidate validator covers Vault create/PATCH, Policy freeze and bootstrap.
+HTTP-only bindings and wildcard languages with no valid DNS members do not
+participate. Method/path differences cannot exempt a TLS overlap. Python also
+rejects overlapping compiled selectors before staging an IPC prepare, without
+changing active/pending state or connection retirement deadlines. This defensive
+check does not substitute for Go's pre-IPC rejection. The same shared
+host-selector contract is used by Go validation and the addon decision snapshot; probe-based overlap
 checks are not part of credential-bound correctness. The static selector list
 is immutable for the egress process lifetime. A future hot-reload design must
 join the same per-subject mutation barrier and revalidate every active binding
@@ -406,9 +432,14 @@ order:
 3. If SNI is absent, pass through without credentials and record
    `reason=no_sni`. Credential-bound runtimes already reject
    `ssl_insecure=true`, so there is no insecure no-SNI MITM exception.
-4. If the validated static pass-through selector list matches normalized SNI,
-   pass through and record
-   `reason=static_ignore`.
+4. Validate wire SNI. If a static selector matches and the actual destination
+   port in the TLS context's server address is 443, pass through with
+   `reason=static_ignore`, even before a snapshot is installed. Static bypass
+   consumes no registry slot. For a matching selector, missing or malformed
+   destination address fails closed; a known different port continues the
+   existing snapshot/binding path. HTTP Host or a string `:443` suffix cannot
+   establish the destination port. This check preserves identity, ECH and
+   no-SNI precedence.
 5. Load the installed active acknowledged decision snapshot for that identity.
    If it is unavailable or bootstrapping, deny the connection.
 6. Match normalized SNI against `tlsBindingHostSelectors`, the union of host
@@ -1481,8 +1512,10 @@ acceptance status is separate from the historical live-Vault results.
   checks reject every intersecting binding revision.
 - Static exact `api.example.com` rejects binding wildcard `*.example.com`; the
   inverse combination and nested wildcard suffixes are covered as regressions.
-- Credential-bound startup rejects any non-empty legacy regex `ignore_hosts`
-  list and accepts the equivalent analyzable pass-through selector list.
+- Credential-bound startup and option updates reject non-empty `ignore_hosts`
+  and `allow_hosts`; startup accepts the canonical typed pass-through list.
+  Static bypass requires actual destination port 443, preserves HTTP/80, and
+  never grants an exception to network policy.
 - Missing/bootstrapping state is distinct from an acknowledged empty revision,
   timeout, 5xx, malformed JSON, dispatch miss, and generation mismatch. Dynamic
   pass-through requires an installed snapshot with no matching TLS selector.
@@ -1685,7 +1718,8 @@ paths.
    existing deployments. Before enabling `credential-bound`, migrate intended
    static bypass entries to the exact/wildcard
    `OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS` list; the new mode rejects a
-   non-empty legacy regex list.
+   non-empty `ignore_hosts` or `allow_hosts` list. The static selector list
+   is immutable; changing it requires a new sidecar process and revalidation.
 8. Release notes must call out strict unknown-field rejection as a runtime
    compatibility tightening, even though the OpenAPI schema was already closed.
 9. Do not change the default in this OSEP. A future default change requires

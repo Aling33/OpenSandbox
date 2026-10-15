@@ -25,9 +25,9 @@ drain thread, and fail-closed connection termination. All credential policy
 ``token_for``, ``acquire_request`` and ``finish_request`` from its hooks.
 
 Security invariants (OSEP-0023 phase 3, sidecar experiment):
-- A TLS decision is derived only from the installed immutable snapshot; an
-  unknown or bootstrapping state denies instead of falling back to decrypt-all
-  or to dynamic pass-through.
+- A TLS decision uses frozen static selectors and the installed immutable
+  snapshot. Unknown identities deny; bootstrapping permits only validated
+  static TLS/443 and the existing ECH/no-SNI opaque decisions.
 - A decrypted connection exists only with a registry admission; a request on a
   connection without one is rejected, never silently forwarded with credentials.
 - Removed hosts fence new requests on tracked connections immediately; the
@@ -39,14 +39,15 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
 from mitmproxy import ctx
+from host_selectors import Selector
 from revision_publication import LiveReceiver
+from static_passthrough import ENV as PASSTHROUGH_ENV, ERROR as PASSTHROUGH_ERROR, parse_handoff
 from tls_registry import (
     AdmissionResult,
     AdmissionToken,
@@ -157,6 +158,7 @@ class LiveRuntime:
         self._receiver = receiver
         self.registry = receiver.registry
         self.identity = identity
+        self._static_passthrough = receiver.static_passthrough
         self._lock = threading.Lock()
         # id(client_conn) -> (token, client_conn). Holding the connection
         # reference keeps the id unique while tracked.
@@ -179,6 +181,10 @@ class LiveRuntime:
         )
         self._closed = False
 
+    @property
+    def static_passthrough(self) -> tuple[Selector, ...]:
+        return self._static_passthrough
+
     def start(self) -> None:
         self._drain_thread.start()
 
@@ -199,19 +205,8 @@ class LiveRuntime:
 
     # -- TLS decision path -------------------------------------------------
 
-    def static_ignored(self, sni: str | None) -> bool:
-        """Legacy operator regex pass-through keeps its existing precedence."""
-        if not sni:
-            return False
-        for pattern in ctx.options.ignore_hosts or []:
-            try:
-                if re.search(pattern, sni):
-                    return True
-            except re.error:
-                pass
-        return False
-
-    def admit_tls(self, sni: str | None, ech_hidden: bool = False) -> AdmissionResult:
+    def admit_tls(self, sni: str | None, ech_hidden: bool = False,
+                  destination_port: int | None = None) -> AdmissionResult:
         """Classify one ClientHello against the installed snapshot.
 
         ``ech_hidden`` is set by the caller only after inspecting the actual
@@ -226,7 +221,8 @@ class LiveRuntime:
             identity=self.identity,
             sni=sni,
             ech_hidden=ech_hidden,
-            static_passthrough=(),
+            static_passthrough=self.static_passthrough,
+            destination_port=destination_port,
         )
 
     def track(self, token: AdmissionToken | None, client_conn: Any) -> bool:
@@ -886,6 +882,13 @@ def enabled() -> bool:
     return _runtime is not None
 
 
+def validate_live_options() -> None:
+    """Native pre-TLS selectors must never bypass live admission."""
+    if any(getattr(ctx.options, name, False) for name in
+           ("ssl_insecure", "ignore_hosts", "allow_hosts")):
+        _fatal()
+
+
 def configure(
     socket_path: str,
     token: str,
@@ -907,6 +910,13 @@ def configure(
     if live is None:
         _fatal()
     tls_capacity, request_capacity, drain_timeout = live
+    validate_live_options()
+    try:
+        static_passthrough = parse_handoff(os.environ.get(PASSTHROUGH_ENV))
+    except ValueError:
+        raise SystemExit(PASSTHROUGH_ERROR) from None
+    if static_passthrough and os.environ.get("OPENSANDBOX_EGRESS_UPSTREAM_PROXY", "").strip():
+        _fatal()
     from revision_ipc import Server
 
     receiver = LiveReceiver(
@@ -916,6 +926,7 @@ def configure(
         capacity=tls_capacity,
         request_capacity=request_capacity,
         drain_timeout_seconds=drain_timeout,
+        static_passthrough=static_passthrough,
     )
     server = Server(
         receiver,
@@ -924,8 +935,8 @@ def configure(
         max_snapshot_bytes=limit,
         request_timeout=1,
     )
-    server.start()
     runtime = LiveRuntime(receiver, identity=(control, subject))
+    server.start()
     runtime.start()
     _runtime = runtime
     return runtime, server

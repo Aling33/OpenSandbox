@@ -67,6 +67,7 @@ _SYSTEM_MODULES = (
     "tls_decision",
     "decision_snapshot",
     "host_selectors",
+    "static_passthrough",
 )
 
 
@@ -283,16 +284,17 @@ def _sort_bindings(bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(bindings, key=lambda item: item["name"])
 
 
-def _system_with_live_runtime() -> tuple[Any, Any, Any]:
+def _system_with_live_runtime(static_json="[]") -> tuple[Any, Any, Any]:
     # Load the system module first: it installs the fake mitmproxy package
     # that the mitmscripts modules import at module scope.
     system = _load_system_module()
     from credential_bound import LiveRuntime
     from revision_publication import LiveReceiver
+    from static_passthrough import parse_handoff
 
     receiver = LiveReceiver(
         CONTROL, SUBJECT, max_snapshot_bytes=1 << 20, capacity=64, request_capacity=256,
-        drain_timeout_seconds=1,
+        drain_timeout_seconds=1, static_passthrough=parse_handoff(static_json),
     )
     runtime = LiveRuntime(receiver, identity=(CONTROL, SUBJECT))
     system._live_runtime = runtime
@@ -358,25 +360,40 @@ class CredentialBoundTLSTest(unittest.TestCase):
         self.assertFalse(data.ignore_connection)
         self.assertTrue(data.client_conn.closed)
 
-    def test_legacy_ignore_hosts_static_passthrough_wins(self) -> None:
-        import mitmproxy as fake_mitmproxy
-
-        fake_mitmproxy.ctx.options.ignore_hosts = ["^ignored\\."]
-
-        class _WithOptions:
-            def __enter__(self) -> None:
-                return None
-
-            def __exit__(self, *_args: object) -> bool:
-                return True
-
-        # ctx is shared per module load; patch the option directly.
-        self.system.ctx.options.ignore_hosts = ["^ignored\\."]
-        self._install([_binding("api", "api.example.com", "token-v1")], ["token-v1"], 1)
+    def test_live_never_uses_dynamic_ignore_hosts(self) -> None:
+        self.system.ctx.options.ignore_hosts = [".*"]
         data = _ClientHelloData("ignored.example.com")
         self.system.tls_clienthello(data)
-        self.assertTrue(data.ignore_connection)
-        self.assertFalse(data.client_conn.closed)
+        self.assertFalse(data.ignore_connection)
+        self.assertTrue(data.client_conn.closed)
+
+    def test_static_hook_uses_original_destination_without_snapshot_or_registry(self) -> None:
+        self.system, self.receiver, self.runtime = _system_with_live_runtime('["*.example.com"]')
+        self.assertIs(self.runtime.static_passthrough, self.receiver.static_passthrough)
+        self.assertIs(self.runtime.static_passthrough, self.receiver._publisher.static_passthrough)
+        for owner in (self.runtime, self.receiver, self.receiver._publisher):
+            with self.assertRaises(AttributeError):
+                owner.static_passthrough = ()
+        for address, expected in ((("192.0.2.1", 443), True), (("192.0.2.1", 80), False),
+                                  (("192.0.2.1", 8443), False), (None, False),
+                                  (("192.0.2.1", True), False), (("192.0.2.1", "443"), False),
+                                  (["192.0.2.1", 443], False), (("", 443), False)):
+            with self.subTest(address=address):
+                data = _ClientHelloData("A.B.Example.com.")
+                data.context.server = types.SimpleNamespace(address=address, peername=None)
+                self.system.tls_clienthello(data)
+                self.assertEqual(data.ignore_connection, expected)
+                self.assertEqual(data.client_conn.closed, not expected)
+                self.assertIsNone(self.runtime.token_for(data.client_conn))
+                self.assertEqual(len(self.runtime.registry._entries), 0)
+        for sni, extensions in ((None, []), ("a.example.com", [(0xFE0D, b"ech")])):
+            data = _ClientHelloData(sni, extensions=extensions)
+            data.context.server = types.SimpleNamespace(address=None)
+            self.system.tls_clienthello(data)
+            self.assertTrue(data.ignore_connection)
+        self.receiver.close()
+        result = self.runtime.admit_tls("a.example.com", destination_port=443)
+        self.assertEqual(result.action, "deny")
 
     def test_registry_exhaustion_closes_new_bound_connection(self) -> None:
         # capacity=64 in setUp: admit 64 connections first.
@@ -903,6 +920,7 @@ class CredentialBoundEnvTest(unittest.TestCase):
         env[ENV["control"]] = CONTROL
         env[ENV["subject"]] = SUBJECT
         env[ENV["limit"]] = "1048576"
+        env["OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS"] = "[]"
         env.update(extra)
         return env
 
@@ -922,6 +940,45 @@ class CredentialBoundEnvTest(unittest.TestCase):
             system._live_runtime.close()
         finally:
             system.done()
+
+    def test_native_selectors_and_bad_handoff_never_start_ipc(self) -> None:
+        live = {LIVE_ENV["tls_capacity"]: "64", LIVE_ENV["request_capacity"]: "256",
+                LIVE_ENV["drain_timeout"]: "5"}
+        key = "OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS"
+        cases = [("ignore_hosts", [".*"], "[]", ""),
+                 ("allow_hosts", ["never-matches.example"], "[]", ""),
+                 ("ignore_hosts", [], None, ""), ("ignore_hosts", [], "null", ""),
+                 ("ignore_hosts", [], '["static.example"]', "http://proxy.example:8080")]
+        for option, value, raw, upstream in cases:
+            with self.subTest(option=option, raw=raw):
+                system = _load_system_module()
+                setattr(system.ctx.options, option, value)
+                env = self._env(live)
+                if raw is None:
+                    env.pop(key)
+                else:
+                    env[key] = raw
+                env["OPENSANDBOX_EGRESS_UPSTREAM_PROXY"] = upstream
+                with mock.patch.dict(os_environ(), env, clear=True), mock.patch("revision_ipc.Server.start") as start:
+                    with self.assertRaises(SystemExit):
+                        system.load(None)
+                    start.assert_not_called()
+                self.assertFalse(Path(self.path).exists())
+                self.assertIsNone(system._revision_server)
+                self.assertIsNone(system._live_runtime)
+
+    def test_native_selectors_rejected_on_configure_before_and_after_load(self) -> None:
+        for option in ("ignore_hosts", "allow_hosts"):
+            for enabled in (False, True):
+                system = _load_system_module()
+                system._live_runtime = object() if enabled else None
+                setattr(system.ctx.options, option, [".*"])
+                with mock.patch.dict(os_environ(), {LIVE_ENV["tls_capacity"]: "64"}, clear=True):
+                    with self.assertRaises(SystemExit):
+                        system.configure({option})
+                system._live_runtime = None
+                with mock.patch.dict(os_environ(), {}, clear=True):
+                    system.configure({option})  # Legacy options stay supported.
 
     def test_partial_live_bundle_fails_closed(self) -> None:
         system = _load_system_module()

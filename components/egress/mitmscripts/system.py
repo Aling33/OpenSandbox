@@ -235,7 +235,10 @@ def load(_loader: Any) -> None:
     # The live credential-bound mode never runs with insecure upstream
     # verification: check the effective option before the receiver starts.
     # The installation-only receiver keeps the legacy escape hatch.
-    if _live_admission_requested() and getattr(ctx.options, "ssl_insecure", False):
+    if _live_admission_requested() and any(
+        getattr(ctx.options, name, False)
+        for name in ("ssl_insecure", "ignore_hosts", "allow_hosts")
+    ):
         _fatal_revision_runtime()
     receiver = server = runtime = None
     try:
@@ -291,17 +294,13 @@ def _live_admission_requested() -> bool:
 
 
 def configure(updated: set) -> None:
-    """Option-change hook: ssl_insecure is fatal while live admission is on.
-
-    mitmproxy invokes this hook on every option change; toggling
-    ssl_insecure true while the live receiver is requested or enabled is a
-    fatal configuration error, never a runtime fallback.
-    """
-    if "ssl_insecure" not in updated:
+    """Fence insecure TLS and native pre-TLS bypasses in the live runtime."""
+    if not {"ssl_insecure", "ignore_hosts", "allow_hosts"}.intersection(updated):
         return
     if _live_runtime is None and not _live_admission_requested():
         return
-    if getattr(ctx.options, "ssl_insecure", False):
+    if any(getattr(ctx.options, name, False) for name in
+           ("ssl_insecure", "ignore_hosts", "allow_hosts")):
         _fatal_revision_runtime()
 
 
@@ -512,10 +511,10 @@ def _tls_clienthello_live(live: Any, data: ClientHelloData) -> None:
         credential_bound.terminate_handshake(data.context.client)
         return
     sni = data.client_hello.sni
-    if live.static_ignored(sni):
-        data.ignore_connection = True
-        return
-    result = live.admit_tls(sni, ech_hidden=ech_hidden)
+    from static_passthrough import destination_port
+
+    port = destination_port(getattr(getattr(data.context, "server", None), "address", None))
+    result = live.admit_tls(sni, ech_hidden=ech_hidden, destination_port=port)
     if result.action == "passthrough":
         data.ignore_connection = True
         return

@@ -280,17 +280,21 @@ class BoundConnectionRegistry:
         sni: str | None,
         ech_hidden: bool,
         static_passthrough: tuple[Selector, ...],
+        destination_port: int | None = None,
     ) -> AdmissionResult:
         """Recheck the active epoch and capacity in one critical section."""
         with self._lock:
             if self._admission_disabled:
                 return AdmissionResult("deny", "admission_disabled")
+            if self._closed:
+                return AdmissionResult("deny", "snapshot_missing")
             result = classify(
                 identity=identity,
                 sni=sni,
                 ech_hidden=ech_hidden,
                 static_passthrough=static_passthrough,
                 view=self._view,
+                destination_port=destination_port,
             )
             if result.action != "needs_registry":
                 return AdmissionResult(result.action, result.reason)

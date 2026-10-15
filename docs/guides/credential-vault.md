@@ -543,10 +543,36 @@ When the experimental revision runtime is enabled, the sidecar installs an
 immutable decision snapshot into the mitmproxy child over a private
 authenticated IPC channel and admits traffic per connection and per request:
 
-- **Decisions come only from the installed snapshot.** Unbound HTTPS passes
+- **Dynamic decisions use the installed snapshot.** Unbound HTTPS passes
   through opaquely; bound hosts are decrypted only with a registry admission.
-  Unknown, bootstrapping, or mismatched state denies — the mode never falls
-  back to decrypt-all or dynamic pass-through.
+  Unknown identity denies. For a known identity, ECH, no-SNI and validated
+  static TLS/443 bypass retain their early precedence, including during
+  bootstrap. Other unknown, bootstrapping or mismatched state denies.
+- **Static TLS/443 bypass is operator-owned.** Set
+  `OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS` to a JSON array of exact
+  FQDNs or leftmost `*.` selectors, for example
+  `["status.example.com","*.logs.example.com"]`. A wildcard covers all proper
+  subdomains, including multiple labels, but not its apex. Go normalizes IDNA,
+  case, surrounding whitespace and one root dot, then freezes a sorted unique
+  list. Unset and `[]` mean empty; explicit empty text is an error. JSON input
+  and canonical output each have a 64 KiB limit; at most 256 input entries are
+  allowed before deduplication. IPs, URLs, ports and regexes are rejected.
+- **Migrate native bypass options before enabling live admission.** Both
+  effective mitmproxy `ignore_hosts` and `allow_hosts` must remain empty.
+  Static selectors run in the typed TLS hook at actual destination port 443,
+  not in native regex options. HTTP/80 behavior and network policy are unchanged.
+  Non-empty selectors cannot be combined with a chained upstream proxy.
+  Explicit use of this variable outside live mode is rejected. Legacy regex
+  behavior remains unchanged when the variable is unset. Existing `tcp_hosts`
+  may still bypass HTTP credential handling; this change does not establish a
+  general addon/options isolation boundary.
+- **TLS overlap is rejected before publication.** Any semantic intersection
+  between a static selector and an HTTPS/443 binding rejects the complete
+  Vault or Policy candidate before IPC prepare, policy persistence or nft
+  application. Methods and paths do not exempt an overlap. HTTP-only bindings
+  remain eligible. The child independently rejects overlap before staging.
+  The list cannot be changed by a Vault update and adds no snapshot fields;
+  changing it requires replacing the sidecar process.
 - **Sticky recovery, no same-sidecar restart.** Any terminal outcome with
   unknown external effects (a mutation whose remote result cannot be
   confirmed, a session cleanup failure, an unexpected child exit) latches a

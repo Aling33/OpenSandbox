@@ -4,7 +4,7 @@ Transparent mode starts `mitmdump --mode transparent` inside the sidecar and red
 
 - **No application changes**: no need to set `HTTP_PROXY`; app traffic is intercepted transparently.
 - **Observability and extensibility**: use mitm scripts for header injection, auditing, and debugging.
-- **Controlled bypass**: use `ignore_hosts` for pass-through TLS (forward only, no decryption).
+- **Controlled bypass**: legacy mode uses `ignore_hosts`; the experimental live runtime uses typed static TLS/443 selectors (forward only, no decryption).
 
 Typical use case: add L7 visibility/processing at the egress boundary without changing the application networking stack.
 
@@ -37,6 +37,46 @@ export OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT=/path/to/your/addon.py,/path/to/anoth
 To bypass decryption for selected domains, edit the baked-in
 `components/egress/mitmproxy/config.yaml` and rebuild the image — see
 "Static Configuration (config.yaml)" below.
+
+## Experimental live static TLS bypass
+
+For the default-off live revision runtime, leave both effective `ignore_hosts`
+and `allow_hosts` empty and configure the operator selector list instead:
+
+```bash
+export OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS='["status.example.com","*.logs.example.com"]'
+```
+
+This does not enable the live runtime or add public API/Fast Sandbox support.
+Explicitly setting the variable without live mode is an error. Unset or `[]`
+means no static selectors; empty text is invalid. Only exact FQDNs and leftmost
+wildcards are accepted. Wildcards include nested subdomains and exclude the
+apex. Go normalizes IDNA/case/one root dot, sorts and deduplicates the list once.
+Input and canonical child JSON each must fit in 64 KiB, with at most 256 input
+entries before deduplication. IPs, ports, URLs and raw regexes are invalid.
+
+The child requires a canonical handoff even for an empty list and rejects
+non-empty native `ignore_hosts`/`allow_hosts` at startup and on updates. Do not
+translate these selectors into anchored regexes: native Host matching can bypass
+the TLS hook on HTTP/80. Typed static matching uses the actual TLS destination
+port 443; HTTP/80, other ports and network allow/deny rules gain no exception.
+A known identity can use static bypass during bootstrap without a snapshot or
+registry slot, after the existing ECH/no-SNI decisions.
+
+HTTPS/443 bindings may not overlap static selectors, regardless of method or
+path. Vault and Policy candidates are rejected before IPC and Policy side
+effects; the child also validates before staging. HTTP-only bindings are not
+excluded. The list is immutable for the sidecar lifetime; replace the sidecar
+to change it. Non-empty lists are incompatible with chained upstream proxies.
+Legacy deployments with the variable unset retain their previous behavior.
+Existing `tcp_hosts` has separate L7 bypass implications that are not addressed
+by this feature. See the [credential vault guide](../../../docs/guides/credential-vault.md#experimental-live-credential-bound-admission-osep-0023).
+
+Verification must distinguish loopback/SOCKS TLS tests from Linux transparent
+original-destination behavior. Transparent acceptance requires real destination
+443, an opaque origin handshake without the proxy CA, bound-host injection,
+unchanged HTTP/80 behavior and nft denial of a static destination. A high port
+or SOCKS-only result cannot establish that acceptance.
 
 ## Configuration Reference
 
