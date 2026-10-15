@@ -690,6 +690,12 @@ else
   if ! nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '; then
     fail "precondition: subject a's interception rule must be installed before the up->down transition"
   fi
+  # Kill the up generation FIRST: the interception table intentionally
+  # survives the daemon (fail closed), so the down generation's startup
+  # cleanup is what must remove it.
+  kill "${EGRESS_PID}" 2>/dev/null
+  wait "${EGRESS_PID}" 2>/dev/null || true
+  EGRESS_PID=""
   CA_SEED_DIR="" EXPECT_MITM_DOWN=1 EGRESS_MITM=1 start_egress
   if nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '; then
     fail "up->down transition must remove the interception table (stale DNAT = blackhole)"
