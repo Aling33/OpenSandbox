@@ -66,6 +66,13 @@ const (
 	VaultRelayPathPrefix = "/vault/"
 )
 
+// EnvEgressVaultDir (fast-sandbox profile): directory for the per-subject
+// vault files on the Pod-scoped emptyDir volume. Empty/unset keeps the vault
+// memory-only; the sidecar profile never persists.
+const (
+	EnvEgressVaultDir = "OPENSANDBOX_EGRESS_VAULT_DIR"
+)
+
 const (
 	EnvBlockDoH443               = "OPENSANDBOX_EGRESS_BLOCK_DOH_443"
 	EnvDoHBlocklist              = "OPENSANDBOX_EGRESS_DOH_BLOCKLIST"

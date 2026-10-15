@@ -116,6 +116,18 @@ sidecar replacement or restart also creates a new in-memory vault and requires
 the same re-injection procedure.
 :::
 
+::: info Fast-sandbox profile: egress-local persistence
+The fast-sandbox profile keeps the vault as memory **plus one file per
+sandbox** under `OPENSANDBOX_EGRESS_VAULT_DIR` (a Pod-scoped `emptyDir`). An
+egress container restart inside the live Pod recovers locally when the Fastlet
+replays the bindings — no server re-push is needed, and the vault files die
+with the Pod, so a Kubernetes pause/resume still follows the re-injection
+procedure above. The files are plaintext v1: the vault volume is part of the
+credential trust surface (mount it with `medium: Memory` to keep plaintext off
+node disk). See
+[fast-sandbox networking](/architecture/fast-sandbox/networking#credential-delivery).
+:::
+
 ## Service Mesh Compatibility
 
 Credential Vault depends on the egress sidecar's transparent redirect and MITM path. If the sandbox pod is also injected with a transparent service-mesh sidecar such as Istio/Envoy, both layers will try to intercept outbound traffic in the same network namespace. OpenSandbox does not currently support that combination for Credential Vault.

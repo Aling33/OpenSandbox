@@ -240,4 +240,11 @@ type StatusResponse struct {
 	MitmCaDown bool `json:"mitmCaDown,omitempty"`
 	// MitmCaError carries the addon-down reason (empty when up).
 	MitmCaError string `json:"mitmCaError,omitempty"`
+
+	// Vault persistence health (OSEP-0022 stage 2, additive): Recovery is
+	// true while the recovery latch freezes vault writes until restart;
+	// DegradedVaults lists subjects whose persisted vault failed to load
+	// (interception fails closed for them; a successful write clears it).
+	Recovery       bool     `json:"vaultRecovery,omitempty"`
+	DegradedVaults []string `json:"degradedVaults,omitempty"`
 }

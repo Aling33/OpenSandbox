@@ -329,6 +329,26 @@ func (v *Store) Patch(req MutationRequest, pol *policy.NetworkPolicy) (State, er
 	return v.sanitizedLocked(), nil
 }
 
+// Reload installs an exact revision from durable state — the egress-restart
+// recovery path (vault file → memory at registration). The full validation
+// pipeline runs against pol; on error the store keeps its previous contents
+// and the caller treats the subject's vault as degraded. Per-credential
+// metadata revisions are not part of the file format: after a reload every
+// record carries the reloaded file revision.
+func (v *Store) Reload(revision int64, req CreateRequest, pol *policy.NetworkPolicy) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if revision < 1 {
+		return fmt.Errorf("vault reload revision %d must be positive", revision)
+	}
+	credentials, bindings, err := v.buildCreate(req, pol, revision)
+	if err != nil {
+		return err
+	}
+	v.publishLocked(true, revision, credentials, bindings)
+	return nil
+}
+
 func (v *Store) Delete() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
