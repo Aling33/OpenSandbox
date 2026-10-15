@@ -56,6 +56,16 @@ const (
 // action envelope carries the subject identity — there is no proxy-injected
 // routing header.
 
+// Relay vault surface (OSEP-0022): /vault/{sandboxUid} — the internal
+// server↔egress contract terminated by the FastPath handler-relay. Every op
+// may carry the expectedIncarnation precondition (the owning runtime
+// instance recorded at SET_BINDING); a mismatch is a 412.
+const (
+	EgressVaultIncarnationHeader = "X-Fast-Sandbox-Incarnation"
+
+	VaultRelayPathPrefix = "/vault/"
+)
+
 const (
 	EnvBlockDoH443               = "OPENSANDBOX_EGRESS_BLOCK_DOH_443"
 	EnvDoHBlocklist              = "OPENSANDBOX_EGRESS_DOH_BLOCKLIST"
