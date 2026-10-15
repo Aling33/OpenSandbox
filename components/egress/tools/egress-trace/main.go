@@ -157,6 +157,14 @@ func (p *NetworkPolicy) summary() string {
 	return fmt.Sprintf("default=%s rules=%d", p.DefaultAction, len(p.Egress))
 }
 
+func (p *NetworkPolicy) fingerprint() string {
+	var b strings.Builder
+	for _, r := range p.Egress {
+		fmt.Fprintf(&b, "%s:%s;", r.Action, r.Target)
+	}
+	return b.String()
+}
+
 // matchIP returns "" when no static IP/CIDR rule matches (any allow must then
 // be DNS-learned).
 func (p *NetworkPolicy) matchIP(ip netip.Addr) (string, string) {
@@ -226,14 +234,30 @@ type nftSet struct {
 	Elem  []json.RawMessage `json:"elem"`
 }
 
-type nftElemValue struct {
-	Val     any     `json:"val"`
-	Timeout float64 `json:"timeout"`
-	Expires float64 `json:"expires"`
-}
-
-type nftTimeoutElem struct {
-	Elem nftElemValue `json:"elem"`
+// intervalFromAny decodes nft interval values: {"prefix":{"addr","len"}} or
+// {"range":[from,to]}. Returns "" for anything else.
+func intervalFromAny(v any) string {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if p, ok := m["prefix"].(map[string]any); ok {
+		addr, _ := p["addr"].(string)
+		length, _ := p["len"].(float64)
+		pfx, err := netip.ParsePrefix(addr + "/" + strconv.Itoa(int(length)))
+		if err == nil {
+			return pfx.String()
+		}
+		return ""
+	}
+	if rg, ok := m["range"].([]any); ok && len(rg) == 2 {
+		from, _ := rg[0].(string)
+		to, _ := rg[1].(string)
+		if from != "" && to != "" {
+			return from + "-" + to
+		}
+	}
+	return ""
 }
 
 type leaseKey struct {
@@ -268,12 +292,15 @@ func (w *nftWatcher) poll() (added, removed []leaseChange, err error) {
 		return nil, nil, err
 	}
 	next := map[leaseKey]float64{}
-	addElem := func(setName, val string, expires float64) {
-		addr, err := netip.ParseAddr(val)
-		if err != nil {
+	addEntry := func(setName, val string, expires float64) {
+		if addr, err := netip.ParseAddr(val); err == nil {
+			next[leaseKey{setName, addr.String()}] = expires
 			return
 		}
-		next[leaseKey{setName, addr.String()}] = expires
+		// Interval sets render static CIDR (prefix) and range elements here.
+		if _, err := netip.ParsePrefix(val); err == nil || strings.Contains(val, "-") {
+			next[leaseKey{setName, val}] = expires
+		}
 	}
 	for _, obj := range doc.Nftables {
 		var s nftSet
@@ -283,22 +310,33 @@ func (w *nftWatcher) poll() (added, removed []leaseChange, err error) {
 		for _, raw := range s.Elem {
 			var plain string
 			if json.Unmarshal(raw, &plain) == nil {
-				addElem(s.Name, plain, 0)
+				addEntry(s.Name, plain, 0)
 				continue
 			}
-			var wrapped nftTimeoutElem
-			if json.Unmarshal(raw, &wrapped) != nil {
+			// Timeout elements are wrapped in {"elem": ...}; bare interval
+			// elements ({"prefix":...}/{"range":[...]}) are not.
+			var obj map[string]any
+			if json.Unmarshal(raw, &obj) != nil {
 				continue
 			}
-			val, ok := wrapped.Elem.Val.(string)
-			if !ok {
+			if inner, ok := obj["elem"].(map[string]any); ok {
+				expires, _ := inner["expires"].(float64)
+				if expires == 0 {
+					expires, _ = inner["timeout"].(float64)
+				}
+				switch v := inner["val"].(type) {
+				case string:
+					addEntry(s.Name, v, expires)
+				default:
+					if cidr := intervalFromAny(v); cidr != "" {
+						addEntry(s.Name, cidr, expires)
+					}
+				}
 				continue
 			}
-			expires := wrapped.Elem.Expires
-			if expires == 0 {
-				expires = wrapped.Elem.Timeout
+			if cidr := intervalFromAny(obj); cidr != "" {
+				addEntry(s.Name, cidr, 0)
 			}
-			addElem(s.Name, val, expires)
 		}
 	}
 	for k, expires := range next {
@@ -332,7 +370,7 @@ func (w *nftWatcher) hasIP(ip string) (bool, float64) {
 		return false, 0
 	}
 	for k, expires := range w.sets {
-		if strings.Contains(strings.ToLower(k.Set), "allow") && k.IP == addr.String() {
+		if strings.HasPrefix(k.Set, "dyn_allow") && k.IP == addr.String() {
 			return true, expires
 		}
 	}
@@ -375,6 +413,10 @@ func (w *flowWatcher) poll() (established, closed []flowKey, err error) {
 		for _, line := range strings.Split(string(data), "\n")[1:] {
 			fields := strings.Fields(line)
 			if len(fields) < 4 {
+				continue
+			}
+			_, lport, ok := parseProcAddr(fields[1])
+			if !ok || isEgressListener(lport) {
 				continue
 			}
 			ip, port, ok := parseProcAddr(fields[2])
@@ -438,6 +480,12 @@ func isLoopback(ip string) bool {
 	return err != nil || addr.IsLoopback() || addr.IsUnspecified()
 }
 
+// isEgressListener drops inbound legs: accepted sockets on the sidecar's own
+// listeners have the listener port as the LOCAL port.
+func isEgressListener(port string) bool {
+	return port == "18080" || port == "15353"
+}
+
 func runTrace(addr, nftBin string, interval time.Duration, proc string) {
 	bar := paint(cDim, "─────────────────────────────────────────────────────────────")
 	fmt.Println(bar)
@@ -475,11 +523,11 @@ func runTrace(addr, nftBin string, interval time.Duration, proc string) {
 			}
 		} else {
 			pol = st.Policy
-			sum := st.Mode + " | " + pol.summary()
+			sum := st.Mode + "|" + pol.fingerprint()
 			if sum != lastSummary {
 				fmt.Printf("%s %s %s %s\n", stampDim(), paint(cBold, "POLICY"),
 					paint(cBold, "mode="+st.Mode),
-					paint(cDim, fmt.Sprintf("default=%s rules=%d", pol.DefaultAction, len(pol.Egress))))
+					paint(cDim, pol.summary()))
 				for _, r := range pol.Egress {
 					color := cGreen
 					if orDeny(r.Action) == "deny" {
@@ -506,6 +554,8 @@ func runTrace(addr, nftBin string, interval time.Duration, proc string) {
 					} else {
 						srcColor = cGreen
 					}
+				} else if strings.Contains(lc.IP, "/") || strings.Contains(lc.IP, "-") {
+					src, srcColor = "static CIDR rule", cGreen
 				}
 				ttl := ""
 				if lc.Expires > 0 {
@@ -541,6 +591,8 @@ func runTrace(addr, nftBin string, interval time.Duration, proc string) {
 					note, noteColor = "static allow "+target, cGreen
 				} else if action == "deny" {
 					note, noteColor = "UNEXPECTED: static deny target connected", cRed+cBold
+				} else if pol != nil && orDeny(pol.DefaultAction) == "allow" {
+					note, noteColor = "default allow", cGreen
 				}
 				fmt.Printf("%s %s %s %s %s\n",
 					stampDim(),
@@ -594,9 +646,9 @@ func runProbe(addr, domain string) int {
 
 	r := &net.Resolver{
 		PreferGo: true,
-		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var d net.Dialer
-			return d.DialContext(ctx, "udp", dnsProxyAddr)
+			return d.DialContext(ctx, network, dnsProxyAddr)
 		},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
@@ -605,13 +657,17 @@ func runProbe(addr, domain string) int {
 	switch {
 	case err == nil:
 		fmt.Printf("dns resolution : %s\n", strings.Join(addrs, ", "))
-		fmt.Println("outcome        : " + paint(cGreen, "resolved; expect an nft lease for these IPs and an admitted dial"))
+		if st != nil && st.EnforcementMode == "dns" {
+			fmt.Println("outcome        : " + paint(cGreen, "resolved and allowed; DNS-only enforcement — admission is decided by name, there is no packet layer"))
+		} else {
+			fmt.Println("outcome        : " + paint(cGreen, "resolved; expect an nft lease for these IPs and an admitted dial"))
+		}
 	case isNXDOMAIN(err):
 		fmt.Println("dns resolution : NXDOMAIN")
 		if action == "deny" {
 			fmt.Println("outcome        : " + paint(cRed, "denied by policy at the DNS layer (no network attempt will happen)"))
 		} else {
-			fmt.Println("outcome        : " + paint(cYellow, "allowed by policy but the name does not exist upstream"))
+			fmt.Println("outcome        : " + paint(cYellow, "not resolved — either the name does not exist upstream, or a platform overlay (deny.always) denies it; GET /policy does not include overlays"))
 		}
 	default:
 		fmt.Printf("dns resolution : error (%v)\n", err)
