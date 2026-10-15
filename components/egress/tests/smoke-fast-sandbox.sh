@@ -662,15 +662,17 @@ else
   bind_and_ready a 10.10.0.5 10 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
 
   # Chained data plane (sandbox -> DNAT -> shared mitm -> CONNECT relay -> ext):
-  # the client=10.99.0.1 oracle proves interception, the relay counter proves
-  # the upstream dial went through the chained proxy and never direct.
+  # the relay counter proves the upstream dial went through the chained proxy
+  # (only the mitm chain can reach it — direct sandbox CONNECT is dropped
+  # profile-wide), and client=10.99.0.2 is the relay's local source as seen
+  # by the ext server, proving the request arrived via the relay.
   before="$(relay_count)"
   out="$(ip netns exec osb-sandbox-a curl -s -m 8 -H 'Host: ext.test' http://10.99.0.2/)"
-  echo "${out}" | grep -qi "client=10.99.0.1" || fail "chained http lost mitm interception; got: ${out}"
+  echo "${out}" | grep -qi "client=10.99.0.2" || fail "chained http did not arrive via the CONNECT relay; got: ${out}"
   after="$(relay_count)"
   [ "${after}" -gt "${before}" ] || fail "chained http must traverse the forward relay (count ${before} -> ${after})"
   out="$(ip netns exec osb-sandbox-a curl -sk -m 8 -H 'Host: ext.test' https://10.99.0.2/)"
-  echo "${out}" | grep -qi "client=10.99.0.1" || fail "chained https lost mitm interception; got: ${out}"
+  echo "${out}" | grep -qi "client=10.99.0.2" || fail "chained https did not arrive via the CONNECT relay; got: ${out}"
   [ "$(relay_count)" -gt "${after}" ] || fail "chained https must traverse the CONNECT tunnel"
   pass "chained data plane (sandbox -> mitm -> CONNECT relay -> ext, http + https)"
 
@@ -711,7 +713,7 @@ else
     fail "containment must survive egress restart"
   fi
   out="$(ip netns exec osb-sandbox-a curl -s -m 8 -H 'Host: ext.test' http://10.99.0.2/)"
-  echo "${out}" | grep -qi "client=10.99.0.1" || fail "chained path must work after restart; got: ${out}"
+  echo "${out}" | grep -qi "client=10.99.0.2" || fail "chained path must work after restart; got: ${out}"
   pass "upstream containment across egress restart (drop re-seeded + chained path intact)"
 fi
 
