@@ -199,7 +199,7 @@ func (r *MemoryRegistry) Resolve(key SubjectKey) (Subject, bool) {
 
 // ApplyPolicy stores the user policy and activates the subject. The subject
 // must have an observed slot; otherwise ErrUnknownSubject is returned and the
-// caller caches the push as pending.
+// caller fails the operation (fail closed).
 func (r *MemoryRegistry) ApplyPolicy(s Subject, pol *policy.NetworkPolicy) error {
 	if pol == nil {
 		pol = policy.DefaultDenyPolicy()

@@ -20,9 +20,9 @@
 //
 //	fastlet action protocol --(SET_BINDING / LIFECYCLE_HOOK / REMOVE_BINDING)-->
 //	  fastSandboxPolicyServer:18080 (loopback): subject lifecycle + deny-first nft,
-//	  policy activation on sandbox.data-plane-ready
-//	proxy route --(UID header)--> fastSandboxPolicyServer:18080 (loopback)
-//	  policy/credential pushes routed per subject (vault memory-only)
+//	  policy activation on sandbox.data-plane-ready (the binding input is the
+//	  policy; the credential vault is egress-held behind the FastPath
+//	  handler-relay, OSEP-0022)
 //	DNS: one shared proxy, per-query policy via source IP dispatch
 //
 // Subject lifecycle is driven entirely by the Fastlet (Sandbox Actions
@@ -115,8 +115,7 @@ func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.Upstream
 	log.Infof("fast-sandbox nftables table reset (stale rules cleared)")
 
 	reg := subject.NewRegistry(alwaysDeny, alwaysAllow)
-	pendingTTL := time.Duration(constants.EnvIntOrDefault(constants.EnvPendingPushTTL, constants.DefaultPendingPushTTL)) * time.Second
-	fastSandboxSrv := newFastSandboxPolicyServer(ctx, reg, podNft, pendingTTL)
+	fastSandboxSrv := newFastSandboxPolicyServer(ctx, reg, podNft)
 
 	// Shared mitmproxy (OSEP-0022 A1): one mitmdump in the Pod netns serving
 	// every sandbox. Started BEFORE the HTTP listener so subjects can never
@@ -213,9 +212,7 @@ func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.Upstream
 			log.Fatalf("fast-sandbox policy server error: %v", err)
 		}
 	})
-	log.Infof("fast-sandbox policy server listening on %s (actions + UID-header routed)", httpAddr)
-
-	fastSandboxSrv.StartPendingSweep(ctx)
+	log.Infof("fast-sandbox policy server listening on %s (Sandbox Actions Handler)", httpAddr)
 
 	// Per-subject connection refresh: active TCP connections keep their
 	// dynamic leases alive (bucketed by source IP from the Pod netns

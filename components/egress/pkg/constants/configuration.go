@@ -28,8 +28,7 @@ const (
 // Fast Sandbox profile: the egress control plane serves N sandboxes
 // sharing one host/network domain; sidecar remains the default profile.
 const (
-	EnvEgressProfile  = "OPENSANDBOX_EGRESS_PROFILE"
-	EnvPendingPushTTL = "OPENSANDBOX_EGRESS_PENDING_PUSH_TTL"
+	EnvEgressProfile = "OPENSANDBOX_EGRESS_PROFILE"
 )
 
 const (
@@ -53,14 +52,9 @@ const (
 )
 
 // Fast Sandbox-profile HTTP listener and trust model: the listener binds the Pod
-// netns loopback only; the fastlet proxy and the Fastlet's action dispatcher
-// are the only peers. The proxy injects the UID header that routes a push to
-// its subject; the action dispatcher carries the identity in the envelope.
-const (
-	EgressSubjectUIDHeader        = "X-Fast-Sandbox-Uid"
-	EgressSubjectGenerationHeader = "X-Fast-Sandbox-Generation"
-	DefaultPendingPushTTL         = 30
-)
+// netns loopback only; the Fastlet's action dispatcher is the only peer. The
+// action envelope carries the subject identity — there is no proxy-injected
+// routing header.
 
 const (
 	EnvBlockDoH443               = "OPENSANDBOX_EGRESS_BLOCK_DOH_443"

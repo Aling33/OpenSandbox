@@ -39,20 +39,25 @@ stateDiagram-v2
 Recovery after egress restart: `ApplyReset` wipes the table, the Handler
 serves a new `instanceId`, the Fastlet detects it and replays the latest
 `SET_BINDING` followed by the already-reached Hooks (every live subject
-re-enters `denying` through the same registration path), and the server's
-reconciliation re-pushes credential revisions.
+re-enters `denying` through the same registration path), and the egress-held
+vault state is recovered from the egress-local vault file at registration
+(no server re-push).
 
-## 2. Control plane: policy and credential push
+## 2. Control plane: policy and credential delivery
 
 The egress listener binds the Pod netns loopback only. It serves the action
-endpoints (Fastlet) and the proxy-route policy/credential surfaces
-(fastlet-proxy is the only peer and injects `X-Fast-Sandbox-Uid` to route a
-push to a subject). There is no sandbox-reachable policy surface.
+endpoints (Fastlet) and `/healthz` — there is no sandbox-reachable control
+surface and no proxy-route surface (the earlier fastlet-proxy channel was
+superseded: identity validation moved from a proxy-injected header into the
+FastPath control plane).
 
-Policy itself rides `SET_BINDING` (the CRD binding is the complete desired
-value; updates arrive as new bindings). The proxy route carries credential
-vault revisions (memory-only, OSEP-0012 — the binding input is NOT a secret
-transport) and runtime policy operations.
+Two concerns, two carriers: policy rides `SET_BINDING` (the CRD binding is
+the complete desired value; updates arrive as new bindings). The credential
+vault is egress-held and rides the FastPath handler-relay
+(`InvokeHandlerAction`): the server pushes complete vault revisions to the
+relay-only vault surface (`/vault/{sandboxUid}`) and gets a synchronous,
+egress-validated ack. Vault state lives in egress memory plus an
+egress-local per-subject file (OSEP-0022).
 
 ```mermaid
 sequenceDiagram
@@ -63,7 +68,7 @@ sequenceDiagram
     participant N as nftables<br/>(table opensandbox-fast-sandbox)
     participant D as DNS proxy<br/>(gateway:53, shared)
     participant S as Server (OpenSandbox)
-    participant P as fastlet-proxy
+    participant FP as FastPath
 
     F->>E: SET_BINDING (sandbox, revision, attachment, policy input)
     E->>R: RegisterAndEnforce (denying, deny-first)
@@ -74,15 +79,12 @@ sequenceDiagram
     E->>R: ApplyPolicy (denying -> active, effective = user + always rules)
     E->>N: atomic swap (subject chain + static sets, single nft -f)
     E->>D: per-query selector now returns this subject's policy
-    Note over S,P: create-then-configure (server side)
-    S->>P: PUT /v1/sandboxes/{sid}/egress/credential-vault
-    P->>E: forward (credential verified, X-Fast-Sandbox-Uid added)
-    alt subject registered
-        E->>E: apply vault revision (memory-only per subject)
-    else binding not observed yet (race)
-        E->>E: cache as pending (TTL, X-Fast-Sandbox-Generation check)
-        E-->>P: 202 Accepted (push applied on registration)
-    end
+    Note over S,FP: create-then-configure (server side)
+    S->>FP: InvokeHandlerAction (vault op, ownership validated)
+    FP->>F: relay to the handler
+    F->>E: POST /vault/{uid} (loopback)
+    E->>E: apply vault revision (egress-held: memory + file)
+    E-->>S: relayed ack {revision, state}
 ```
 
 ## 3. Data plane: outbound traffic flow
@@ -136,8 +138,9 @@ flowchart LR
 
 ## 4. Credential vault
 
-Vault revisions are pushed over the proxy route and held **memory-only** per
-subject (OSEP-0012 model — no Secret volume, nothing written to egress disk).
+Vault revisions are pushed over the FastPath handler-relay and held
+**egress-side** per subject (memory plus an egress-local file, OSEP-0022 —
+no Secret volume, nothing in the CRD).
 The shared mitmdump instance selects the subject's vault by the client's
 source IP (transparent REDIRECT/DNAT preserves it). It keeps an immutable
 snapshot per subject and conditionally checks the private Unix-socket endpoint
@@ -166,16 +169,18 @@ dependency whenever transparent interception is enabled.
 sequenceDiagram
     autonumber
     participant S as Server
-    participant P as fastlet-proxy
+    participant FP as FastPath
+    participant F as Fastlet (relay hop)
     participant E as Egress listener
-    participant V as Subject vault store<br/>(memory-only, per subject)
+    participant V as Subject vault store<br/>(egress-held: memory + file)
     participant M as mitmdump (shared)
     participant C as Sandbox client
 
-    S->>P: PUT /v1/sandboxes/{sid}/egress/credential-vault (full revision)
-    P->>E: forward (UID header -> subject)
-    E->>V: atomically replace revision (memory-only)
-    V-->>E: mutation response acknowledges active revision
+    S->>FP: InvokeHandlerAction (vault op)
+    FP->>F: relay to the handler (ownership validated)
+    F->>E: POST /vault/{uid} (full revision, loopback)
+    E->>V: atomically replace revision (persist + apply)
+    E-->>S: relayed ack {revision, state}
     C->>M: HTTP(S) flow (DNAT preserves source IP)
     M->>M: script: client source IP -> subject -> subject's vault
     M->>V: GET _active + If-None-Match cached opaque ETag
@@ -198,7 +203,7 @@ sequenceDiagram
 | Transition / event | Guarantee |
 |---|---|
 | SET_BINDING, no data-plane-ready yet | deny-first: empty nft sets + drop chain, gateway DNS REDIRECT, DNS NXDOMAIN |
-| Vault push before SET_BINDING | cached pending (TTL); applied on registration; generation mismatch discards it |
+| Vault push before data-plane-ready | held at the same barrier as the policy; applies when the Hook lands |
 | data-plane-ready lands | one atomic `nft -f` transaction (chain + static sets); DNS selector switches per subject |
 | Rebind (new runtimeInstanceId/attachmentId) | policy discarded in registry AND nft chain/sets/DNS leases force-reset |
 | Unload (REMOVE_BINDING) | chain + all sets removed in one transaction; stale fence ignored |
@@ -219,5 +224,5 @@ sequenceDiagram
 | Subject state machine | `pkg/subject` (`MemoryRegistry`, lifecycle hooks) |
 | Per-subject nft rules | `pkg/fastsandboxnft` (dispatch rules, atomic swap, reset) |
 | Actions endpoints + lifecycle mapping | `fastsandbox_actions.go` (SET_BINDING / LIFECYCLE_HOOK / REMOVE_BINDING) |
-| Policy/vault HTTP surface | `fastsandbox_server.go` (UID routing, pending cache, per-subject vault) |
+| Policy/vault HTTP surface | `fastsandbox_server.go` (actions mux, per-subject vault; vault writes arrive via the OSEP-0022 relay surface) |
 | DNS per-query dispatch | `pkg/dnsproxy` `SetQueryPolicySelector` |

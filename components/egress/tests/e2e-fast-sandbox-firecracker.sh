@@ -17,8 +17,9 @@
 # High-fidelity fast-sandbox deployment simulation with a REAL Firecracker
 # microVM: egress in a container sharing the fastlet container's Pod netns
 # (docker bridge), a firecracker VM as the sandbox, real CA delivery into the
-# VM rootfs, real system-trust installation, and a real TLS credential-vault
-# round trip. Also measures the CA-installation cost (the point of the test).
+# VM rootfs, real system-trust installation, and a real TLS round trip through
+# the egress MITM (credential delivery returns with the OSEP-0022 relay
+# surface). Also measures the CA-installation cost (the point of the test).
 #
 # Topology:
 #
@@ -407,13 +408,12 @@ wait_for_egress() {
 wait_for_egress
 
 # ---------------------------------------------------------------------------
-# Two sandbox VMs with DIFFERENT policies and credential vaults — the
-# deployment's real terminal state. vm1 binds ext.test -> fc-secret,
-# vm2 binds alt.test -> fc-secret-2; each VM probes BOTH hosts to prove
-# cross-subject isolation on the real data plane.
+# Two sandbox VMs with DIFFERENT policies — the deployment's real terminal
+# state. vm1 binds ext.test, vm2 binds alt.test; each VM probes BOTH hosts to
+# prove cross-subject isolation on the real data plane.
 # ---------------------------------------------------------------------------
-VM_NETNS1="osb-fc-vm1"; VM_IP1="10.30.0.5"; VM_TARGET1="ext.test"; VM_SECRET1="fc-secret"
-VM_NETNS2="osb-fc-vm2"; VM_IP2="10.30.0.6"; VM_TARGET2="alt.test"; VM_SECRET2="fc-secret-2"
+VM_NETNS1="osb-fc-vm1"; VM_IP1="10.30.0.5"; VM_TARGET1="ext.test"
+VM_NETNS2="osb-fc-vm2"; VM_IP2="10.30.0.6"; VM_TARGET2="alt.test"
 VM_GW="10.30.0.1"
 VM_ROOTFS1="${WORK_DIR}/vm1-rootfs.ext4"; VM_ROOTFS_MNT1="${WORK_DIR}/vm1-rootfs-mnt"
 VM_ROOTFS2="${WORK_DIR}/vm2-rootfs.ext4"; VM_ROOTFS_MNT2="${WORK_DIR}/vm2-rootfs-mnt"
@@ -475,25 +475,6 @@ activate_subject() {
 EOF
 )"
   pod_exec curl -sSf -XPOST "http://127.0.0.1:${POLICY_PORT}/_fastlet/v1/actions" -d "${body}" >/dev/null
-}
-
-# push_vault <uid> <target> <secret>: per-subject credential vault (the
-# policy already arrived with SET_BINDING).
-push_vault() {
-  local uid="$1" target="$2" secret="$3"
-  # vm2 must not be able to bind vm1's host (per-subject policy isolation):
-  # tested BEFORE the real vault exists, so the 400 comes from the policy
-  # validation, not from a duplicate-vault ErrExists.
-  if [ "${uid}" = "vm2" ]; then
-    local code
-    code="$(pod_exec curl -s -o /dev/null -w '%{http_code}' -H "X-Fast-Sandbox-Uid: vm2" -XPOST \
-      "http://127.0.0.1:${POLICY_PORT}/credential-vault" \
-      -d '{"credentials":[{"name":"x","source":{"type":"inline","value":"leak"}}],"bindings":[{"name":"b","match":{"schemes":["http","https"],"hosts":["ext.test"]},"auth":{"type":"apiKey","name":"X-Api-Key","credential":"x"}}]}')"
-    [ "${code}" = "400" ] || fail "vm2 vault must reject a binding outside its policy (ext.test), got ${code}"
-  fi
-  pod_exec curl -sSf -H "X-Fast-Sandbox-Uid: ${uid}" -XPOST \
-    "http://127.0.0.1:${POLICY_PORT}/credential-vault" \
-    -d "{\"credentials\":[{\"name\":\"k\",\"source\":{\"type\":\"inline\",\"value\":\"${secret}\"}}],\"bindings\":[{\"name\":\"b\",\"match\":{\"schemes\":[\"http\",\"https\"],\"hosts\":[\"${target}\"]},\"auth\":{\"type\":\"apiKey\",\"name\":\"X-Api-Key\",\"credential\":\"k\"}}]}" >/dev/null
 }
 
 # deliver_ca <rootfs> <mnt> : fastlet loop-mount write of the egress CA
@@ -581,12 +562,10 @@ T_DNAT_READY="$(ts)"
 pass "egress up; CA exported at ${T0_CA_EXPORT}; both subjects registered deny-first (DNAT ready at ${T_DNAT_READY})"
 
 # ---------------------------------------------------------------------------
-info "Activating policies (data-plane-ready) + pushing credential vaults"
+info "Activating policies (data-plane-ready)"
 activate_subject vm1
 activate_subject vm2
-push_vault vm1 "${VM_TARGET1}" "${VM_SECRET1}"
-push_vault vm2 "${VM_TARGET2}" "${VM_SECRET2}"
-pass "policy active + vault pushed (vm1=${VM_TARGET1}/${VM_SECRET1}, vm2=${VM_TARGET2}/${VM_SECRET2})"
+pass "policies active (vm1=${VM_TARGET1}, vm2=${VM_TARGET2})"
 
 # ---------------------------------------------------------------------------
 info "Preparing the VM rootfs images (template copy + CA delivery per VM)"
@@ -614,11 +593,11 @@ watch_until 90 "vm1 bootstrap" "bootstrap start" "${VM_SERIAL1}"
 T4_BOOTSTRAP="$(ts)"
 watch_until 90 "vm1 CA installed" "CA installed" "${VM_SERIAL1}"
 T5_CA_HOST="$(ts)"
-watch_until 90 "vm1 curl result" "X-Api-Key" "${VM_SERIAL1}"
+watch_until 90 "vm1 curl result" "curl done" "${VM_SERIAL1}"
 T6_CURL_DONE="$(ts)"
 vm2_elapsed=0
 while [ "${vm2_elapsed}" -lt 90 ]; do
-  if grep -q "X-Api-Key" "${VM_SERIAL2}" 2>/dev/null; then break; fi
+  if grep -q "curl done" "${VM_SERIAL2}" 2>/dev/null; then break; fi
   sleep 0.2
   vm2_elapsed=$((vm2_elapsed + 1))
 done
@@ -664,31 +643,19 @@ T6_CA_CURL_TS="$(grep -oP '^\[\K[0-9.]+(?=\] curl done)' "${VM_SERIAL1}" | head 
 echo "=== vm1 console (tail) ==="
 grep -E "bootstrap|curl done|cross done" "${VM_SERIAL1}" | tail -8
 echo "--- vm1 result ---"
-grep -A5 "curl done" "${VM_SERIAL1}" | grep -E "X-Api-Key|client=" | head -4
+grep -A5 "curl done" "${VM_SERIAL1}" | grep -E "client=" | head -4
 echo "=== vm2 console (tail) ==="
 grep -E "bootstrap|curl done|cross done" "${VM_SERIAL2}" | tail -8
 echo "--- vm2 result ---"
-grep -A5 "curl done" "${VM_SERIAL2}" | grep -E "X-Api-Key|client=" | head -4
+grep -A5 "curl done" "${VM_SERIAL2}" | grep -E "client=" | head -4
 
-echo "=== credential checks ==="
-# own-host injection
-grep -A5 "curl done" "${VM_SERIAL1}" | grep -qi "X-Api-Key: fc-secret" \
-  || fail "vm1 credential injection missing"
+echo "=== TLS traversal checks ==="
+# own-host flow: the client=10.99.0.1 oracle proves the request traversed
+# the shared mitm (direct traffic shows the VM's own IP).
 grep -A5 "curl done" "${VM_SERIAL1}" | grep -q "client=10.99.0.1" \
   || fail "vm1 request did not traverse the shared mitm"
-grep -A5 "curl done" "${VM_SERIAL2}" | grep -qi "X-Api-Key: fc-secret-2" \
-  || fail "vm2 credential injection missing"
 grep -A5 "curl done" "${VM_SERIAL2}" | grep -q "client=10.99.0.1" \
   || fail "vm2 request did not traverse the shared mitm"
-# cross-subject isolation: neither VM may receive the OTHER's credential.
-# The cross host is outside the VM's own policy, so the request is typically
-# denied at DNS resolution already (the strongest isolation — the flow never
-# leaves the sandbox); it may also be proxied without a matching binding.
-# Either way: NO X-Api-Key may appear.
-grep -A5 "cross done" "${VM_SERIAL1}" | grep -qi "X-Api-Key" \
-  && fail "vm1 must NOT receive a credential for alt.test (vm2's host)"
-grep -A5 "cross done" "${VM_SERIAL2}" | grep -qi "X-Api-Key" \
-  && fail "vm2 must NOT receive a credential for ext.test (vm1's host)"
 # deny-path on the real data plane: the always-deny target (10.99.0.9, which
 # the ext netns DOES serve) must be dropped by the Pod INPUT chain — the
 # authoritative layer for MITM traffic in the firecracker form (A2 cannot
@@ -715,4 +682,4 @@ if [ -n "${T4_KERNEL_TS}" ] && [ -n "${T5_CA_TS}" ] && [ -n "${T6_CA_CURL_TS}" ]
   echo "  kernel start -> CA install:     $(awk "BEGIN{printf \"%.3f\", ${T5_CA_TS}-${T4_KERNEL_TS}}")s (guest clock)"
   echo "  CA install -> curl done:        $(awk "BEGIN{printf \"%.3f\", ${T6_CA_CURL_TS}-${T5_CA_TS}}")s (guest clock)"
 fi
-pass "real firecracker TLS + per-VM credential-vault e2e succeeded (two VMs, isolated policies)"
+pass "real firecracker TLS e2e succeeded (two VMs, isolated policies)"

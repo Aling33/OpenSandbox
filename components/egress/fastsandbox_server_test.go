@@ -23,16 +23,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/alibaba/opensandbox/egress/pkg/actionhandler"
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
+	"github.com/alibaba/opensandbox/egress/pkg/credentialvault"
 	"github.com/alibaba/opensandbox/egress/pkg/iptables"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
@@ -92,18 +91,14 @@ func fastSandboxTestServer(t *testing.T) (*fastSandboxPolicyServer, *subject.Mem
 	t.Helper()
 	reg := subject.NewRegistry(nil, nil)
 	nft := &fakeNft{}
-	srv := newFastSandboxPolicyServer(context.Background(), reg, nft, time.Minute)
+	srv := newFastSandboxPolicyServer(context.Background(), reg, nft)
 	// no-op the gateway DNS redirect (no iptables/nft in unit tests)
 	srv.dnsRedirectInstall = func(netip.Addr, int) error { return nil }
 	srv.dnsRedirectRemove = func() error { return nil }
 	return srv, reg, nft
 }
 
-func uidHeader(s subject.Subject) string {
-	return strings.TrimPrefix(string(s), "s-")
-}
-
-func doRequest(t *testing.T, srv *fastSandboxPolicyServer, method, path, uid, body string) *httptest.ResponseRecorder {
+func doRequest(t *testing.T, srv *fastSandboxPolicyServer, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	var rd *bytes.Reader
 	if body == "" {
@@ -112,9 +107,6 @@ func doRequest(t *testing.T, srv *fastSandboxPolicyServer, method, path, uid, bo
 		rd = bytes.NewReader([]byte(body))
 	}
 	req := httptest.NewRequest(method, path, rd)
-	if uid != "" {
-		req.Header.Set(constants.EgressSubjectUIDHeader, uid)
-	}
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 	return rec
@@ -123,7 +115,7 @@ func doRequest(t *testing.T, srv *fastSandboxPolicyServer, method, path, uid, bo
 // doAction posts an action envelope to the Fastlet dispatch endpoint.
 func doAction(t *testing.T, srv *fastSandboxPolicyServer, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	return doRequest(t, srv, http.MethodPost, constants.ActionsDispatchPath, "", body)
+	return doRequest(t, srv, http.MethodPost, constants.ActionsDispatchPath, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +231,7 @@ func setBindingAndReady(t *testing.T, srv *fastSandboxPolicyServer, reg *subject
 
 func TestActionsStatus(t *testing.T) {
 	srv, _, _ := fastSandboxTestServer(t)
-	rec := doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "", "")
+	rec := doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "")
 	require.Equal(t, http.StatusOK, rec.Code)
 	var status actionhandler.StatusResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &status))
@@ -248,7 +240,7 @@ func TestActionsStatus(t *testing.T) {
 	assert.NotEmpty(t, status.InstanceID)
 
 	// instanceId is stable for the process incarnation
-	rec = doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "", "")
+	rec = doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "")
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &status))
 	assert.Equal(t, srv.instanceID, status.InstanceID)
 }
@@ -260,14 +252,14 @@ func TestActionsStatusMirrorsMitmGate(t *testing.T) {
 	srv.mitmGate = gate
 	gate.SetReady(false)
 
-	rec := doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "", "")
+	rec := doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "")
 	require.Equal(t, http.StatusOK, rec.Code)
 	var status actionhandler.StatusResponse
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &status))
 	assert.False(t, status.Ready, "handler not ready while the MITM stack is pending")
 
 	gate.SetReady(true)
-	rec = doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "", "")
+	rec = doRequest(t, srv, http.MethodGet, constants.ActionsStatusPath, "")
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &status))
 	assert.True(t, status.Ready)
 }
@@ -287,9 +279,6 @@ func TestActionsSetBindingDenyFirstThenHookActivates(t *testing.T) {
 	require.Equal(t, subject.StateDenying, mustState(reg.Get(s)))
 	require.Len(t, nft.denyFirst, 1)
 	assert.Nil(t, reg.EffectivePolicy(s), "DNS must keep denying while the policy is pending")
-	rec = doRequest(t, srv, http.MethodGet, "/policy", uidHeader(s), "")
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Contains(t, rec.Body.String(), "denying")
 
 	// runtime-ready confirms; still denying
 	rec = doAction(t, srv, hookBody(t, testUID, testFenceR, testFenceA, constants.HookRuntimeReady))
@@ -430,19 +419,11 @@ func TestActionsRemoveBindingCleansUp(t *testing.T) {
 	input := `{"defaultAction":"deny"}`
 	s := setBindingAndReady(t, srv, reg, testUID, testIP, &input)
 
-	// a pending vault push sits in the cache: removal must drop it
-	rec := doRequest(t, srv, http.MethodPost, "/credential-vault", uidHeader(s), `{"credentials":[],"bindings":[]}`)
-	require.Equal(t, http.StatusCreated, rec.Code)
-
-	rec = doAction(t, srv, removeBody(t, testUID, testFenceR, testFenceA))
+	rec := doAction(t, srv, removeBody(t, testUID, testFenceR, testFenceA))
 	require.Equal(t, http.StatusOK, rec.Code)
 	_, ok := reg.Get(s)
 	assert.False(t, ok)
 	require.Len(t, nft.removed, 1)
-
-	// a later registration must not flush the removed sandbox's state
-	rec = doRequest(t, srv, http.MethodGet, "/credential-vault", uidHeader(s), "")
-	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 func TestActionsRemoveBindingMissingStateSuccess(t *testing.T) {
@@ -450,15 +431,6 @@ func TestActionsRemoveBindingMissingStateSuccess(t *testing.T) {
 	rec := doAction(t, srv, removeBody(t, "ghost", testFenceR, testFenceA))
 	require.Equal(t, http.StatusOK, rec.Code, "missing Handler state is success")
 	require.Len(t, nft.removed, 0)
-	// cached pushes for the dead sandbox are dropped
-	rec = doRequest(t, srv, http.MethodPost, "/credential-vault", "ghost", `{"credentials":[],"bindings":[]}`)
-	require.Equal(t, http.StatusAccepted, rec.Code)
-	rec = doAction(t, srv, removeBody(t, "ghost", testFenceR, testFenceA))
-	require.Equal(t, http.StatusOK, rec.Code)
-	srv.mu.Lock()
-	_, ok := srv.pending[subject.FromSandboxUID("ghost")]
-	srv.mu.Unlock()
-	assert.False(t, ok, "remove must drop cached pushes even for an unregistered UID")
 }
 
 func TestActionsRemoveBindingStaleFenceIgnored(t *testing.T) {
@@ -511,193 +483,36 @@ func TestActionsInvalidEnvelopesRejected(t *testing.T) {
 	}
 }
 
-func TestActionsSetBindingNullDropsPendingPushes(t *testing.T) {
-	srv, reg, nft := fastSandboxTestServer(t)
-	s := subject.FromSandboxUID(testUID)
-
-	// a policy push races the binding and lands in the pending cache
-	rec := doRequest(t, srv, http.MethodPut, "/policy", uidHeader(s),
-		`{"defaultAction":"deny","egress":[{"action":"allow","target":"example.com"}]}`)
-	require.Equal(t, http.StatusAccepted, rec.Code)
-
-	// the binding is removed before it ever carried a policy: the cached push
-	// must be dropped, never applied to a policy-less subject
-	rec = doAction(t, srv, bindBody(t, testUID, testIP, testFenceR, testFenceA, 1, nil))
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, subject.StateDenying, mustState(reg.Get(s)))
-	assert.Equal(t, 0, nft.appliedCount())
-	assert.Nil(t, reg.EffectivePolicy(s))
-
-	srv.mu.Lock()
-	_, ok := srv.pending[s]
-	srv.mu.Unlock()
-	assert.False(t, ok, "binding removal must drop cached pushes")
-}
-
 // ---------------------------------------------------------------------------
-// Proxy-route policy/vault surface (unchanged semantics)
+// Superseded proxy-route surfaces (removed per OSEP-0022 revision)
 // ---------------------------------------------------------------------------
 
-func TestFastSandboxServerPolicyRouting(t *testing.T) {
-	srv, reg, nft := fastSandboxTestServer(t)
-	uid := "u-1"
-	s := setBindingAndReady(t, srv, reg, uid, testIP, strPtr(`{"defaultAction":"deny"}`))
-	_ = s
-
-	// unknown UID -> 404 on read
-	rec := doRequest(t, srv, http.MethodGet, "/policy", "ghost", "")
-	require.Equal(t, http.StatusNotFound, rec.Code)
-
-	// push policy for an active subject -> in-place apply
-	rec = doRequest(t, srv, http.MethodPut, "/policy", uid,
-		`{"defaultAction":"deny","egress":[{"action":"allow","target":"example.com"}]}`)
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, 2, nft.appliedCount())
-	state, ok := reg.Get(subject.FromSandboxUID(uid))
-	require.True(t, ok)
-	assert.Equal(t, subject.StateActive, state)
-
-	// GET reflects the subject's policy
-	rec = doRequest(t, srv, http.MethodGet, "/policy", uid, "")
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Contains(t, rec.Body.String(), "example.com")
-
-	// missing header -> 400
-	rec = doRequest(t, srv, http.MethodPut, "/policy", "", `{"defaultAction":"deny"}`)
-	require.Equal(t, http.StatusBadRequest, rec.Code)
-}
-
-// TestFastSandboxServerPolicyPushWhileDenyingStaysPending (review fix + binding
-// authority): a runtime /policy push for a still-denying subject must neither
-// activate it nor override the SET_BINDING input — data-plane-ready applies
-// the binding's policy, not the pushed one.
-func TestFastSandboxServerPolicyPushWhileDenyingStaysPending(t *testing.T) {
-	srv, reg, nft := fastSandboxTestServer(t)
-	s := subject.FromSandboxUID("u-1")
-	binding := `{"defaultAction":"deny","egress":[{"action":"allow","target":"binding.com"}]}`
-	rec := doAction(t, srv, bindBody(t, "u-1", testIP, testFenceR, testFenceA, 1, &binding))
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, subject.StateDenying, mustState(reg.Get(s)))
-
-	// a push with a DIFFERENT policy while denying: 202, stored nowhere, the
-	// binding's pending policy is untouched
-	rec = doRequest(t, srv, http.MethodPut, "/policy", "u-1",
-		`{"defaultAction":"deny","egress":[{"action":"allow","target":"pushed.com"}]}`)
-	require.Equal(t, http.StatusAccepted, rec.Code)
-	require.Equal(t, subject.StateDenying, mustState(reg.Get(s)))
-	require.Equal(t, 0, nft.appliedCount())
-
-	// data-plane-ready applies the BINDING policy, not the pushed one
-	rec = doAction(t, srv, hookBody(t, "u-1", testFenceR, testFenceA, constants.HookDataPlaneReady))
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, subject.StateActive, mustState(reg.Get(s)))
-	require.Equal(t, 1, nft.appliedCount())
-	assert.Equal(t, "allow", reg.EffectivePolicy(s).Evaluate("binding.com"))
-	assert.Equal(t, "deny", reg.EffectivePolicy(s).Evaluate("pushed.com"), "a denying push must not override the binding")
-
-	// an active subject accepts the same push in place (runtime override;
-	// the next SET_BINDING resets it)
-	rec = doRequest(t, srv, http.MethodPut, "/policy", "u-1",
-		`{"defaultAction":"deny","egress":[{"action":"allow","target":"pushed.com"}]}`)
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, "allow", reg.EffectivePolicy(s).Evaluate("pushed.com"))
-}
-
-func TestFastSandboxServerPolicyPendingPushFlushedOnSetBinding(t *testing.T) {
-	srv, reg, nft := fastSandboxTestServer(t)
-	s := subject.FromSandboxUID("u-1")
-
-	// push before the binding exists -> cached as pending (202), nothing applied
-	rec := doRequest(t, srv, http.MethodPut, "/policy", "u-1",
-		`{"defaultAction":"deny","egress":[{"action":"allow","target":"example.com"}]}`)
-	require.Equal(t, http.StatusAccepted, rec.Code)
-	assert.Equal(t, 0, nft.appliedCount())
-
-	// SET_BINDING registers the subject deny-first and flushes the cached
-	// push — but the binding input is authoritative, so the flush does not
-	// change the pending policy (the binding's default-deny stays)
-	rec = doAction(t, srv, bindBody(t, "u-1", testIP, testFenceR, testFenceA, 1, strPtr(`{}`)))
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, subject.StateDenying, mustState(reg.Get(s)))
-	assert.Equal(t, 0, nft.appliedCount())
-
-	// data-plane-ready applies the BINDING input (default deny), not the
-	// flushed push
-	rec = doAction(t, srv, hookBody(t, "u-1", testFenceR, testFenceA, constants.HookDataPlaneReady))
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, subject.StateActive, mustState(reg.Get(s)))
-	assert.Equal(t, 1, nft.appliedCount())
-	eff := reg.EffectivePolicy(s)
-	require.NotNil(t, eff)
-	assert.Equal(t, "deny", eff.Evaluate("example.com"), "the binding input is authoritative over cached pushes")
-}
-
-func TestFastSandboxServerPendingGenerationMismatchDropped(t *testing.T) {
-	srv, reg, nft := fastSandboxTestServer(t)
-	s := subject.FromSandboxUID("u-1")
-
-	rec := doRequest(t, srv, http.MethodPut, "/policy", "u-1",
-		`{"defaultAction":"deny","egress":[{"action":"allow","target":"example.com"}]}`)
-	require.Equal(t, http.StatusAccepted, rec.Code)
-	// header generation 9 set on the cached request
-	srv.mu.Lock()
-	if qs, ok := srv.pending[s]; ok && len(qs) > 0 {
-		qs[0].hasGen = true
-		qs[0].gen = 9
+// TestFastSandboxServerSupersededRoutesGone: the UID-header-routed /policy and
+// /credential-vault surfaces are removed — policy rides only the SET_BINDING
+// binding input and the vault moves to the relay-only /vault/{sandboxUid}
+// surface, so the mux must not serve the old routes.
+func TestFastSandboxServerSupersededRoutesGone(t *testing.T) {
+	srv, _, _ := fastSandboxTestServer(t)
+	for _, tc := range []struct {
+		method, path string
+	}{
+		{http.MethodGet, "/policy"},
+		{http.MethodPut, "/policy"},
+		{http.MethodPost, "/policy"},
+		{http.MethodDelete, "/policy"},
+		{http.MethodGet, "/credential-vault"},
+		{http.MethodPost, "/credential-vault"},
+		{http.MethodPatch, "/credential-vault"},
+		{http.MethodDelete, "/credential-vault"},
+	} {
+		rec := doRequest(t, srv, tc.method, tc.path, `{}`)
+		require.Equal(t, http.StatusNotFound, rec.Code, "%s %s must be gone", tc.method, tc.path)
 	}
-	srv.mu.Unlock()
-
-	// SET_BINDING with spec generation 1 -> mismatch, pending dropped. The
-	// subject is registered (deny-first) before the flush; no policy lands.
-	rec = doAction(t, srv, bindBody(t, "u-1", testIP, testFenceR, testFenceA, 1, strPtr(`{"defaultAction":"deny"}`)))
-	require.Equal(t, http.StatusOK, rec.Code)
-
-	state, _ := reg.Get(s)
-	assert.Equal(t, subject.StateDenying, state, "stale pending push must never activate a rebound sandbox")
-	assert.Equal(t, 0, nft.appliedCount())
-}
-
-func TestFastSandboxServerCredentialVaultPerSubject(t *testing.T) {
-	srv, reg, _ := fastSandboxTestServer(t)
-	sA := subject.FromSandboxUID("a")
-	sB := subject.FromSandboxUID("b")
-	reg.Register(sA, subject.SubjectKey{SourceIP: netip.MustParseAddr("10.0.0.5")}, subject.Fencing{RuntimeInstanceID: "r-a", AttachmentID: "a-a"})
-	reg.Register(sB, subject.SubjectKey{SourceIP: netip.MustParseAddr("10.0.0.6")}, subject.Fencing{RuntimeInstanceID: "r-b", AttachmentID: "a-b"})
-
-	rec := doRequest(t, srv, http.MethodPost, "/credential-vault", uidHeader(sA),
-		`{"credentials":[],"bindings":[]}`)
-	require.Equal(t, http.StatusCreated, rec.Code)
-
-	// subject B's vault does not exist yet (same as sidecar: 404); subject
-	// A's vault has the revision
-	rec = doRequest(t, srv, http.MethodGet, "/credential-vault", uidHeader(sB), "")
-	require.Equal(t, http.StatusNotFound, rec.Code)
-
-	rec = doRequest(t, srv, http.MethodGet, "/credential-vault", uidHeader(sA), "")
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Contains(t, rec.Body.String(), `"revision":1`)
-}
-
-func TestFastSandboxServerOnUnloadedDropsPending(t *testing.T) {
-	srv, reg, nft := fastSandboxTestServer(t)
-	s := subject.FromSandboxUID("u-1")
-	rec := doRequest(t, srv, http.MethodPut, "/policy", uidHeader(s), `{"defaultAction":"deny"}`)
-	require.Equal(t, http.StatusAccepted, rec.Code)
-
-	reg.Register(s, subject.SubjectKey{}, subject.Fencing{RuntimeInstanceID: "r-1", AttachmentID: "a-1"})
-	require.NoError(t, srv.OnUnloaded(s, testAttachment().Network))
-	require.Len(t, nft.removed, 1)
-
-	// pending was dropped; a later registration must NOT flush stale policy
-	reg.Register(s, subject.SubjectKey{}, subject.Fencing{RuntimeInstanceID: "r-2", AttachmentID: "a-2"})
-	srv.OnRegisteredComplete(s, testAttachment().Network, 2)
-	state, _ := reg.Get(s)
-	assert.Equal(t, subject.StateDenying, state)
 }
 
 func TestFastSandboxServerHealthz(t *testing.T) {
 	srv, _, _ := fastSandboxTestServer(t)
-	rec := doRequest(t, srv, http.MethodGet, "/healthz", "", "")
+	rec := doRequest(t, srv, http.MethodGet, "/healthz", "")
 	require.Equal(t, http.StatusOK, rec.Code)
 }
 
@@ -825,12 +640,12 @@ func TestFastSandboxServerHealthzMitmGate(t *testing.T) {
 	srv.mitmGate = gate
 
 	gate.SetReady(false)
-	rec := doRequest(t, srv, http.MethodGet, "/healthz", "", "")
+	rec := doRequest(t, srv, http.MethodGet, "/healthz", "")
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	require.Contains(t, rec.Body.String(), "mitmproxy not ready")
 
 	gate.SetReady(true)
-	rec = doRequest(t, srv, http.MethodGet, "/healthz", "", "")
+	rec = doRequest(t, srv, http.MethodGet, "/healthz", "")
 	require.Equal(t, http.StatusOK, rec.Code)
 }
 
@@ -853,9 +668,18 @@ func TestFastSandboxServerActiveVaultClientIPDispatch(t *testing.T) {
 	rec = doAction(t, srv, hookBody(t, "a", "r-a", "a-a", constants.HookDataPlaneReady))
 	require.Equal(t, http.StatusOK, rec.Code)
 
-	rec = doRequest(t, srv, http.MethodPost, "/credential-vault", uidHeader(sA),
-		`{"credentials":[{"name":"k","source":{"type":"inline","value":"v"}}],"bindings":[{"name":"b","match":{"hosts":["example.com"]},"auth":{"type":"apiKey","name":"X-API-Key","credential":"k"}}]}`)
-	require.Equal(t, http.StatusCreated, rec.Code)
+	// Populate subject A's vault through the store API (the relay-only
+	// surface that owns vault writes is tracked separately in OSEP-0022).
+	vault := srv.vaultFor(sA)
+	_, err := vault.Create(credentialvault.CreateRequest{
+		Credentials: []credentialvault.Credential{
+			{Name: "k", Source: json.RawMessage(`{"type":"inline","value":"v"}`)},
+		},
+		Bindings: []credentialvault.Binding{
+			{Name: "b", Match: credentialvault.Match{Hosts: []string{"example.com"}}, Auth: credentialvault.Auth{Type: "apiKey", Name: "X-API-Key", Credential: "k"}},
+		},
+	}, reg.EffectivePolicy(sA))
+	require.NoError(t, err)
 
 	// client IP -> subject A vault (the active endpoint is served on the
 	// unix socket; here the handler is exercised directly)
@@ -896,13 +720,13 @@ func TestFastSandboxServerActiveVaultClientIPDispatch(t *testing.T) {
 
 	// the HTTP mux must NOT expose the active endpoint (sidecar parity: the
 	// addon is the only client, over the unix socket)
-	rec = doRequest(t, srv, http.MethodGet, "/credential-vault/_active?clientIp=10.0.0.5", "", "")
+	rec = doRequest(t, srv, http.MethodGet, "/credential-vault/_active?clientIp=10.0.0.5", "")
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 // TestActionsCreateThenConfigureEndToEnd exercises the actions-driven
-// create-then-configure spine: SET_BINDING installs deny-first, a vault push
-// racing registration is flushed, data-plane-ready activates the policy, and
+// create-then-configure spine: SET_BINDING installs deny-first with the
+// binding policy held pending, data-plane-ready activates it, and
 // REMOVE_BINDING tears everything down.
 func TestActionsCreateThenConfigureEndToEnd(t *testing.T) {
 	srv, reg, nft := fastSandboxTestServer(t)
@@ -914,10 +738,6 @@ func TestActionsCreateThenConfigureEndToEnd(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, subject.StateDenying, mustState(reg.Get(s)))
 	assert.Nil(t, reg.EffectivePolicy(s), "fail-closed: DNS denies while the policy is pending")
-
-	// vault push after registration goes straight through
-	rec = doRequest(t, srv, http.MethodPost, "/credential-vault", uid, `{"credentials":[],"bindings":[]}`)
-	require.Equal(t, http.StatusCreated, rec.Code)
 
 	// data-plane-ready activates the policy
 	rec = doAction(t, srv, hookBody(t, uid, testFenceR, testFenceA, constants.HookDataPlaneReady))
@@ -932,8 +752,6 @@ func TestActionsCreateThenConfigureEndToEnd(t *testing.T) {
 	_, ok := reg.Get(s)
 	assert.False(t, ok)
 	require.Len(t, nft.removed, 1)
-	rec = doRequest(t, srv, http.MethodGet, "/credential-vault", uid, "")
-	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 // TestFastSandboxServerAlwaysRulesReachNft: allow.always/deny.always must be
@@ -947,7 +765,7 @@ func TestFastSandboxServerAlwaysRulesReachNft(t *testing.T) {
 
 	reg := subject.NewRegistry([]policy.EgressRule{alwaysDeny}, []policy.EgressRule{alwaysAllow})
 	nft := &fakeNft{}
-	srv := newFastSandboxPolicyServer(context.Background(), reg, nft, time.Minute)
+	srv := newFastSandboxPolicyServer(context.Background(), reg, nft)
 	srv.dnsRedirectInstall = func(netip.Addr, int) error { return nil }
 	srv.dnsRedirectRemove = func() error { return nil }
 
@@ -968,7 +786,7 @@ func TestFastSandboxServerAlwaysRulesReachNft(t *testing.T) {
 }
 
 // TestFastSandboxServerNftFailureKeepsRegistryState: a failed nft apply must leave
-// the registry (DNS/GET) on the PREVIOUS policy — nft commits before registry
+// the registry (DNS dispatch) on the PREVIOUS policy — nft commits before registry
 // state.
 func TestFastSandboxServerNftFailureKeepsRegistryState(t *testing.T) {
 	srv, reg, nft := fastSandboxTestServer(t)
@@ -976,12 +794,13 @@ func TestFastSandboxServerNftFailureKeepsRegistryState(t *testing.T) {
 	s := setBindingAndReady(t, srv, reg, "u-1", testIP, &input)
 	require.Equal(t, subject.StateActive, mustState(reg.Get(s)))
 
-	// second push fails at nft: registry must stay on the FIRST policy
+	// in-place binding update fails at nft: registry must stay on the FIRST
+	// policy
 	nft.mu.Lock()
 	nft.policyErr = errors.New("nft busy")
 	nft.mu.Unlock()
-	rec := doRequest(t, srv, http.MethodPut, "/policy", "u-1",
-		`{"defaultAction":"deny","egress":[{"action":"allow","target":"example.com"}]}`)
+	rec := doAction(t, srv, bindBody(t, "u-1", testIP, testFenceR, testFenceA, 2,
+		strPtr(`{"defaultAction":"deny","egress":[{"action":"allow","target":"example.com"}]}`)))
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 
 	eff := reg.EffectivePolicy(s)
@@ -995,7 +814,7 @@ func TestFastSandboxServerNftFailureKeepsRegistryState(t *testing.T) {
 func TestFastSandboxServerGatewayRedirectRefcounted(t *testing.T) {
 	reg := subject.NewRegistry(nil, nil)
 	nft := &fakeNft{}
-	srv := newFastSandboxPolicyServer(context.Background(), reg, nft, time.Minute)
+	srv := newFastSandboxPolicyServer(context.Background(), reg, nft)
 	var installs, removes int
 	srv.dnsRedirectInstall = func(netip.Addr, int) error { installs++; return nil }
 	srv.dnsRedirectRemove = func() error { removes++; return nil }
@@ -1124,7 +943,7 @@ func TestActionsRemoveBindingRetriesAfterNftFailure(t *testing.T) {
 func TestFastSandboxServerGatewayRedirectDuplicateSetBindingIdempotent(t *testing.T) {
 	reg := subject.NewRegistry(nil, nil)
 	nft := &fakeNft{}
-	srv := newFastSandboxPolicyServer(context.Background(), reg, nft, time.Minute)
+	srv := newFastSandboxPolicyServer(context.Background(), reg, nft)
 	var installs, removes int
 	srv.dnsRedirectInstall = func(netip.Addr, int) error { installs++; return nil }
 	srv.dnsRedirectRemove = func() error { removes++; return nil }
@@ -1144,7 +963,7 @@ func TestFastSandboxServerGatewayRedirectDuplicateSetBindingIdempotent(t *testin
 func TestFastSandboxServerGatewayRedirectRebindMovesGateway(t *testing.T) {
 	reg := subject.NewRegistry(nil, nil)
 	nft := &fakeNft{}
-	srv := newFastSandboxPolicyServer(context.Background(), reg, nft, time.Minute)
+	srv := newFastSandboxPolicyServer(context.Background(), reg, nft)
 	var installs, removes int
 	srv.dnsRedirectInstall = func(netip.Addr, int) error { installs++; return nil }
 	srv.dnsRedirectRemove = func() error { removes++; return nil }

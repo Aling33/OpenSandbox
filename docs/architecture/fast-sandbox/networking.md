@@ -92,10 +92,7 @@ Every operation carries fencing fields (`runtimeInstanceId`, `attachmentId`) so 
 
 ### Credential delivery
 
-Credential vault revisions are pushed by the server over fast-sandbox's proxy-route mechanism and routed per subject by the `X-Fast-Sandbox-Uid` header. Pushes stay memory-only in egress — no Secret volumes, no disk state.
-
-- A push for a UID whose binding has not appeared yet is cached briefly and applied on registration.
-- A push carrying a mismatched `X-Fast-Sandbox-Generation` is discarded.
+Credential vault revisions are **egress-held** (OSEP-0022): the server pushes complete vault revisions over the FastPath handler-relay (`InvokeHandlerAction`) to the egress vault surface (`/vault/{sandboxUid}`) on the Pod loopback. FastPath validates tenant-scoped sandbox ownership before the Fastlet forwards the payload — there is no proxy-injected identity header. The relay response is the synchronous ack: success means egress has validated and applied the revision. Pushes stay in egress — memory plus an egress-local per-subject file, no Secret volumes, no CRD/etcd vault material. A vault mutation for a subject that has not reached `data-plane-ready` is held at the same barrier as the policy; there is no separate pending-cache channel.
 
 ### Enforcement
 

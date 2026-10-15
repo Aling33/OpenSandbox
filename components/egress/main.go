@@ -62,9 +62,9 @@ func main() {
 		log.Fatalf("invalid upstream proxy configuration: %v", err)
 	}
 
-	// Fast Sandbox profile: multi-sandbox control plane over the slot
-	// store and the proxy route. Sidecar stays the default; the two profiles
-	// are mutually exclusive deployment forms.
+	// Fast Sandbox profile: multi-sandbox control plane driven by the
+	// Sandbox Actions Handler protocol. Sidecar stays the default; the two
+	// profiles are mutually exclusive deployment forms.
 	if profile == constants.ProfileFastSandbox {
 		runFastSandboxProfile(ctx, upstreamSpec)
 		return

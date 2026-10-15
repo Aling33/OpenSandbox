@@ -193,9 +193,13 @@ expect_answers() {
 
 nft_has() { nft list table inet opensandbox-fast-sandbox 2>/dev/null | grep -q "$1"; }
 
-# subject_state <uid>: prints the subject's lifecycle state from GET /policy.
-subject_state() {
-  curl -s -H "X-Fast-Sandbox-Uid: $1" "http://127.0.0.1:${POLICY_PORT}/policy" 2>/dev/null
+# dns_rcode_is <netns-or-host> <name> <rcode>: probe variant of expect_rcode
+# that returns non-zero instead of failing (usable inside wait_for).
+dns_rcode_is() {
+  local out rcode
+  out="$(dns_query "$1" "$2")"
+  rcode="$(echo "${out}" | sed -n 's/^rcode=\([0-9]*\).*/\1/p')"
+  [ "${rcode}" = "$3" ]
 }
 
 start_egress() {
@@ -238,17 +242,6 @@ start_egress() {
   "${EGRESS_BIN}" >"${EGRESS_LOG}" 2>&1 &
   EGRESS_PID=$!
   wait_for 30 "egress healthz" curl -sf "http://127.0.0.1:${POLICY_PORT}/healthz"
-}
-
-push_vault() {
-  # push_vault <uid> <json>: POST the vault; on failure print the server's
-  # rejection body (the fast-sandbox handler reports validation errors there).
-  local uid="$1" json="$2" resp code body
-  resp="$(curl -s -w '\n%{http_code}' -H "X-Fast-Sandbox-Uid: ${uid}" \
-    -XPOST "http://127.0.0.1:${POLICY_PORT}/credential-vault" -d "${json}")"
-  code="$(printf '%s' "${resp}" | tail -1)"
-  body="$(printf '%s' "${resp}" | sed '$d')"
-  [ "${code}" = "201" ] || fail "vault push for ${uid}: HTTP ${code}: ${body}"
 }
 
 set_up_netns() {
@@ -387,27 +380,24 @@ info "Test 5: unknown source is fail-closed"
 expect_rcode osb-ext allow.test 3
 pass "DNS from unknown source -> NXDOMAIN"
 
-###############################################################################
-info "Test 6: pending vault push flushed on registration"
-http_code="$(curl -s -o /dev/null -w '%{http_code}' -H "X-Fast-Sandbox-Uid: b" -XPOST \
-  "http://127.0.0.1:${POLICY_PORT}/credential-vault" \
-  -d '{"credentials":[],"bindings":[]}')"
-[ "${http_code}" = "202" ] || fail "push before binding must be 202 pending, got ${http_code}"
-pass "credential push before binding cached as pending (202)"
+# ---------------------------------------------------------------------------
+info "Test 6: superseded proxy-route surfaces are gone (no UID-header channel)"
+http_code="$(curl -s -o /dev/null -w '%{http_code}' -XPOST \
+  "http://127.0.0.1:${POLICY_PORT}/credential-vault" -d '{}')"
+[ "${http_code}" = "404" ] || fail "superseded /credential-vault must be gone (404), got ${http_code}"
+http_code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/policy")"
+[ "${http_code}" = "404" ] || fail "superseded /policy must be gone (404), got ${http_code}"
+pass "superseded proxy-route surfaces removed (policy rides the binding only)"
 
 set_up_netns b 10.10.0.6
-set_binding b 10.10.0.6 1 runtime-b att-b '{"defaultAction":"deny","egress":[{"action":"allow","target":"*.test"}]}'
-wait_for 15 "pending vault flushed on registration" bash -c \
-  "curl -s -o /dev/null -w '%{http_code}' -H 'X-Fast-Sandbox-Uid: b' http://127.0.0.1:${POLICY_PORT}/credential-vault | grep -q 200"
-lifecycle_hook b runtime-b att-b sandbox.runtime-ready
-lifecycle_hook b runtime-b att-b sandbox.data-plane-ready
+bind_and_ready b 10.10.0.6 1 runtime-b att-b '{"defaultAction":"deny","egress":[{"action":"allow","target":"*.test"}]}'
 expect_answers osb-sandbox-b allow.test 1.1.1.1
-pass "pending push applied on registration (subject b active, DNS works)"
+pass "subject b registered + active through the action protocol"
 
 ###############################################################################
 info "Test 7: rebind discards policy (fail closed until re-activation)"
 set_binding a 10.10.0.5 4 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"*.test"}]}'
-wait_for 15 "rebind back to denying" bash -c "curl -s -H 'X-Fast-Sandbox-Uid: a' http://127.0.0.1:${POLICY_PORT}/policy | grep -q denying"
+wait_for 15 "rebind back to denying" dns_rcode_is osb-sandbox-a allow.test 3
 nft_has '10.99.0.2' && fail "stale policy must not survive a rebind"
 expect_rcode osb-sandbox-a allow.test 3
 lifecycle_hook a runtime-a-2 att-a-2 sandbox.data-plane-ready
@@ -444,7 +434,7 @@ wait "${EGRESS_PID}" 2>/dev/null || true
 EGRESS_PID=""
 EGRESS_DOH_BLOCKLIST="" start_egress
 set_binding a 10.10.0.5 6 runtime-a-2 att-a-2 '{"defaultAction":"deny"}'
-wait_for 15 "subject a re-registered after strict-mode restart" bash -c "curl -s -H 'X-Fast-Sandbox-Uid: a' http://127.0.0.1:${POLICY_PORT}/policy | grep -q denying"
+wait_for 15 "subject a re-registered after strict-mode restart" dns_rcode_is osb-sandbox-a allow.test 3
 nft_has 'tcp dport 443 drop' || fail "strict mode must install a bare tcp 443 drop"
 nft_has 'doh_block_v4' && fail "strict mode must not create blocklist sets"
 pass "strict DoH mode enforced (bare 443 drop, no blocklist sets)"
@@ -506,87 +496,59 @@ else
   fi
   pass "deny-first blocks MITM 80/443 at the Pod INPUT chain"
 
-  # Subject a: policy + vault, then a real HTTP request through the shared
-  # mitm; the upstream must see the injected credential (proves interception
-  # AND clientIp -> subject -> vault dispatch). Binding hosts must be FQDNs
-  # (IP binding hosts are rejected), so the sandbox curls the ext netns with
-  # an explicit Host header; the policy keeps allowing the real daddr
-  # 10.99.0.2 so the nft layers pass the packet.
+  # Subject a: policy via the binding, then a real HTTP request through the
+  # shared mitm (proves interception; credential delivery returns with the
+  # OSEP-0022 relay surface — no vault exists here, so flows proceed
+  # uncredentialed). Binding hosts must be FQDNs (IP binding hosts are
+  # rejected), so the sandbox curls the ext netns with an explicit Host
+  # header; the policy keeps allowing the real daddr 10.99.0.2 so the nft
+  # layers pass the packet.
   set_binding a 10.10.0.5 8 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
   lifecycle_hook a runtime-a-2 att-a-2 sandbox.runtime-ready
   lifecycle_hook a runtime-a-2 att-a-2 sandbox.data-plane-ready
-  push_vault a '{"credentials":[{"name":"k","source":{"type":"inline","value":"secret-v1"}}],"bindings":[{"name":"b","match":{"schemes":["http","https"],"hosts":["ext.test"]},"auth":{"type":"apiKey","name":"X-Api-Key","credential":"k"}}]}'
   code="$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "${ACTIVE_SOCK}" 'http://localhost/credential-vault/_active?clientIp=10.10.0.5')"
-  [ "${code}" = "200" ] || fail "active API: subject a vault must resolve, got ${code}"
+  [ "${code}" = "404" ] || fail "active API: subject a has no vault yet (relay not wired), got ${code}"
   out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "request did not traverse the shared mitm (direct path?); got: ${out}"
-  echo "${out}" | grep -qi "x-api-key: secret-v1" || fail "mitm must inject subject a's credential; got: ${out}"
-  pass "real HTTP through shared mitm with credential injection (clientIp dispatch)"
+  pass "real HTTP through shared mitm (clientIp -> subject dispatch, no vault -> plain flow)"
 
   # Subject b (re-registered after Test 8's unload): a second sandbox with a
-  # DIFFERENT policy (allows alt.test, not ext.test) and its own vault; each
-  # sandbox's rules and credentials stay strictly isolated.
+  # DIFFERENT policy (allows alt.test, not ext.test); each sandbox's rules
+  # stay strictly isolated.
   set_binding b 10.10.0.6 2 runtime-b att-b '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"alt.test"}]}'
   lifecycle_hook b runtime-b att-b sandbox.data-plane-ready
   wait_for 15 "subject b re-registered with DNAT" bash -c "nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.6 '"
 
-  # b's vault must reject a binding for a host its own policy does not allow
-  # (ext.test belongs to subject a's policy) — per-subject rule isolation at
-  # the vault validation layer.
-  code="$(curl -s -o /dev/null -w '%{http_code}' -H "X-Fast-Sandbox-Uid: b" -XPOST \
-    "http://127.0.0.1:${POLICY_PORT}/credential-vault" \
-    -d '{"credentials":[{"name":"k","source":{"type":"inline","value":"leak"}}],"bindings":[{"name":"b","match":{"schemes":["http","https"],"hosts":["ext.test"]},"auth":{"type":"apiKey","name":"X-Api-Key","credential":"k"}}]}')"
-  [ "${code}" = "400" ] || fail "b's vault must reject a binding outside its policy (ext.test), got ${code}"
-
-  push_vault b '{"credentials":[{"name":"k","source":{"type":"inline","value":"secret-v2"}}],"bindings":[{"name":"b","match":{"schemes":["http","https"],"hosts":["alt.test"]},"auth":{"type":"apiKey","name":"X-Api-Key","credential":"k"}}]}'
   out="$(ip netns exec osb-sandbox-b curl -s -m 5 -H 'Host: alt.test' http://10.99.0.2/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "subject b request did not traverse the shared mitm; got: ${out}"
-  echo "${out}" | grep -qi "x-api-key: secret-v2" || fail "mitm must inject subject b's credential; got: ${out}"
   out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "subject a request did not traverse the shared mitm; got: ${out}"
-  echo "${out}" | grep -qi "x-api-key: secret-v1" || fail "subject a's credential must survive subject b's registration; got: ${out}"
 
-  # Cross-policy isolation: b has no binding for ext.test and a has none for
-  # alt.test — neither sandbox may receive the other's credential, even
-  # though both can reach the same upstream IP.
+  # Per-subject dispatch: b reaching a's host still traverses the shared mitm
+  # (its own policy allows the daddr), dispatched by source IP — subject
+  # isolation is enforced by the per-subject policy/credential slices.
   out="$(ip netns exec osb-sandbox-b curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "subject b request did not traverse the shared mitm; got: ${out}"
-  echo "${out}" | grep -qi "x-api-key" && fail "b must NOT receive a credential for ext.test (a's host); got: ${out}"
   out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: alt.test' http://10.99.0.2/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "subject a request did not traverse the shared mitm; got: ${out}"
-  echo "${out}" | grep -qi "x-api-key" && fail "a must NOT receive a credential for alt.test (b's host); got: ${out}"
-  pass "per-subject policy + vault isolation (two sandboxes, distinct rules and credentials)"
+  pass "per-subject policy isolation (two sandboxes, distinct rules)"
 
-  # HTTPS data plane: TLS interception + SO_ORIGINAL_DST(443) + credential
-  # injection on the encrypted path. curl -k skips the sandbox-side trust
-  # check (the CA delivery into sandboxes is fast-sandbox issue #19); the
-  # mitm's own upstream validation is disabled via ssl_insecure (self-signed
-  # ext cert). The client=10.99.0.1 oracle still proves the mitm proxied it.
+  # HTTPS data plane: TLS interception + SO_ORIGINAL_DST(443) on the
+  # encrypted path. curl -k skips the sandbox-side trust check (the CA
+  # delivery into sandboxes is fast-sandbox issue #19); the mitm's own
+  # upstream validation is disabled via ssl_insecure (self-signed ext cert).
+  # The client=10.99.0.1 oracle proves the mitm proxied it.
   out="$(ip netns exec osb-sandbox-a curl -sk -m 5 -H 'Host: ext.test' https://10.99.0.2/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "https request did not traverse the shared mitm; got: ${out}"
-  echo "${out}" | grep -qi "x-api-key: secret-v1" || fail "mitm must inject subject a's credential over TLS; got: ${out}"
   out="$(ip netns exec osb-sandbox-b curl -sk -m 5 -H 'Host: alt.test' https://10.99.0.2/)"
   echo "${out}" | grep -qi "client=10.99.0.1" || fail "subject b https request did not traverse the shared mitm; got: ${out}"
-  echo "${out}" | grep -qi "x-api-key: secret-v2" || fail "mitm must inject subject b's credential over TLS; got: ${out}"
-  pass "HTTPS data plane (TLS interception + per-subject injection)"
-
-  # A successful PATCH acknowledges the active revision. The very next
-  # intercepted request must use the new credential without a cache-expiry
-  # sleep.
-  code="$(curl -s -o /dev/null -w '%{http_code}' -H "X-Fast-Sandbox-Uid: a" -XPATCH \
-    "http://127.0.0.1:${POLICY_PORT}/credential-vault" \
-    -d '{"credentials":{"replace":[{"name":"k","source":{"type":"inline","value":"secret-v1-new"}}]}}')"
-  [ "${code}" = "200" ] || fail "vault PATCH must succeed, got ${code}"
-  out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/)"
-  echo "${out}" | grep -qi "x-api-key: secret-v1-new" || fail "PATCHed credential must be injected immediately after acknowledgement; got: ${out}"
-  pass "vault revision acknowledgement reaches the next intercepted request"
+  pass "HTTPS data plane (TLS interception, per-subject dispatch)"
 
   # Interception-set precision: :8080 is outside {80,443}, so it must go
-  # DIRECT (client=10.10.0.5, the sandbox IP) with no credential injection.
+  # DIRECT (client=10.10.0.5, the sandbox IP).
   out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2:8080/)"
   echo "${out}" | grep -qi "client=10.10.0.5" || fail ":8080 must NOT be intercepted (direct path); got: ${out}"
-  echo "${out}" | grep -qi "x-api-key" && fail ":8080 must not receive credentials; got: ${out}"
-  pass "interception set precision (:8080 direct, no injection)"
+  pass "interception set precision (:8080 direct)"
 
   # Direct proxy-protocol connection to the mitm port: a default-allow
   # sandbox must not bypass the transparent interception by talking to the
@@ -612,14 +574,12 @@ else
   # packet follows subject a's policy instead of b's. Spoof protection rests
   # on IPAM (per-sandbox unique IP) and the Pod netns rp_filter strict mode,
   # not on nft. Assert the observable consequence: b's forged-IP traffic is
-  # NOT dispatched to subject b (a b-policy deny would be dropped by b's
-  # chain); it follows a's policy or is dropped by the master tail.
+  # dispatched by source IP to subject a (whose policy allows this target),
+  # so it traverses the shared mitm instead of being dropped.
   ip netns exec osb-sandbox-b ip addr add 10.10.0.5/32 dev veth-b 2>/dev/null || true
   out="$(ip netns exec osb-sandbox-b curl -s -m 3 -H 'Host: ext.test' http://10.99.0.2/ 2>/dev/null || true)"
-  if echo "${out}" | grep -qi "x-api-key: secret-v2"; then
-    fail "forged-IP traffic must NOT be dispatched to subject b (b has no ext.test credential)"
-  fi
-  pass "forged source IP is not dispatched to the forging subject (saddr dispatch, no iifname)"
+  echo "${out}" | grep -qi "client=10.99.0.1" || fail "forged-IP traffic must follow subject a's policy (saddr dispatch); got: ${out}"
+  pass "forged source IP is dispatched by saddr (subject a's policy, no iifname)"
 
   # Unload removes the subject's DNAT rule (the rebuild drops it).
   remove_binding b runtime-b att-b
@@ -627,7 +587,7 @@ else
   pass "unload removed subject b's DNAT rule"
 
   # mitmdump death -> healthz 503 -> auto-restart (watchMitmproxy + backoff)
-  # -> injection resumes. The 503 window can be sub-second, so poll fast.
+  # -> interception resumes. The 503 window can be sub-second, so poll fast.
   pkill -TERM -x mitmdump 2>/dev/null || true
   deadline=$((SECONDS + 15))
   saw_503=0
@@ -645,11 +605,11 @@ else
   done
   [ "${code}" = "200" ] || fail "healthz must recover after mitmdump auto-restart"
   out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/)"
-  echo "${out}" | grep -qi "x-api-key: secret-v1-new" || fail "injection must resume after mitmdump restart; got: ${out}"
-  pass "mitmdump death recovery (503 -> auto-restart -> injection resumes)"
+  echo "${out}" | grep -qi "client=10.99.0.1" || fail "interception must resume after mitmdump restart; got: ${out}"
+  pass "mitmdump death recovery (503 -> auto-restart -> interception resumes)"
 
 ###############################################################################
-  info "Test 12: MITM-mode restart recovery (DNAT rebuild + CA re-export + action replay + vault re-push)"
+  info "Test 12: MITM-mode restart recovery (DNAT rebuild + CA re-export + action replay)"
   kill "${EGRESS_PID}" 2>/dev/null
   wait "${EGRESS_PID}" 2>/dev/null || true
   EGRESS_PID=""
@@ -658,11 +618,9 @@ else
   set_binding a 10.10.0.5 9 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
   wait_for 15 "DNAT rebuilt after restart" bash -c "nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '"
   lifecycle_hook a runtime-a-2 att-a-2 sandbox.data-plane-ready
-  # the in-memory vault died with the old process; re-push (idempotent)
-  push_vault a '{"credentials":[{"name":"k","source":{"type":"inline","value":"secret-v1-new"}}],"bindings":[{"name":"b","match":{"schemes":["http","https"],"hosts":["ext.test"]},"auth":{"type":"apiKey","name":"X-Api-Key","credential":"k"}}]}'
   out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/)"
-  echo "${out}" | grep -qi "x-api-key: secret-v1-new" || fail "injection must work after MITM-mode restart; got: ${out}"
-  pass "MITM-mode restart recovery (DNAT + CA + action replay + vault re-push + injection)"
+  echo "${out}" | grep -qi "client=10.99.0.1" || fail "interception must work after MITM-mode restart; got: ${out}"
+  pass "MITM-mode restart recovery (DNAT + CA + action replay + interception)"
 
   ###############################################################################
   info "Test 13: chained upstream CONNECT proxy — dual-resolver drop set + profile-wide containment"
@@ -702,18 +660,17 @@ else
   # Subject a re-registers with a policy that allows the ext destination and
   # its IP, so any failure to reach the proxy can only be the profile-wide drop.
   bind_and_ready a 10.10.0.5 10 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
-  push_vault a '{"credentials":[{"name":"k","source":{"type":"inline","value":"chain-v1"}}],"bindings":[{"name":"b","match":{"schemes":["http","https"],"hosts":["ext.test"]},"auth":{"type":"apiKey","name":"X-Api-Key","credential":"k"}}]}'
 
   # Chained data plane (sandbox -> DNAT -> shared mitm -> CONNECT relay -> ext):
-  # the injected credential proves interception, the relay counter proves the
-  # upstream dial went through the chained proxy and never direct.
+  # the client=10.99.0.1 oracle proves interception, the relay counter proves
+  # the upstream dial went through the chained proxy and never direct.
   before="$(relay_count)"
   out="$(ip netns exec osb-sandbox-a curl -s -m 8 -H 'Host: ext.test' http://10.99.0.2/)"
-  echo "${out}" | grep -qi "x-api-key: chain-v1" || fail "chained http lost mitm credential injection; got: ${out}"
+  echo "${out}" | grep -qi "client=10.99.0.1" || fail "chained http lost mitm interception; got: ${out}"
   after="$(relay_count)"
   [ "${after}" -gt "${before}" ] || fail "chained http must traverse the forward relay (count ${before} -> ${after})"
   out="$(ip netns exec osb-sandbox-a curl -sk -m 8 -H 'Host: ext.test' https://10.99.0.2/)"
-  echo "${out}" | grep -qi "x-api-key: chain-v1" || fail "chained https lost mitm credential injection; got: ${out}"
+  echo "${out}" | grep -qi "client=10.99.0.1" || fail "chained https lost mitm interception; got: ${out}"
   [ "$(relay_count)" -gt "${after}" ] || fail "chained https must traverse the CONNECT tunnel"
   pass "chained data plane (sandbox -> mitm -> CONNECT relay -> ext, http + https)"
 
@@ -750,12 +707,11 @@ else
   wait_for 15 "drop set re-seeded after restart" bash -c \
     "nft list set inet opensandbox-fast-sandbox upstream_proxy_v4 2>/dev/null | grep -q '10.99.0.2'"
   bind_and_ready a 10.10.0.5 12 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
-  push_vault a '{"credentials":[{"name":"k","source":{"type":"inline","value":"chain-v1"}}],"bindings":[{"name":"b","match":{"schemes":["http","https"],"hosts":["ext.test"]},"auth":{"type":"apiKey","name":"X-Api-Key","credential":"k"}}]}'
   if ip netns exec osb-sandbox-a curl -s -m 3 -o /dev/null --proxytunnel -x http://10.99.0.2:3128 http://10.99.0.2:8080/ 2>/dev/null; then
     fail "containment must survive egress restart"
   fi
   out="$(ip netns exec osb-sandbox-a curl -s -m 8 -H 'Host: ext.test' http://10.99.0.2/)"
-  echo "${out}" | grep -qi "x-api-key: chain-v1" || fail "chained path must work after restart; got: ${out}"
+  echo "${out}" | grep -qi "client=10.99.0.1" || fail "chained path must work after restart; got: ${out}"
   pass "upstream containment across egress restart (drop re-seeded + chained path intact)"
 fi
 

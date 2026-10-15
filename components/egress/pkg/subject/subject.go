@@ -104,8 +104,8 @@ type SubjectKey struct {
 }
 
 // ErrUnknownSubject is returned when an operation targets a subject with no
-// observed binding. Callers treat it as the signal to cache the push as
-// pending.
+// observed binding. Callers treat it as a failed operation (fail closed);
+// there is no pending-cache retry.
 var ErrUnknownSubject = errors.New("subject not registered")
 
 // Resolver is the hot path: pure lookup, must be cheap and race-free.
@@ -159,7 +159,7 @@ type Registry interface {
 // the action protocol (the fast-sandbox control plane translates SET_BINDING,
 // LIFECYCLE_HOOK, and REMOVE_BINDING into these calls). The caller installs
 // the platform adapters here (deny-first nft rules, gateway DNS redirect,
-// pending-push flush). A hook error must be treated as fail-closed: the
+// MITM interception). A hook error must be treated as fail-closed: the
 // subject stays denying until the hook succeeds.
 type LifecycleHooks interface {
 	// OnRegistered fires when a binding is observed (SET_BINDING) and the
@@ -169,13 +169,6 @@ type LifecycleHooks interface {
 	// (atomic with ApplyPolicy), so it must not call back into registry
 	// methods.
 	OnRegistered(s Subject, att actionhandler.NetworkAttachment) error
-	// OnRegisteredComplete fires once registration (deny-first install)
-	// succeeded and the registry lock is released. It is the place for
-	// best-effort follow-ups that would deadlock inside OnRegistered, e.g.
-	// flushing a cached pending credential push for this subject. specGen is
-	// the sandbox spec generation recorded at SET_BINDING, used to drop
-	// stale pending pushes (X-Fast-Sandbox-Generation fencing).
-	OnRegisteredComplete(s Subject, att actionhandler.NetworkAttachment, specGen uint64)
 	// OnUnloaded fires when the binding is removed terminally (REMOVE_BINDING
 	// or the sandbox's binding is gone). Enforcement must be removed; att is
 	// the last observed network attachment (for gateway refcounts etc.).

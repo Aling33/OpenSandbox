@@ -156,12 +156,11 @@ func (s *fastSandboxPolicyServer) applySetBinding(env *actionhandler.Envelope) (
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("deny-first install: %w", err)
 	}
-	s.recordBindingState(subj, att, env.Revision.SpecGeneration)
+	s.recordBindingState(subj, att)
 	if env.Binding.IsRemoval() {
-		// Binding removed from a still-live sandbox: the cached pushes are
-		// stale for the removed binding (a re-added binding gets fresh
-		// pushes) — drop them, never apply them to a policy-less subject.
-		s.dropPendingPushes(subj)
+		// Binding removed from a still-live sandbox: drop the pending policy
+		// (a re-added binding gets a fresh input — never apply the removed
+		// binding's policy to a policy-less subject).
 		s.clearPendingPolicy(subj)
 		if state == subject.StateActive {
 			if err := s.revertToDenyFirst(subj, att); err != nil {
@@ -181,11 +180,6 @@ func (s *fastSandboxPolicyServer) applySetBinding(env *actionhandler.Envelope) (
 		// Deny-first until sandbox.data-plane-ready activates the subject.
 		s.storePendingPolicy(subj, pol)
 	}
-	// Flush cached pushes LAST: a push that landed during the registration
-	// window is newer intent than the binding input, so it overwrites the
-	// pending policy (the lifecycle barrier still holds — it only becomes
-	// effective at data-plane-ready). Vault pushes apply regardless.
-	s.OnRegisteredComplete(subj, att, env.Revision.SpecGeneration)
 	log.Infof("subject %s: SET_BINDING applied (state=%s)", subj, state)
 	return http.StatusOK, nil
 }
