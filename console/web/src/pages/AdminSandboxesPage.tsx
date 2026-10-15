@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { Alert, Select, Space, Table, Typography } from 'antd';
+import { Alert, Select, Space, Table, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { adminApi } from '../api/client';
@@ -22,6 +22,9 @@ import { AdminTenantSelect, ALL_TENANTS, tenantFilterToQuery } from '../componen
 import type { Sandbox } from '../api/types';
 import { consoleTagTableCellProps, SandboxStateTag, TenantTag } from '../components/SemanticTags';
 import { formatDuration, SANDBOX_STATES, sandboxDisplayName } from '../utils/format';
+
+/** Lifecycle maximum page size. A full page can hide later sandboxes for that tenant. */
+const ADMIN_LIST_PAGE_SIZE = 200;
 
 export function AdminSandboxesPage() {
   const [loading, setLoading] = useState(false);
@@ -31,25 +34,36 @@ export function AdminSandboxesPage() {
   const [tenantErrors, setTenantErrors] = useState<
     { tenant: string; code: string; message: string }[]
   >([]);
+  const [capped, setCapped] = useState(false);
+  const requestSeq = useRef(0);
 
-  const load = async () => {
+  const load = useCallback(async () => {
+    const seq = ++requestSeq.current;
     setLoading(true);
     try {
       const data = await adminApi.sandboxes({
-        pageSize: 200,
+        pageSize: ADMIN_LIST_PAGE_SIZE,
         state: stateFilter,
         tenant: tenantFilterToQuery(tenantFilter),
       });
+      if (seq !== requestSeq.current) return;
       setItems(data.items ?? []);
       setTenantErrors(data.pagination?.tenantErrors ?? []);
+      setCapped(Boolean(data.pagination?.capped));
+    } catch (error) {
+      if (seq !== requestSeq.current) return;
+      setItems([]);
+      setTenantErrors([]);
+      setCapped(false);
+      message.error(error instanceof Error ? error.message : '加载沙箱失败');
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
-  };
+  }, [stateFilter, tenantFilter]);
 
   useEffect(() => {
     void load();
-  }, [stateFilter, tenantFilter]);
+  }, [load]);
 
   const columns: ColumnsType<Sandbox> = [
     {
@@ -111,8 +125,16 @@ export function AdminSandboxesPage() {
     <div>
       <Typography.Title level={4}>沙箱（全局）</Typography.Title>
       <Typography.Paragraph type="secondary">
-        来自 Lifecycle 的当前沙箱列表。持久化申请记录见侧栏「沙箱 → 申请历史」。Admin 默认全部租户，可筛选单租户。
+        来自 Lifecycle 的当前沙箱列表，不是持久化申请记录。Admin 默认全部租户，可筛选单租户。
       </Typography.Paragraph>
+      {capped && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message={`每个租户最多显示 ${ADMIN_LIST_PAGE_SIZE} 条，超出的沙箱未列出。`}
+        />
+      )}
       {tenantErrors.length > 0 && (
         <Alert
           type="warning"

@@ -29,6 +29,13 @@ import { useAuth } from '../auth/AuthContext';
 
 const { Header, Sider, Content } = Layout;
 
+function menuKey(pathname: string, isAdmin: boolean): string {
+  if (pathname === '/sandboxes/new') return '/sandboxes/new';
+  if (pathname.startsWith('/admin/sandboxes')) return '/admin/sandboxes';
+  if (pathname.startsWith('/sandboxes')) return isAdmin ? '/admin/sandboxes' : '/sandboxes';
+  return pathname;
+}
+
 export function AppLayout() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
@@ -49,16 +56,7 @@ export function AppLayout() {
     { key: '/diagnostics', icon: <FileSearchOutlined />, label: '诊断' },
   ];
 
-  const selectedKey =
-    location.pathname === '/sandboxes/new'
-      ? '/sandboxes/new'
-      : location.pathname.startsWith('/sandboxes/')
-        ? isAdmin
-          ? '/admin/sandboxes'
-          : '/sandboxes'
-        : location.pathname.startsWith('/admin/sandboxes')
-          ? '/admin/sandboxes'
-          : location.pathname;
+  const selectedKey = menuKey(location.pathname, Boolean(isAdmin));
 
   return (
     <Layout style={{ minHeight: '100vh' }}>

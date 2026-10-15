@@ -27,8 +27,13 @@ from app.tenants import load_tenants
 router = APIRouter(prefix="/pools", tags=["pools"])
 
 
-def _pool_proxy_api_key() -> str:
-    """Pool API is not tenant-scoped; any configured tenant key satisfies Lifecycle auth."""
+async def _pool_proxy(method: str, path: str, **kwargs: Any) -> Any:
+    """Pool API is not tenant-scoped. Try each configured key until one is accepted.
+
+    A revoked or rotated first key must not fail every pool call while another
+    key in tenants.toml is still valid. 401/403 tries the next key; other
+    statuses are the upstream answer.
+    """
     settings = get_settings()
     tenants = load_tenants(settings.tenants_toml_path)
     if not tenants:
@@ -36,7 +41,20 @@ def _pool_proxy_api_key() -> str:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "NO_TENANTS", "message": "No tenants configured for pool proxy"},
         )
-    return tenants[0].api_key
+    client = LifecycleClient(settings)
+    last = None
+    for tenant in tenants:
+        for api_key in tenant.api_keys or (tenant.api_key,):
+            resp = await client.request(api_key, method, path, **kwargs)
+            if resp.status_code not in (401, 403):
+                return await passthrough_json(resp)
+            last = resp
+    if last is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "NO_TENANTS", "message": "No tenants configured for pool proxy"},
+        )
+    return await passthrough_json(last)
 
 
 @router.get("")
@@ -45,14 +63,7 @@ async def list_pools(
     payload: dict = Depends(get_session_payload),
 ) -> Any:
     require_admin_session(payload)
-    client = LifecycleClient(get_settings())
-    resp = await client.request(
-        _pool_proxy_api_key(),
-        "GET",
-        "/pools",
-        params=dict(request.query_params),
-    )
-    return await passthrough_json(resp)
+    return await _pool_proxy("GET", "/pools", params=dict(request.query_params))
 
 
 @router.post("")
@@ -61,9 +72,7 @@ async def create_pool(
     payload: dict = Depends(get_session_payload),
 ) -> Any:
     require_admin_session(payload)
-    client = LifecycleClient(get_settings())
-    resp = await client.request(_pool_proxy_api_key(), "POST", "/pools", json_body=body)
-    return await passthrough_json(resp)
+    return await _pool_proxy("POST", "/pools", json_body=body)
 
 
 @router.get("/{pool_name}")
@@ -72,9 +81,7 @@ async def get_pool(
     payload: dict = Depends(get_session_payload),
 ) -> Any:
     require_admin_session(payload)
-    client = LifecycleClient(get_settings())
-    resp = await client.request(_pool_proxy_api_key(), "GET", f"/pools/{pool_name}")
-    return await passthrough_json(resp)
+    return await _pool_proxy("GET", f"/pools/{pool_name}")
 
 
 @router.put("/{pool_name}")
@@ -84,14 +91,7 @@ async def update_pool(
     payload: dict = Depends(get_session_payload),
 ) -> Any:
     require_admin_session(payload)
-    client = LifecycleClient(get_settings())
-    resp = await client.request(
-        _pool_proxy_api_key(),
-        "PUT",
-        f"/pools/{pool_name}",
-        json_body=body,
-    )
-    return await passthrough_json(resp)
+    return await _pool_proxy("PUT", f"/pools/{pool_name}", json_body=body)
 
 
 @router.delete("/{pool_name}")
@@ -100,6 +100,4 @@ async def delete_pool(
     payload: dict = Depends(get_session_payload),
 ) -> Any:
     require_admin_session(payload)
-    client = LifecycleClient(get_settings())
-    resp = await client.request(_pool_proxy_api_key(), "DELETE", f"/pools/{pool_name}")
-    return await passthrough_json(resp)
+    return await _pool_proxy("DELETE", f"/pools/{pool_name}")

@@ -18,7 +18,7 @@ import { useEffect, useState } from 'react';
 import { adminApi, sandboxApi } from '../api/client';
 import type { RuntimeStats } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
-import { formatDuration } from '../utils/format';
+import { formatDateTime, formatDuration } from '../utils/format';
 
 export function OverviewPage() {
   const { user } = useAuth();
@@ -100,7 +100,7 @@ export function OverviewPage() {
           </Col>
           <Col xs={24} sm={12} md={8}>
             <Card>
-              <Statistic title="统计时间" value={stats.asOf} valueStyle={{ fontSize: 14 }} />
+              <Statistic title="统计时间" value={formatDateTime(stats.asOf)} />
             </Card>
           </Col>
         </Row>

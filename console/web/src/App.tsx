@@ -16,7 +16,7 @@ import { ConfigProvider } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 
-import { AuthProvider, RequireAuth } from './auth/AuthContext';
+import { AuthProvider, RequireAdmin, RequireAuth } from './auth/AuthContext';
 import { AppLayout } from './layout/AppLayout';
 import { AdminSandboxesPage } from './pages/AdminSandboxesPage';
 import { DiagnosticsPage } from './pages/DiagnosticsPage';
@@ -71,9 +71,23 @@ export default function App() {
               <Route path="sandboxes" element={<SandboxListPage />} />
               <Route path="sandboxes/new" element={<SandboxCreatePage />} />
               <Route path="sandboxes/:id" element={<SandboxDetailPage />} />
-              <Route path="admin/sandboxes" element={<AdminSandboxesPage />} />
+              <Route
+                path="admin/sandboxes"
+                element={
+                  <RequireAdmin>
+                    <AdminSandboxesPage />
+                  </RequireAdmin>
+                }
+              />
               <Route path="snapshots" element={<SnapshotsPage />} />
-              <Route path="pools" element={<PoolsPage />} />
+              <Route
+                path="pools"
+                element={
+                  <RequireAdmin>
+                    <PoolsPage />
+                  </RequireAdmin>
+                }
+              />
               <Route path="diagnostics" element={<DiagnosticsPage />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />

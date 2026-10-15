@@ -17,7 +17,9 @@ import type {
   PaginatedSandboxes,
   PoolItem,
   PoolListResponse,
+  PoolUpsertRequest,
   RuntimeStats,
+  TenantListResponse,
   Sandbox,
   SessionUser,
   Snapshot,
@@ -167,8 +169,7 @@ export const sandboxApi = {
 };
 
 export const adminApi = {
-  listTenants: () =>
-    apiRequest<{ items: { name: string; namespace: string }[] }>('/api/admin/tenants'),
+  listTenants: () => apiRequest<TenantListResponse>('/api/admin/tenants'),
   sandboxes: (query: Record<string, string | number | undefined>) => {
     const params = new URLSearchParams();
     Object.entries(query).forEach(([k, v]) => {
@@ -252,9 +253,9 @@ export const snapshotApi = {
 export const poolApi = {
   list: () => apiRequest<PoolListResponse>('/api/pools'),
   get: (name: string) => apiRequest<PoolItem>(`/api/pools/${encodeURIComponent(name)}`),
-  create: (body: Record<string, unknown>) =>
+  create: (body: PoolUpsertRequest) =>
     apiRequest<PoolItem>('/api/pools', { method: 'POST', body: JSON.stringify(body) }),
-  update: (name: string, body: Record<string, unknown>) =>
+  update: (name: string, body: PoolUpsertRequest) =>
     apiRequest<PoolItem>(`/api/pools/${encodeURIComponent(name)}`, {
       method: 'PUT',
       body: JSON.stringify(body),

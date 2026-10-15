@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { Select } from 'antd';
+import { Select, message } from 'antd';
 import { useEffect, useMemo, useState } from 'react';
 
 import { adminApi } from '../api/client';
@@ -44,8 +44,9 @@ export function AdminTenantSelect({ value, onChange, width = 240, placeholder }:
             value: t.name,
           })),
         );
-      } catch {
+      } catch (error) {
         setTenantOptions([]);
+        message.error(error instanceof Error ? error.message : '加载租户列表失败');
       }
     })();
   }, []);
