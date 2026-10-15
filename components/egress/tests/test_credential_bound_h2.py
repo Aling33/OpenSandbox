@@ -55,6 +55,12 @@ class Runtime:
         self.consumed = []
         self.pruned = 0
 
+    def filter_h2_wakeups(self, adapter):
+        pass  # Pure layer harness drives its own Wakeup events.
+
+    def h2_transport_known_terminal(self, *args):
+        return self.h2_transport_terminal(*args)
+
     def token_for(self, client):
         return self.token if client is self.client else None
 

@@ -389,6 +389,46 @@ class SystemH2Hooks(unittest.TestCase):
         self.assertIs(flow.metadata[system.FLOW_REQUEST_HANDLE_KEY], first)
         self.assertTrue(self.adapter.failed)
 
+    def test_unsupported_interpreter_denies_before_adapter_or_request_admission(self):
+        self.runtime.adapter = None
+        data = SimpleNamespace(layer=None, context=SimpleNamespace(
+            client=self.client, server=SimpleNamespace(via=None),
+            options=SimpleNamespace(connection_strategy="lazy")))
+        with patch("credential_bound_h2.sys.version_info", (3, 12, 0)):
+            system.next_layer(data)
+        self.assertEqual(self.runtime.closed, [self.client])
+        self.assertIsNone(data.layer)
+        self.assertEqual(self.runtime.acquisitions, 0)
+        self.assertEqual(self.runtime.registry.request_count, 0)
+        # TLS admission precedes ALPN; normal disconnect reclaims that slot.
+        self.runtime.client_disconnected(self.client)
+        self.assertEqual(self.runtime.registry.count, 0)
+
+    def test_genuine_cleartext_h2_is_not_credential_admitted(self):
+        flow = self.flow()
+        self.runtime.adapter = None
+        self.runtime.client_disconnected(self.client)
+        self.client.tls = False
+        self.client.alpn = None
+        flow.request.scheme = "http"
+        flow.request.port = 80
+        system.requestheaders(flow)
+        self.assertEqual(self.runtime.acquisitions, 0)
+        self.assertEqual(self.runtime.closed, [])
+        self.assertIsNone(flow.error)
+        self.assertIsNone(flow.response)
+        self.assertNotIn("authorization", flow.request.headers)
+
+    def test_untracked_tls_h2_cannot_bypass_with_http_scheme(self):
+        flow = self.flow()
+        self.runtime.adapter = None
+        self.runtime.client_disconnected(self.client)
+        flow.request.scheme = "http"
+        system.requestheaders(flow)
+        self.assertEqual(self.runtime.closed, [self.client])
+        self.assertEqual(self.runtime.acquisitions, 0)
+        self.assertIsNotNone(flow.error)
+
     def test_known_chained_h2_rejected_before_selector_or_attachment(self):
         data = SimpleNamespace(
             layer=None,

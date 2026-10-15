@@ -12,6 +12,7 @@ termination, including the narrow D3 fallback, belongs to LiveRuntime.
 from __future__ import annotations
 
 import importlib.metadata
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -44,6 +45,11 @@ class H2OwnershipError(ValueError):
 
 
 def dependency_versions_supported() -> bool:
+    # mitmproxy enables eager tasks on Python >= 3.12. Its ServerConnect hook
+    # then runs before transports[connection] is registered, outside this
+    # adapter's proven ownership ordering. Reject before installing the layer.
+    if sys.implementation.name != "cpython" or sys.version_info[:2] not in ((3, 10), (3, 11)):
+        return False
     try:
         return all(
             importlib.metadata.version(name) == pin for name, pin in PINS.items()
@@ -358,7 +364,7 @@ class BoundH2Server(Http2Server):
             raise H2OwnershipError("credential proxy: unsupported H2 upstream protocol")
         return protocol
 
-    def _association(self, record):
+    def _association(self, record, *, remember=True):
         sid, flow = record.identity.stream_id, record.flow
         pending = []
         for conn, waiting in self.http_layer.waiting_for_establishment.items():
@@ -375,7 +381,8 @@ class BoundH2Server(Http2Server):
         if pending:
             conn, owner = pending[0]
             child = self._upstream_child(conn, owner)
-            record.upstream = (conn, owner)
+            if remember:
+                record.upstream = (conn, owner)
             return conn, owner, child, "connecting", None
 
         conn = flow.server_conn
@@ -421,7 +428,8 @@ class BoundH2Server(Http2Server):
             )
         if kind == "unsent" and record.upstream is None:
             return None
-        record.upstream = (conn, owner)
+        if remember:
+            record.upstream = (conn, owner)
         return conn, owner, child, kind, ours
 
     def owned_upstreams(self):
@@ -439,12 +447,14 @@ class BoundH2Server(Http2Server):
             raise
         return tuple(result)
 
-    def _upstream_done(self, record):
-        association = self._association(record)
+    def _upstream_done(self, record, *, observe=True):
+        association = self._association(record, remember=observe)
         if association is None:
             return True, False
         conn, owner, child, kind, ours = association
-        if self.runtime.h2_transport_terminal(self, conn, owner):
+        terminal = (self.runtime.h2_transport_terminal if observe
+                    else self.runtime.h2_transport_known_terminal)
+        if terminal(self, conn, owner):
             return True, False
         if kind in ("connecting", "queued"):
             return False, False
@@ -491,6 +501,50 @@ class BoundH2Server(Http2Server):
         self._refused.clear()
         self._handle_event = self.done
 
+    def _request_finished(self, sid, record, upstream_done):
+        return (
+            record.application_done
+            and sid not in self.http_layer.streams
+            and self.is_closed(sid)
+            and not self.h2_conn.stream_buffers.get(sid)
+            and sid not in self.h2_conn.stream_trailers
+            and upstream_done
+        )
+
+    def maintenance_needed(self):
+        """Read-only wake filter; no task observation or protocol commands.
+
+        A fence, pending request, or future deadline alone is not progress.
+        Polling those must not refresh mitmproxy's inactivity watchdog.
+        """
+        if self.client_closed or self.close_started:
+            return False
+        state = self.runtime.registry.drain_state(self.token)
+        if (self.failed or state is None
+                or (state.fenced and state.frozen_last_stream_id is None)
+                or (state.deadline is not None and time.monotonic() >= state.deadline)
+                or any(sid not in self._active for sid in self.h2_conn.stream_trailers)):
+            return True
+        try:
+            for sid, record in self._active.items():
+                upstream_done, upstream_trailers = self._upstream_done(record, observe=False)
+                if self._request_finished(sid, record, upstream_done):
+                    return True
+                if ((self.is_closed(sid) and sid in self.h2_conn.stream_trailers)
+                        or upstream_trailers) and state.deadline is None:
+                    return True
+                if (record.peer_reset and record.response_done
+                        and not record.request_ended and not upstream_done):
+                    return True
+        except H2OwnershipError:
+            return True  # normal event dispatch performs the fail-closed transition
+        return bool(
+            state.fenced and state.frozen_last_stream_id is not None
+            and not self._active and not self._pending and not self._claimed
+            and not self._refused and not self.http_layer.streams
+            and not self.h2_conn.stream_buffers and not self.h2_conn.stream_trailers
+        )
+
     def _maintain(self):
         if self.client_closed:
             return
@@ -522,14 +576,7 @@ class BoundH2Server(Http2Server):
                         # An early response suppresses the dependency's reset
                         # propagation. An empty buffer does not finish upload.
                         self.fail_closed()
-                    if (
-                        record.application_done
-                        and sid not in self.http_layer.streams
-                        and self.is_closed(sid)
-                        and not self.h2_conn.stream_buffers.get(sid)
-                        and sid not in self.h2_conn.stream_trailers
-                        and upstream_done
-                    ):
+                    if self._request_finished(sid, record, upstream_done):
                         self._active.pop(sid)
                         self.streams.pop(sid, None)
                         if (
@@ -570,5 +617,11 @@ class BoundH2Server(Http2Server):
             yield from self._close_owned()
             return
         if self._wakeup is None:
+            try:
+                self.runtime.filter_h2_wakeups(self)
+            except ValueError:
+                self.fail_closed()
+                yield from self._close_owned()
+                return
             self._wakeup = commands.RequestWakeup(_POLL_SECONDS)
             yield self._wakeup

@@ -1649,10 +1649,19 @@ def _requestheaders_live(live: Any, flow: http.HTTPFlow) -> None:
     must acquire request admission; a fenced connection (removed host, drained
     revision) is rejected and never falls back to the retired snapshot.
     """
+    client = getattr(flow, "client_conn", None)
     if (
-        getattr(getattr(flow, "client_conn", None), "alpn", None) == b"h2"
+        getattr(client, "alpn", None) == b"h2"
         or (flow.request.http_version or "").upper() in ("HTTP/2", "HTTP/2.0")
     ):
+        # Genuine cleartext H2 remains outside credential admission. Scheme
+        # alone cannot establish that: tracked/decrypted H2 must validate its
+        # captured raw identity even after another hook rewrites the scheme.
+        if (getattr(client, "tls", None) is False
+                and getattr(client, "alpn", None) is None
+                and live.token_for(client) is None and live.h2_for(client) is None
+                and (flow.request.scheme or "").lower() == "http"):
+            return
         _requestheaders_live_h2(live, flow)
         return
     if (flow.request.scheme or "").lower() != "https":

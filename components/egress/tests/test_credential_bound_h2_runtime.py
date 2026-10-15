@@ -1034,6 +1034,8 @@ def fingerprint():
 
 
 def preflight(metadata):
+    if sys.implementation.name != "cpython" or sys.version_info[:2] not in ((3, 10), (3, 11)):
+        raise Blocked("H2 adapter requires CPython 3.10 or 3.11; eager-task runtimes are unsupported")
     executable = Path(sys.executable).parent / "mitmdump"
     if not executable.is_file():
         raise Blocked("mitmdump must exist beside this pinned venv Python; no install attempted")

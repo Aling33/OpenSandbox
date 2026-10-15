@@ -38,7 +38,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install mitmproxy
-        run: pip install mitmproxy==11.0.2
+        run: pip install mitmproxy==11.0.2 h2==4.1.0 hyperframe==6.0.1
 
       - name: Check gofmt
         working-directory: components/egress
@@ -139,6 +139,67 @@ jobs:
         working-directory: components/egress
         run: |
           python -m unittest discover -v -s tests -p "test_*.py"
+
+      - name: Set up Python for H2 runtime coverage
+        # Unit discovery above covers 3.10; exercise real runtime on 3.11 too.
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Prepare pinned H2 runtime environment
+        run: |
+          python -m venv "$RUNNER_TEMP/h2-runtime-venv"
+          "$RUNNER_TEMP/h2-runtime-venv/bin/python" -m pip install \
+            mitmproxy==11.0.2 h2==4.1.0 hyperframe==6.0.1
+
+      - name: Run pinned H2 lifecycle and watchdog regressions
+        run: |
+          "$RUNNER_TEMP/h2-runtime-venv/bin/python" -m unittest discover -v \
+            -s components/egress/tests -p 'test_credential_bound_h2*.py'
+
+      - name: Run H2 loopback runtime regressions
+        # A real loopback destination on port 443 is part of this fixture.
+        # This does not cover transparent redirects, the production UID or quarantine.
+        run: |
+          sudo "$RUNNER_TEMP/h2-runtime-venv/bin/python" \
+            components/egress/tests/test_credential_bound_h2_runtime.py \
+            --run-real-runtime --artifacts "$RUNNER_TEMP/h2-runtime-evidence"
+
+      - name: Make H2 runtime evidence readable by the runner
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/h2-runtime-evidence" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/h2-runtime-evidence"
+          fi
+
+      - name: Upload H2 runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: h2-runtime-evidence
+          path: ${{ runner.temp }}/h2-runtime-evidence
+          if-no-files-found: warn
+          retention-days: 5
+
+      - name: Set up unsupported Python for fail-closed checks
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Prepare unsupported-interpreter test environment
+        run: |
+          python -m venv "$RUNNER_TEMP/h2-unsupported-venv"
+          "$RUNNER_TEMP/h2-unsupported-venv/bin/python" -m pip install \
+            mitmproxy==11.0.2 h2==4.1.0 hyperframe==6.0.1
+
+      - name: Verify Python 3.12 rejection and admission cleanup
+        # Negative compatibility checks only, not positive H2 runtime coverage.
+        working-directory: components/egress/tests
+        run: |
+          "$RUNNER_TEMP/h2-unsupported-venv/bin/python" -m unittest -v \
+            test_credential_bound_h2_compatibility \
+            test_system_h2.SystemH2Hooks.test_unsupported_interpreter_denies_before_adapter_or_request_admission \
+            test_credential_bound_h2_lifecycle.H2RuntimeLifecycleTest.test_actual_system_rejects_unsupported_interpreter_without_retaining_tls
 
   smoke:
     needs: changes

@@ -570,7 +570,7 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
                 finally:
                     f.cleanup()
 
-    def test_pending_task_and_unconsumed_close_never_fire(self):
+    def test_pending_task_waits_but_unproven_completed_close_exits(self):
         f = self.fixture()
         f.establish()
         f.process._h2_task_done(f.item, f.item.task)
@@ -579,10 +579,10 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
         f.item.task.cancel("test cancellation without normal close")
         f.sched.ready()
         self.assertFalse(f.item.close_consumed)
-        self.assertEqual(f.exits, [])
+        self.assertEqual(f.exits, [87])
         self.assert_retained(f)
 
-    def test_done_without_exact_connect_error_hook_stays_blocked(self):
+    def test_done_without_exact_connect_error_hook_exits_without_release(self):
         f = self.fixture()
         f.item.task.cancel("test unobserved preconnect cancellation")
         f.sched.ready()
@@ -590,9 +590,8 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
         self.assertFalse(f.item.close_consumed)
         self.assertIsNone(f.item.connect_error_io)
         self.assertFalse(f.item.terminal)
-        self.assertTrue(f.adapter.failed)
-        self.assertIn(id(f.ctx.client), f.process._h2_cleanup_blocked)
-        self.assertEqual(f.exits, [])
+        self.assertTrue(f.process._h2_exit_started)
+        self.assertEqual(f.exits, [87])
         self.assert_retained(f)
 
     def test_actual_connect_error_hook_proves_normal_no_io_completion(self):
@@ -615,7 +614,7 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
         f.handler.transports[f.item.connection].writer.close()  # fixture state
         f.close()
         f.sched.ready()
-        self.assertEqual(f.exits, [])
+        self.assertEqual(f.exits, [87])
         self.assertFalse(
             f.process.h2_transport_terminal(f.adapter, f.item.connection, f.item.owner)
         )
@@ -668,14 +667,14 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
                     f.adapter, f.item.connection, f.item.owner
                 )
             )
-            self.assertEqual(f.exits, [])
+            self.assertEqual(f.exits, [87])
             f.process.client_disconnected(f.ctx.client)
             self.assert_retained(f)
         finally:
             writer.transport.close_fails = False
             writer.close()  # fixture cleanup only
 
-    def test_stale_owner_or_current_io_never_fires_or_releases(self):
+    def test_stale_admission_ignored_but_current_unknown_ownership_exits(self):
         cases = (
             "proxy_handler",
             "client_identity",
@@ -744,7 +743,7 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
                         f.adapter.runtime = make_runtime(f.proxyserver, f.sched.loop)
                     f.sched.ready()
                     self.assertTrue(f.item.task.done())
-                    self.assertEqual(f.exits, [])
+                    self.assertEqual(f.exits, [] if changed in ("runtime_token", "runtime_adapter") else [87])
                     self.assertFalse(f.item.terminal)
                 finally:
                     if removed is not None:
@@ -849,8 +848,7 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
         f.sched.ready()
         self.assertTrue(f.item.task.done())
         self.assertFalse(f.item.close_consumed)
-        self.assertEqual(f.exits, [])
-        self.assertTrue(f.adapter.failed)
+        self.assertEqual(f.exits, [87])
         self.assertEqual(
             f.process.acquire_request(f.item.token, client_stream_id=3).action, "deny"
         )
@@ -935,7 +933,7 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
 
     def test_hard_exit_isolated_child_and_normal_control(self):
         parent = os.getpid()
-        for mode, expected in (("fatal", 86), ("normal", 0)):
+        for mode, expected in (("fatal", 86), ("ownership", 87), ("normal", 0)):
             with self.subTest(mode=mode):
                 result = subprocess.run(
                     [
@@ -956,6 +954,9 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
                 self.assertIn("ISOLATED_CHILD_READY", result.stdout)
                 self.assertEqual(os.getpid(), parent)
                 self.assertNotIn("UNREACHABLE_AFTER_FATAL", result.stdout)
+
+    def test_actual_system_rejects_unsupported_interpreter_without_retaining_tls(self):
+        self._actual_system_assembly(connected=False, unsupported=True)
 
     def test_actual_system_adapter_runtime_assembly_disconnect(self):
         self._actual_system_assembly(connected=True)
@@ -982,9 +983,12 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
         normal_established=False,
         connect_error=None,
         transport_error=False,
+        unsupported=False,
     ):
-        from credential_bound_h2 import BoundH2Server
+        from credential_bound_h2 import BoundH2Server, dependency_versions_supported
 
+        if not unsupported and not dependency_versions_supported():
+            self.skipTest("supported CPython 3.10/3.11 pinned runtime assembly only")
         spec = importlib.util.spec_from_file_location(
             "h2_lifecycle_system", MITMSCRIPTS / "system.py"
         )
@@ -1119,11 +1123,24 @@ class H2RuntimeLifecycleTest(unittest.TestCase):
                 self.assertEqual(exits, expected_exits)
             deregistered.append(True)
 
+        if unsupported:
+            version_patch = mock.patch("credential_bound_h2.sys.version_info", (3, 12, 0))
+            version_patch.start()
+            self.addCleanup(version_patch.stop)
         lifecycle = scheduler.loop.create_task(registered_client())
         scheduler.ready()
         reader.feed_data(peer.data_to_send())
         scheduler.ready()
         adapter = runtime.h2_for(context.client)
+        if unsupported:
+            self.assertIsNone(adapter)
+            self.assertTrue(lifecycle.done())
+            self.assertTrue(deregistered)
+            self.assertNotIn("server_connect", handler.hooks)
+            self.assertEqual(runtime.registry.count, 0)
+            self.assertEqual(runtime.registry.request_count, 0)
+            self.assertEqual(exits, [])
+            return
         self.assertIs(
             type(adapter),
             BoundH2Server,
@@ -1277,6 +1294,9 @@ def isolated_child(mode):
             f.handler.connected_gate.set_result(None)
             f.sched.ready()
         print("ISOLATED_CHILD_READY", flush=True)
+        if mode == "ownership":
+            f.process._block_h2_cleanup(f.adapter)
+            raise AssertionError("UNREACHABLE_AFTER_FATAL")
         f.close()
         f.sched.ready()
         if mode == "fatal":
@@ -1288,7 +1308,7 @@ def isolated_child(mode):
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--isolated-child":
-        if sys.argv[2] not in ("fatal", "normal"):
+        if sys.argv[2] not in ("fatal", "ownership", "normal"):
             raise SystemExit(2)
         isolated_child(sys.argv[2])
     else:

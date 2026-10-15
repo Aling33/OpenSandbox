@@ -59,6 +59,8 @@ _DRAIN_INTERVAL_SECONDS = 0.5
 _DRAIN_PAGE_LIMIT = 64
 _LIVE_RUNTIME_ERROR = "credential proxy: invalid revision runtime configuration"
 _H2_PROCESS_EXIT_CODE = 86
+_H2_OWNERSHIP_EXIT_CODE = 87
+_ABSENT = object()
 _H2_OWNERSHIP_ERROR = "credential proxy: unverified H2 transport ownership"
 
 _LIVE_ENV = {
@@ -166,7 +168,7 @@ class LiveRuntime:
         self._h2: dict[int, tuple[Any, Any]] = {}
         self._h2_transports: dict[asyncio.Task, _H2Transport] = {}
         self._h2_disconnected: set[int] = set()
-        self._h2_cleanup_blocked: set[int] = set()
+        self._h2_wakeup_hooks: dict[int, tuple[Any, Any, Any, set]] = {}
         self._h2_exit_started = False
         # Captured inside the event loop at the first tracked handshake; used
         # by the drain thread to schedule thread-safe transport closure.
@@ -283,6 +285,94 @@ class LiveRuntime:
             self._h2[id(client_conn)] = (client_conn, adapter)
         return True
 
+    def _h2_handler(self, adapter: Any) -> Any:
+        from mitmproxy.proxy import server
+
+        client, root = adapter.context.client, adapter.http_layer
+        handler = getattr(self._proxyserver, "connections", {}).get(client.id)
+        if not (
+            self._on_h2_loop() and not self._closed
+            and self.h2_for(client) is adapter
+            and self.token_for(client) is adapter.token
+            and self._connection_for_serial(adapter.token.serial) is client
+            and isinstance(handler, server.ConnectionHandler)
+            and handler.client is client and root.context.client is client
+            and any(node is root for node in _layer_chain(handler.layer))
+            and _exact_entry(root.connections, client, adapter)
+        ):
+            raise ValueError(_H2_OWNERSHIP_ERROR)
+        return handler
+
+    def filter_h2_wakeups(self, adapter: Any) -> None:
+        """Filter only this adapter's ordinary, dependency-registered wakeup.
+
+        Poll in the existing wakeup task without delivering no-op server events:
+        those events reset the dependency watchdog even without network traffic.
+        Neither command routing maps nor dependency classes are patched.
+        """
+        handler = self._h2_handler(adapter)
+        key = id(adapter.context.client)
+        installed = self._h2_wakeup_hooks.get(key)
+        if installed is not None:
+            if installed[0] is not handler or handler.wakeup is not installed[2]:
+                raise ValueError(_H2_OWNERSHIP_ERROR)
+            return
+        from mitmproxy.proxy import server
+
+        previous = handler.__dict__.get("wakeup", _ABSENT)
+        original = handler.wakeup
+        if (getattr(original, "__self__", None) is not handler
+                or getattr(original, "__func__", None) is not server.ConnectionHandler.wakeup):
+            raise ValueError(_H2_OWNERSHIP_ERROR)
+        tasks: set[asyncio.Task] = set()
+
+        async def wakeup(request):
+            from mitmproxy.proxy import events
+
+            if request is not adapter._wakeup:
+                await original(request)
+                return
+            task = asyncio.current_task()
+            tasks.add(task)
+            try:
+                while True:
+                    # Preserve the dependency's initial suspension and its
+                    # registration/cancellation ordering, even for fast tasks.
+                    await asyncio.sleep(request.delay)
+                    if adapter.client_closed or adapter.close_started:
+                        return
+                    if (request is not adapter._wakeup
+                            or handler.wakeup is not wakeup
+                            or self._h2_handler(adapter) is not handler):
+                        raise ValueError(_H2_OWNERSHIP_ERROR)
+                    if adapter.maintenance_needed():
+                        handler.wakeup_timer.discard(task)
+                        await handler.server_event(events.Wakeup(request))
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - never silently lose drain checks
+                self._block_h2_cleanup(adapter)
+            finally:
+                tasks.discard(task)
+                handler.wakeup_timer.discard(task)
+
+        handler.wakeup = wakeup
+        self._h2_wakeup_hooks[key] = (handler, previous, wakeup, tasks)
+
+    def _restore_h2_wakeups(self, client: Any) -> None:
+        installed = self._h2_wakeup_hooks.pop(id(client), None)
+        if installed is None:
+            return
+        handler, previous, wrapper, tasks = installed
+        if handler.wakeup is wrapper:
+            if previous is _ABSENT:
+                del handler.wakeup
+            else:
+                handler.wakeup = previous
+        for task in tuple(tasks):
+            task.cancel()
+
     # -- Request admission path -------------------------------------------
 
     def acquire_request(
@@ -310,6 +400,7 @@ class LiveRuntime:
             return
         adapter = self.h2_for(client_conn)
         if adapter is not None:
+            self._restore_h2_wakeups(client_conn)
             self._h2_disconnected.add(id(client_conn))
             adapter.on_client_disconnected()
             try:
@@ -517,13 +608,25 @@ class LiveRuntime:
             or self._h2_transports.get(item.task) is not item
             or completed is not item.task
             or not item.task.done()
-            or not self._h2_ownership_current(item)
+            or not self._on_h2_loop()
         ):
             return
-        current = item.handler.transports.get(item.connection)
-        if current is not None and not _exact_entry(item.handler.transports, item.connection, current):
+        # Released/replaced admissions make this callback stale. An admission
+        # still owned by this runtime cannot silently retain capacity when its
+        # completed task's physical ownership proof has become unverifiable.
+        if (self.h2_for(item.client) is not item.adapter
+                or self.token_for(item.client) is not item.token
+                or self._connection_for_serial(item.token.serial) is not item.client):
             return
-        if current is not None and current.handler is not item.task:
+        if not self._h2_ownership_current(item):
+            self._block_h2_cleanup(item.adapter)
+            return
+        current = item.handler.transports.get(item.connection)
+        if current is not None and (
+            not _exact_entry(item.handler.transports, item.connection, current)
+            or current.handler is not item.task
+        ):
+            self._block_h2_cleanup(item.adapter)
             return
         if current is None:
             io = item.connected_io or item.close_io
@@ -565,6 +668,14 @@ class LiveRuntime:
         else:
             self._block_h2_cleanup(item.adapter)
 
+    def h2_transport_known_terminal(self, adapter: Any, conn: Any, owner: Any) -> bool:
+        """Read existing terminal proof without observing tasks or releasing state."""
+        return any(
+            item.adapter is adapter and item.connection is conn and item.owner is owner
+            and item.terminal and self._h2_ownership_current(item)
+            for item in self._h2_transports.values()
+        )
+
     def h2_transport_terminal(self, adapter: Any, conn: Any, owner: Any) -> bool:
         try:
             item = self._observe_h2(adapter, conn, owner)
@@ -593,7 +704,7 @@ class LiveRuntime:
         client = adapter.context.client
         if (
             id(client) not in self._h2_disconnected
-            or id(client) in self._h2_cleanup_blocked
+            or self._h2_exit_started
             or self.h2_for(client) is not adapter
             or self.token_for(client) is not adapter.token
         ):
@@ -621,13 +732,13 @@ class LiveRuntime:
         self._release_client(client)
 
     def _block_h2_cleanup(self, adapter: Any) -> None:
-        key = id(adapter.context.client)
-        first = key not in self._h2_cleanup_blocked
-        self._h2_cleanup_blocked.add(key)
-        adapter.fail_closed()
-        if first:
-            with suppress(Exception):
-                ctx.log.warn(_H2_OWNERSHIP_ERROR)
+        # Unverifiable cleanup is a distinct fatal recovery condition, not D3's
+        # proven current-writer defect. Do not release unproven resources or
+        # leave a healthy-looking process holding their budgets indefinitely.
+        if self._h2_exit_started:
+            return
+        self._h2_exit_started = True
+        os._exit(_H2_OWNERSHIP_EXIT_CODE)
 
     # -- Drain -------------------------------------------------------------
 
@@ -711,6 +822,8 @@ class LiveRuntime:
 
         The IPC server's close() fences the receiver; system.py owns it.
         """
+        for client, _ in tuple(self._h2.values()):
+            self._restore_h2_wakeups(client)
         self._drain_stop.set()
         if self._drain_thread.is_alive() and threading.current_thread() is not self._drain_thread:
             self._drain_thread.join(timeout=2)
