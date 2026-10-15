@@ -78,6 +78,13 @@ RUN cd /workspace/components/internal && \
               -X 'github.com/alibaba/opensandbox/internal/version.GitCommit=${GIT_COMMIT}'" \
     -o /out/opensandbox-supervisor ./cmd/supervisor
 
+# egress-trace: read-only admission viewer (policy API + nft sets/leases +
+# /proc sockets) for demos and troubleshooting; stdlib-only, same module.
+# Run inside the container via docker exec.
+RUN go build ${GOFLAGS} -trimpath -buildvcs=false \
+    -ldflags "-s -w -buildid= -B none" \
+    -o /out/egress-trace ./tools/egress-trace
+
 FROM debian:bookworm-slim
 
 # Optional Debian mirror host for restricted build networks (e.g.
@@ -141,6 +148,7 @@ RUN chown mitmproxy:mitmproxy /var/lib/mitmproxy/.mitmproxy/config.yaml \
 # All egress runtime artifacts live under one directory to keep paths grouped.
 COPY --from=builder /out/egress /opt/opensandbox-egress/egress
 COPY --from=builder /out/opensandbox-supervisor /opt/opensandbox-egress/supervisor
+COPY --from=builder /out/egress-trace /opt/opensandbox-egress/egress-trace
 # Pre-start hook: reap any mitmdump left over from a previous crashed
 # egress, and remove stale DNS-redirect iptables rules + opensandbox_dns_redirect
 # nft tables left pointing at a dead proxy. The `inet opensandbox` policy table
@@ -150,7 +158,9 @@ COPY components/egress/scripts/cleanup.sh /opt/opensandbox-egress/cleanup.sh
 RUN chmod 0755 /opt/opensandbox-egress/cleanup.sh \
             /opt/opensandbox-egress/egress \
             /opt/opensandbox-egress/supervisor \
-    && ln -s /opt/opensandbox-egress/egress /egress
+            /opt/opensandbox-egress/egress-trace \
+    && ln -s /opt/opensandbox-egress/egress /egress \
+    && ln -s /opt/opensandbox-egress/egress-trace /usr/local/bin/egress-trace
 
 COPY components/egress/mitmscripts /var/egress/mitmscripts
 # The mitmdump addon is loaded by the mitmproxy user (uid 10042): normalize
