@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using OpenSandbox.Adapters;
 using OpenSandbox.Config;
 using OpenSandbox.Core;
 using OpenSandbox.Factory;
@@ -193,6 +194,11 @@ public sealed class Sandbox : IAsyncDisposable
         ValidateHostPaths(options.Volumes);
         var startupSource = options.Image ?? options.SnapshotId;
 
+        if (options.NetworkPolicy?.Egress is { Count: > 0 })
+        {
+            NetworkPolicyCodec.ValidateRules(options.NetworkPolicy.Egress, nameof(options.NetworkPolicy.Egress));
+        }
+
         var request = new CreateSandboxRequest
         {
             Image = string.IsNullOrWhiteSpace(options.Image)
@@ -270,6 +276,11 @@ public sealed class Sandbox : IAsyncDisposable
         options.IdlePolicy?.Validate();
 
         var connectionConfig = options.ConnectionConfig ?? new ConnectionConfig();
+        if (options.NetworkPolicy?.Egress is { Count: > 0 })
+        {
+            NetworkPolicyCodec.ValidateRules(options.NetworkPolicy.Egress, nameof(options.NetworkPolicy.Egress));
+        }
+
         var request = new CreateSandboxRequest
         {
             TemplateId = options.TemplateId,

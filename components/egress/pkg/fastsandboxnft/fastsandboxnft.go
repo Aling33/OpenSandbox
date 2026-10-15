@@ -153,6 +153,10 @@ type Options struct {
 	// needed; the drop is the source-IP-model equivalent of the sidecar
 	// profile's uid-scoped upstream rules.
 	UpstreamProxy *UpstreamProxyEndpoint
+	// PortFloorDenyRanges carries the platform port cap (reachable.ports.cap
+	// complement), enforced profile-wide in the master chains. User
+	// port-scoped rules never reach this profile (#2213).
+	PortFloorDenyRanges []policy.PortRange
 }
 
 // installedSubject tracks the enforcement state the applier owns in memory;
@@ -334,6 +338,19 @@ func (a *Applier) ApplyPolicy(ctx context.Context, s subject.Subject, pol *polic
 	if pol == nil {
 		pol = policy.DefaultDenyPolicy()
 	}
+	// User port-scoped rules (Ports) would be silently dropped by the fast
+	// path — a deny rule that stops denying is fail-open — so refuse the
+	// apply. PortRanges-only rules are the platform floor, enforced in the
+	// master chains, and are exempt.
+	blocked := 0
+	for _, r := range pol.Egress {
+		if len(r.Ports) > 0 {
+			blocked++
+		}
+	}
+	if blocked > 0 {
+		return fmt.Errorf("fastsandboxnft: subject policy carries %d port-scoped rule(s), which the fast path cannot enforce", blocked)
+	}
 	var b strings.Builder
 	if err := writeSubjectPolicySwapFragment(&b, s, pol, a.opts.MitmRedirectPort); err != nil {
 		return err
@@ -512,14 +529,37 @@ func (a *Applier) writeTableHeader(b *strings.Builder) error {
 		fmt.Fprintf(b, "add rule inet %s %s ct state established,related accept\n", TableName, inputChain)
 	}
 	if !a.opts.BlockDoH443 {
+		a.writePortFloorFragment(b)
 		writeFailClosedTail(b)
 		return nil
 	}
 	if err := a.writeDoHBlockFragment(b); err != nil {
 		return err
 	}
+	a.writePortFloorFragment(b)
 	writeFailClosedTail(b)
 	return nil
+}
+
+// writePortFloorFragment emits the cap complement as one drop rule per
+// master chain. The input rule only fires on MITM-redirected flows
+// (tcp dport <MitmRedirectPort>); fsb DNS shares the same DNAT gate
+// (REDIRECT to :15353) and must not match, and the original — not the
+// redirect — port is evaluated via ct.
+func (a *Applier) writePortFloorFragment(b *strings.Builder) {
+	if len(a.opts.PortFloorDenyRanges) == 0 {
+		return
+	}
+	members := make([]string, 0, len(a.opts.PortFloorDenyRanges))
+	for _, rg := range a.opts.PortFloorDenyRanges {
+		members = append(members, fmt.Sprintf("%d-%d", rg.Lo, rg.Hi))
+	}
+	fmt.Fprintf(b, "add rule inet %s %s tcp dport { %s } drop\n", TableName, dispatchChain, strings.Join(members, ", "))
+	if a.opts.MitmRedirectPort > 0 {
+		fmt.Fprintf(b,
+			"add rule inet %s %s ct status dnat tcp dport %d ct original proto-dst { %s } drop\n",
+			TableName, inputChain, a.opts.MitmRedirectPort, strings.Join(members, ", "))
+	}
 }
 
 // writeFailClosedTail appends the master-chain rule that drops every

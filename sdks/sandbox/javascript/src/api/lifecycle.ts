@@ -1312,10 +1312,10 @@ export interface components {
             onIdle?: "pause";
             /**
              * @description Whether incoming traffic may wake the sandbox from `Paused`.
+             *     Defaults to `true` when omitted.
              *     `false` keeps today's paused behavior (permanent 503 through the
              *     gateway) and only `POST /sandboxes/{sandboxId}/resume` restores
              *     the sandbox.
-             * @default true
              */
             wakeOnAccess?: boolean;
             /**
@@ -1339,10 +1339,7 @@ export interface components {
              *     whitespace or control characters.
              */
             path: string;
-            /**
-             * @description Probe request budget in seconds. The server defaults to 2 when omitted.
-             * @default 2
-             */
+            /** @description Probe request budget in seconds. The server defaults to 2 when omitted. */
             timeoutSeconds?: number;
         };
         /**
@@ -1674,6 +1671,7 @@ export interface components {
              */
             enabled: boolean;
         };
+        /** @description Egress rule. At least one of `target` or `ports` must be provided; when both are present the rule applies to `ports` on `target` only. Enforced by the server and the egress sidecar. */
         NetworkRule: {
             /**
              * @description Whether to allow or deny matching targets.
@@ -1681,10 +1679,30 @@ export interface components {
              */
             action: "allow" | "deny";
             /**
-             * @description FQDN or wildcard domain (e.g., "example.com", "*.example.com").
-             *     IP/CIDR not yet supported in the egress MVP.
+             * @description FQDN, wildcard domain (e.g., "example.com", "*.example.com"), IP
+             *     address, or CIDR. May be omitted when `ports` is set (see below);
+             *     otherwise required.
              */
-            target: string;
+            target?: string;
+            /**
+             * @description Restricts this rule to specific TCP destination ports.
+             *
+             *     - `target` omitted, `ports` set: the rule applies to these ports
+             *       across all IPv4/IPv6 destinations.
+             *     - `target` is an IP or CIDR, `ports` set: the rule applies to that
+             *       destination only on these ports.
+             *     - `target` is a domain: `ports` is rejected with a validation
+             *       error. Domain rules are evaluated at the DNS layer, which has no
+             *       port dimension; combining them is not supported yet.
+             *
+             *     TCP only for now; UDP port scoping is not supported.
+             *
+             *     Under `defaultAction: deny`, the DNS proxy still denies hostname
+             *     lookups for targetless allow rules (it matches domain rules
+             *     only), so this shape serves direct-IP clients; hostname access
+             *     requires explicit domain rules or stable IPs.
+             */
+            ports?: number[];
         };
         /**
          * @description Storage mount definition for a sandbox. Each volume entry contains:
