@@ -704,15 +704,18 @@ else
 
 ###############################################################################
   info "Test 12: MITM-mode restart recovery (DNAT rebuild + pinned CA stability + action replay)"
-  fp_before="$(healthz_fingerprint)"
-  [ -n "${fp_before}" ] || fail "pinned CA fingerprint must be present before restart"
+  # Test 11c left the addon DOWN (no fingerprint on healthz), so stability is
+  # asserted against the pinned seed itself — the previous up generation was
+  # proven equal to it in Test 11b, and the restart must land on it again.
+  # This restart also exercises the idempotent re-seed over an already-seeded
+  # confdir.
   kill "${EGRESS_PID}" 2>/dev/null
   wait "${EGRESS_PID}" 2>/dev/null || true
   EGRESS_PID=""
   EGRESS_MITM=1 start_egress
   got_fp="$(healthz_fingerprint)"
   [ -n "${got_fp}" ] || fail "pinned CA fingerprint must be present after restart"
-  [ "${got_fp}" = "${fp_before}" ] || fail "pinned CA fingerprint must be stable across egress restart (no rotation): ${fp_before} -> ${got_fp}"
+  [ "${got_fp}" = "${SEED_FP}" ] || fail "pinned CA fingerprint after restart ${got_fp} must equal the pinned seed ${SEED_FP} (no rotation)"
   pass "pinned CA fingerprint stable across restart (${got_fp:0:12}...)"
   set_binding a 10.10.0.5 9 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
   wait_for 15 "DNAT rebuilt after restart" bash -c "nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '"
