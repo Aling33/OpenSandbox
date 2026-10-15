@@ -121,9 +121,14 @@ type Registry interface {
 	// RegisterAndEnforce observes a binding for the subject and runs the
 	// deny-first install (via enforce) under the same lock that ApplyPolicy
 	// uses, so a policy push can never be clobbered by a retried install.
-	// enforce is skipped when the subject is already active. Returns the
+	// enforce is skipped when the subject is already active. When the
+	// dispatch key is held by a different live subject (slot reuse),
+	// onTakeover tears that stale subject down under the same lock before
+	// the successor is indexed or installed (OSEP-0022 takeover); it is
+	// required for a takeover — a nil callback fails the registration
+	// rather than orphaning the evictee's kernel enforcement. Returns the
 	// state after registration.
-	RegisterAndEnforce(s Subject, key SubjectKey, fence Fencing, enforce func() error) (State, error)
+	RegisterAndEnforce(s Subject, key SubjectKey, fence Fencing, enforce func() error, onTakeover func(stale Subject) error) (State, error)
 	// Register is RegisterAndEnforce without platform hooks.
 	Register(s Subject, key SubjectKey, fence Fencing) State
 	// Get returns the current state.

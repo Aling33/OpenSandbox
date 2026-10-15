@@ -16,6 +16,7 @@ package fastsandboxnft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -220,6 +221,48 @@ func TestRemoveRebuildsTable(t *testing.T) {
 	require.NoError(t, a.Remove(ctx, s2))
 	script = runner.last()
 	require.Contains(t, script, "delete table inet opensandbox-fast-sandbox")
+}
+
+// TestRemoveFailureStaysRetryable: a failed nft transaction must not forget
+// the subject from the in-memory map — otherwise the retry short-circuits to
+// success and the stale same-IP dispatch rule stays first-match in the kernel
+// ahead of any successor (takeover/REMOVE_BINDING retry convergence).
+func TestRemoveFailureStaysRetryable(t *testing.T) {
+	runner := &fakeRunner{}
+	a := NewApplier(runner.Run)
+	ctx := context.Background()
+	s1 := subject.FromSandboxUID("u-1")
+	s2 := subject.FromSandboxUID("u-2")
+	require.NoError(t, a.ApplyDenyFirst(ctx, s1, testSlot("u-1", "10.0.0.5")))
+	require.NoError(t, a.ApplyDenyFirst(ctx, s2, testSlot("u-2", "10.0.0.6")))
+
+	runner.mu.Lock()
+	runner.fail = func(string) error { return errors.New("nft busy") }
+	runner.mu.Unlock()
+	require.Error(t, a.Remove(ctx, s1))
+	// the failed attempt must not have mutated the in-memory state
+	a.mu.Lock()
+	_, stillInstalled := a.subjects[s1]
+	a.mu.Unlock()
+	require.True(t, stillInstalled, "a failed removal must keep the subject retryable")
+
+	// the retry re-emits a real rebuild (header + remaining subject) instead
+	// of short-circuiting
+	runner.mu.Lock()
+	runner.fail = nil
+	runner.mu.Unlock()
+	before := runner.count()
+	require.NoError(t, a.Remove(ctx, s1))
+	assert.Greater(t, runner.count(), before, "the retry must re-run the nft transaction")
+	script := runner.last()
+	require.Contains(t, script, "delete table inet opensandbox-fast-sandbox")
+	require.Contains(t, script, "subj_s_u_2")
+	assert.NotContains(t, script, "subj_s_u_1")
+
+	// and the subject is gone for good: a further Remove is a genuine no-op
+	before = runner.count()
+	require.NoError(t, a.Remove(ctx, s1))
+	assert.Equal(t, before, runner.count())
 }
 
 func TestDenyFirstResetsOnReRegistration(t *testing.T) {

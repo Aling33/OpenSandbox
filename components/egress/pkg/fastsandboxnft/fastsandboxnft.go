@@ -421,26 +421,15 @@ func (a *Applier) trackDynamicIPs(s subject.Subject, ips []nftables.ResolvedIP) 
 // is fine at the target density (removals are rare). Removing the last
 // subject swaps in the empty master drop chain (fail-closed, never a bare
 // table).
+//
+// The in-memory state mutates only AFTER the transaction commits: a failed
+// removal must stay retryable, since a subject forgotten from the map while
+// its kernel rules survive would turn the retry into a no-op that leaves the
+// stale same-IP dispatch rule first-match ahead of any successor.
 func (a *Applier) Remove(ctx context.Context, s subject.Subject) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, ok := a.subjects[s]; !ok {
-		return nil
-	}
-	delete(a.subjects, s)
-	delete(a.states, s)
-	if len(a.subjects) == 0 {
-		var b strings.Builder
-		if err := a.writeTableHeader(&b); err != nil {
-			return err
-		}
-		if err := a.applyWithMissingTableFallback(ctx, b.String()); err != nil {
-			telemetry.RecordNftablesUpdateFailed(telemetry.NftOpRemove)
-			return err
-		}
-		a.tableReady = true
-		a.recordRuleCountLocked()
-		telemetry.RecordNftablesUpdate()
 		return nil
 	}
 	var b strings.Builder
@@ -448,6 +437,9 @@ func (a *Applier) Remove(ctx context.Context, s subject.Subject) error {
 		return err
 	}
 	for subj, inst := range a.subjects {
+		if subj == s {
+			continue
+		}
 		var err error
 		if inst.pol == nil {
 			err = writeSubjectDenyFirstFragment(&b, subj, inst.att, a.opts.MitmRedirectPort)
@@ -458,10 +450,12 @@ func (a *Applier) Remove(ctx context.Context, s subject.Subject) error {
 			return err
 		}
 	}
-	if _, err := a.run(ctx, b.String()); err != nil {
+	if err := a.applyWithMissingTableFallback(ctx, b.String()); err != nil {
 		telemetry.RecordNftablesUpdateFailed(telemetry.NftOpRemove)
 		return err
 	}
+	delete(a.subjects, s)
+	delete(a.states, s)
 	a.tableReady = true
 	a.recordRuleCountLocked()
 	telemetry.RecordNftablesUpdate()
