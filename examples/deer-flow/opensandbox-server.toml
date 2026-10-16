@@ -20,10 +20,15 @@ level = "INFO"
 
 [runtime]
 type = "docker"
-execd_image = "opensandbox/execd:v1.1.0"
+# Images default to the Alibaba Cloud Container Registry for faster pulls in
+# mainland-China classrooms; the Docker Hub equivalents are the same versions
+# (matching the latest release, 1.1.1).
+execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.1.0"
+# execd_image = "opensandbox/execd:v1.1.0"
 
 [egress]
-image = "opensandbox/egress:v1.1.7"
+image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.1.7"
+# image = "opensandbox/egress:v1.1.7"
 readiness_timeout_seconds = 30.0
 
 [docker]
