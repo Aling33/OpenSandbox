@@ -17,7 +17,9 @@ import json
 import sys
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from typing import get_args
 from unittest import mock
 
 import test_credential_bound as fixtures
@@ -53,6 +55,34 @@ class TLSAdmissionTelemetryTest(unittest.TestCase):
                 self.system._record_tls_admission(**item)
                 warn.assert_not_called()
 
+    def test_fixture_covers_runtime_vocabulary(self):
+        # Import after setUp has isolated the runtime modules. RegistryReason
+        # is a union of Literal aliases, not a flat Literal of strings.
+        from tls_decision import Action, Reason
+        from tls_registry import RegistryAction, RegistryReason
+
+        cases = json.loads((Path(__file__).resolve().parents[1] / "testdata/tls_admission_events.json").read_text())
+        pairs = {(item["decision"], item["reason"]) for item in cases["valid"]}
+        self.assertEqual(len(pairs), len(cases["valid"]), "duplicate fixture pair")
+        registry_reasons = {
+            reason for branch in get_args(RegistryReason) for reason in get_args(branch)
+        }
+        self.assertLessEqual(set(get_args(Reason)), registry_reasons)
+        self.assertEqual(
+            {reason for _, reason in pairs},
+            registry_reasons | {"ssl_insecure", "malformed_extensions"},
+        )
+        self.assertEqual({decision for decision, _ in pairs}, set(get_args(RegistryAction)))
+        self.assertEqual(
+            set(get_args(RegistryAction)),
+            (set(get_args(Action)) - {"needs_registry"}) | {"decrypt"},
+        )
+        self.assertEqual(pairs, {
+            (decision, reason)
+            for decision, reasons in self.system._TLS_ADMISSION_REASONS.items()
+            for reason in reasons
+        })
+
     def test_each_final_admission_records_once(self):
         cases = json.loads((Path(__file__).resolve().parents[1] / "testdata/tls_admission_events.json").read_text())
         for item in cases["valid"]:
@@ -83,7 +113,7 @@ class TLSAdmissionTelemetryTest(unittest.TestCase):
                     if reason == "malformed_extensions":
                         data.client_hello.extensions = None
                     runtime = mock.Mock()
-                    with mock.patch.object(self.system.ctx.log, "warn", side_effect=RuntimeError("unavailable")) if broken_log else mock.patch.object(self.system.ctx.log, "info"):
+                    with mock.patch.object(self.system.ctx.log, "warn", side_effect=RuntimeError("unavailable")) if broken_log else nullcontext():
                         self.system._tls_clienthello_live(runtime, data)
                     runtime.admit_tls.assert_not_called()
                     self.assertTrue(data.client_conn.closed)
