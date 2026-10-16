@@ -59,6 +59,13 @@ PROXY_PID=""
 EGRESS_PID=""
 HOSTS_BACKUP=""
 
+# Per-subject credential vault files (OSEP-0022 stage 2), wired through
+# OPENSANDBOX_EGRESS_VAULT_DIR for the whole run: a fresh directory per run
+# keeps the "no vault yet" assertions meaningful across re-runs, while the
+# same directory must survive the in-run restarts (Test 14 durability).
+VAULT_DIR=""
+VAULT_BODY=""
+
 info() { echo "[$(date +%H:%M:%S)] $*"; }
 pass() { info "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -96,6 +103,8 @@ cleanup() {
   fi
   [ -n "${SSL_DIR:-}" ] && rm -rf "${SSL_DIR}" 2>/dev/null
   [ -n "${CA_SEED_DIR}" ] && rm -rf "${CA_SEED_DIR}" 2>/dev/null
+  [ -n "${VAULT_DIR}" ] && rm -rf "${VAULT_DIR}" 2>/dev/null
+  [ -n "${VAULT_BODY}" ] && rm -f "${VAULT_BODY}" 2>/dev/null
   nft delete table inet opensandbox-fast-sandbox 2>/dev/null
 }
 trap cleanup EXIT
@@ -248,6 +257,7 @@ start_egress() {
   OPENSANDBOX_EGRESS_HTTP_ADDR="127.0.0.1:${POLICY_PORT}" \
   OPENSANDBOX_EGRESS_BLOCK_DOH_443="${block_doh}" \
   OPENSANDBOX_EGRESS_DOH_BLOCKLIST="${doh_blocklist}" \
+  OPENSANDBOX_EGRESS_VAULT_DIR="${VAULT_DIR}" \
   "${mitm_env[@]}" \
   "${upstream_env[@]}" \
   "${EGRESS_BIN}" >"${EGRESS_LOG}" 2>&1 &
@@ -309,6 +319,12 @@ iptables -t filter -P FORWARD ACCEPT || true
 # always-deny CIDR file must exist before egress starts (loaded once)
 mkdir -p "${ALWAYS_RULES_DIR}"
 printf '%s\n' '10.99.0.9' > "${ALWAYS_RULES_DIR}/deny.always"
+
+# Vault persistence directory: enabled for every start_egress below, so relay
+# writes run the commit protocol and the ack means durable (exercised by the
+# Test 14 restart reload).
+VAULT_DIR="$(mktemp -d -t fast-sandbox-vault.XXXXXX)"
+VAULT_BODY="$(mktemp -t fast-sandbox-vault-body.XXXXXX)"
 
 info "Building egress binary"
 (cd "${REPO_ROOT}/components/egress" && go build -o "${EGRESS_BIN}" .)
@@ -817,6 +833,73 @@ else
   out="$(ip netns exec osb-sandbox-a curl -s -m 8 -H 'Host: ext.test' http://10.99.0.2/)"
   echo "${out}" | grep -qi "client=10.99.0.2" || fail "chained path must work after restart; got: ${out}"
   pass "upstream containment across egress restart (drop re-seeded + chained path intact)"
+
+ ###############################################################################
+  info "Test 14: credential vault loop — relay write -> real mitm injection -> restart durability"
+  # OSEP-0022 chain, every hop a real process: the relay POST acks only after
+  # the vault file commit (persistence is on for the whole run), the addon
+  # fetches subject a's active snapshot over the shared unix socket and
+  # injects the Go-rendered credential into matching flows, and after an
+  # egress restart the SET_BINDING replay reloads the vault from disk —
+  # injection resumes with no relay write in between. Binding match rides the
+  # Host header (transparent-mode pretty_host prefers it over the original
+  # destination IP) and pins scheme http — the default binding scheme is
+  # https-only.
+  CREATE_BODY='{"credentials":[{"name":"smoke-token","source":{"type":"inline","value":"smoke-vault-secret-1"}}],"bindings":[{"name":"ext-bearer","match":{"hosts":["ext.test"],"schemes":["http"]},"auth":{"type":"bearer","credential":"smoke-token"}}]}'
+  vault_inject_probe() {
+    ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/
+  }
+
+  # 14a: create-only relay POST — 201, then 409 on the second create.
+  code="$(curl -s -o "${VAULT_BODY}" -w '%{http_code}' -XPOST "http://127.0.0.1:${POLICY_PORT}/vault/a" -d "${CREATE_BODY}")"
+  [ "${code}" = "201" ] || fail "relay POST must create the vault (201), got ${code}: $(cat "${VAULT_BODY}")"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -XPOST "http://127.0.0.1:${POLICY_PORT}/vault/a" -d "${CREATE_BODY}")"
+  [ "${code}" = "409" ] || fail "relay POST must be create-only (409 on exists), got ${code}"
+  pass "relay POST create-only (201, then 409 on exists)"
+
+  # 14b: the real mitm request carries the injected credential, while the
+  # same subject's non-matching host stays uncredentialed (binding scope).
+  out="$(vault_inject_probe)"
+  echo "${out}" | grep -qi 'client=10.99.0.1' || fail "request did not traverse the shared mitm; got: ${out}"
+  echo "${out}" | grep -qi 'authorization: bearer smoke-vault-secret-1' \
+    || fail "injected credential missing at the upstream; got: ${out}"
+  out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: alt.test' http://10.99.0.2/)"
+  echo "${out}" | grep -qi 'client=10.99.0.1' || fail "non-matching host did not traverse the shared mitm; got: ${out}"
+  if echo "${out}" | grep -qi 'smoke-vault-secret-1'; then
+    fail "credential must not leak to a non-matching host; got: ${out}"
+  fi
+  pass "real mitm injection (matching host credentialed, alt host uncredentialed)"
+
+  # 14c: restart durability — with the daemon down the vault lives only in
+  # its file (the relay 404s the unregistered subject), the SET_BINDING
+  # replay reloads it from disk, and injection resumes with no relay write.
+  kill "${EGRESS_PID}" 2>/dev/null
+  wait "${EGRESS_PID}" 2>/dev/null || true
+  EGRESS_PID=""
+  start_egress
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/vault/a")"
+  [ "${code}" = "404" ] || fail "unregistered subject must 404 before the replay, got ${code}"
+  bind_and_ready a 10.10.0.5 13 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
+  code="$(curl -s -o "${VAULT_BODY}" -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/vault/a")"
+  [ "${code}" = "200" ] || fail "vault must survive the restart (reloaded at SET_BINDING), got ${code}"
+  grep -q '"revision":1' "${VAULT_BODY}" || fail "reloaded vault revision must be 1, got: $(cat "${VAULT_BODY}")"
+  out="$(vault_inject_probe)"
+  echo "${out}" | grep -qi 'authorization: bearer smoke-vault-secret-1' \
+    || fail "injection must resume after the restart without a relay write; got: ${out}"
+  pass "vault survives restart (file reload at SET_BINDING replay, injection resumes)"
+
+  # 14d: relay DELETE removes the vault — the addon drops back to the
+  # no-vault plain flow on the same matching host.
+  code="$(curl -s -o /dev/null -w '%{http_code}' -XDELETE "http://127.0.0.1:${POLICY_PORT}/vault/a")"
+  [ "${code}" = "204" ] || fail "relay DELETE must be 204, got ${code}"
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/vault/a")"
+  [ "${code}" = "404" ] || fail "vault must be gone after DELETE, got ${code}"
+  out="$(vault_inject_probe)"
+  echo "${out}" | grep -qi 'client=10.99.0.1' || fail "request did not traverse the shared mitm; got: ${out}"
+  if echo "${out}" | grep -qi 'smoke-vault-secret-1'; then
+    fail "credential must stop flowing after DELETE; got: ${out}"
+  fi
+  pass "relay DELETE stops injection (no-vault plain flow)"
 fi
 
 ###############################################################################
