@@ -61,12 +61,21 @@ RUN pip install opensandbox-server==1.1.1 opensandbox==1.1.1 opensandbox-cli==1.
 # UV_EXTRAS keeps the extra across DeerFlow's own `uv sync --locked` runs
 # (scripts/serve.sh re-syncs on every start); without it the provider import
 # disappears after the first restart.
-RUN git clone --depth 1 --branch "${DEERFLOW_REF}" "${DEERFLOW_REPO}" /opt/deer-flow \
-    && cd /opt/deer-flow/backend \
-    && uv sync --all-packages --extra opensandbox \
-    && cd ../frontend \
-    && pnpm install --frozen-lockfile \
-    && pnpm run build
+# Each step is its own layer with a cache mount, so rebuilds after config or
+# script changes skip the slow dependency installs; only a DEERFLOW_REF bump
+# re-runs them.
+RUN git clone --depth 1 --branch "${DEERFLOW_REF}" "${DEERFLOW_REPO}" /opt/deer-flow
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    cd /opt/deer-flow/backend \
+    && uv sync --all-packages --extra opensandbox
+
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    cd /opt/deer-flow/frontend \
+    && pnpm install --frozen-lockfile
+
+# Slowest step: Next.js production build (reused at runtime via next start).
+RUN cd /opt/deer-flow/frontend && pnpm run build
 ENV PATH="/opt/deer-flow/backend/.venv/bin:${PATH}" \
     UV_EXTRAS=opensandbox
 WORKDIR /opt/deer-flow
