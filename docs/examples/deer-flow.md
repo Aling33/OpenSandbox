@@ -184,6 +184,51 @@ deployment reaches the provider through the `UV_EXTRAS=opensandbox` setting in `
 | `OPEN_SANDBOX_DOMAIN` | _(unset)_ | Server address when the DeerFlow config omits `domain` |
 | `OPEN_SANDBOX_API_KEY` | _(unset)_ | API key when the DeerFlow config omits `api_key` |
 
+## All-in-one Docker image (server + DeerFlow)
+
+`examples/deer-flow/` ships an all-in-one lab image bundling both sides of the integration: the OpenSandbox server (docker runtime) and the DeerFlow backend with the OpenSandboxProvider extra preinstalled. Sandbox containers run on the **host** Docker daemon: the image mounts `docker.sock` at run time and drives the host daemon through it — the same topology as `server/docker-compose.example.yaml`.
+
+Build and run:
+
+```shell
+cd examples/deer-flow
+docker build -t deerflow-opensandbox .
+docker run -d --name deerflow-opensandbox \
+  -p 8080:8080 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  --add-host host.docker.internal:host-gateway \
+  deerflow-opensandbox
+
+docker exec -it deerflow-opensandbox bash
+```
+
+`--add-host host.docker.internal:host-gateway` is required on Linux so the server can reach the host-published sandbox ports; Docker Desktop resolves that name already, and the flag is harmless there.
+
+Inside the container:
+
+```shell
+# 0) server ready
+curl -s http://127.0.0.1:8080/health        # -> {"status":"healthy"}
+
+# 1) model-free path: drive OpenSandboxProvider directly (no API key needed)
+cd /opt/OpenSandbox
+uv run --project /opt/deer-flow/backend python examples/deer-flow/main.py
+#   in another terminal: docker ps | grep -i sandbox   (watch containers appear)
+
+# 2) full agent path (requires a model key)
+cd /opt/deer-flow && make setup             # interactive wizard, writes .env
+deerflow --print "Run python3 -c 'print(2 ** 16)' and report the output"
+```
+
+::: tip
+On first boot the entrypoint generates `/opt/deer-flow/config.yaml` from `config.example.yaml` and switches the sandbox section to `OpenSandboxProvider` via `enable-opensandbox` (on PATH, idempotent). If `make setup` or any wizard later overwrites the config, rerun `enable-opensandbox` to switch back.
+:::
+
+Notes:
+
+- Sandbox images (default `python:3.11`) are pulled by the **host** Docker; the provider's `ready_timeout` is set to 300s to cover the first pull.
+- `DEERFLOW_REPO` / `DEERFLOW_REF` / `OPENSANDBOX_REPO` build args let network-restricted environments point the clones at mirrors; pip/uv honor `PIP_INDEX_URL` / `UV_INDEX_URL`.
+
 ## References
 
 - [DeerFlow](https://github.com/bytedance/deer-flow) - Open-source deep-research agent framework

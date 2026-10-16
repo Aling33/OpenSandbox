@@ -1,0 +1,42 @@
+# OpenSandbox server config for the DeerFlow all-in-one image.
+#
+# Topology matches server/docker-compose.example.yaml: the server runs inside
+# this image's container and creates sandbox containers on the HOST Docker
+# daemon through the mounted /var/run/docker.sock. Sandbox ports are published
+# on the host, and the server reaches them back via host-gateway
+# (host.docker.internal). Only the server port differs (8080).
+
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[proxy]
+# The server container and sandbox containers are not on the same Docker
+# network: always reach sandboxes through their host-published ports.
+resolve_internal = false
+
+[log]
+level = "INFO"
+
+[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:v1.1.0"
+
+[egress]
+image = "opensandbox/egress:v1.1.7"
+readiness_timeout_seconds = 30.0
+
+[docker]
+network_mode = "bridge"
+# Sandbox ports are published on the host; from this container they resolve
+# through the host-gateway address.
+host_ip = "host.docker.internal"
+port_range_min = 40000
+port_range_max = 60000
+# Hardening, matching the official compose example.
+drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+no_new_privileges = true
+pids_limit = 4096
+
+[ingress]
+mode = "direct"
