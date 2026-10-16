@@ -892,7 +892,7 @@ else
   kill "${EGRESS_PID}" 2>/dev/null
   wait "${EGRESS_PID}" 2>/dev/null || true
   EGRESS_PID=""
-  start_egress
+  EGRESS_MITM=1 start_egress
   code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/vault/a")"
   [ "${code}" = "404" ] || fail "unregistered subject must 404 before the replay, got ${code}"
   bind_and_ready a 10.10.0.5 14 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
