@@ -882,11 +882,13 @@ def enabled() -> bool:
     return _runtime is not None
 
 
-def validate_live_options() -> None:
+def validate_live_options(options: Any | None = None) -> None:
     """Native pre-TLS selectors must never bypass live admission."""
-    if any(getattr(ctx.options, name, False) for name in ("ignore_hosts", "allow_hosts")):
-        raise SystemExit(NATIVE_OPTIONS_ERROR)
-    if getattr(ctx.options, "ssl_insecure", False):
+    if options is None:
+        options = ctx.options
+    if any(getattr(options, name, ()) for name in ("ignore_hosts", "allow_hosts")):
+        raise SystemExit(NATIVE_OPTIONS_ERROR) from None
+    if getattr(options, "ssl_insecure", False):
         _fatal()
 
 

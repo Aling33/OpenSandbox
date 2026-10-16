@@ -93,13 +93,13 @@ class RevisionPublisher:
         valid = True
         try:
             view = compile_view(snapshot)
-            if any(left.overlaps(right) for left in view.selectors
-                   for right in self.static_passthrough):
-                raise ValueError("static passthrough overlap")
         except Exception:  # noqa: BLE001 - compilation errors may contain secrets
             valid = False
         if not valid:
             raise RevisionError("snapshot validation failed")
+        if any(left.overlaps(right) for left in view.selectors
+               for right in self.static_passthrough):
+            raise RevisionError("static passthrough overlap")
 
         with self._registry._lock, receiver._lock:
             if receiver._stage_check(snapshot, serial):

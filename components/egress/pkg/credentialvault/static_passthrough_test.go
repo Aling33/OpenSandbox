@@ -16,9 +16,11 @@ package credentialvault
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/alibaba/opensandbox/egress/pkg/hostselector"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmpassthrough"
 	"github.com/stretchr/testify/require"
 )
@@ -34,7 +36,12 @@ func TestStaticPassthroughCandidates(t *testing.T) {
 			req.Bindings[0].Match.Hosts = []string{pair[1]}
 			_, err = store.PrepareCreate(req, pol)
 			require.Error(t, err)
-			require.NotContains(t, err.Error(), pair[0])
+			require.Contains(t, err.Error(), fmt.Sprintf("binding %q host %q", req.Bindings[0].Name, pair[1]))
+			require.Contains(t, err.Error(), "credential TLS binding overlaps static passthrough")
+			require.NotContains(t, err.Error(), "secret-token")
+			if pair[0] != pair[1] {
+				require.NotContains(t, err.Error(), pair[0])
+			}
 			require.Zero(t, store.revision)
 			req.Bindings[0].Match.Schemes = []string{"http"}
 			candidate, err := store.PrepareCreate(req, pol)
@@ -49,6 +56,7 @@ func TestStaticPassthroughCandidates(t *testing.T) {
 				binding.Match.Schemes = schemes
 				_, err = store.PreparePatch(MutationRequest{Bindings: &BindingMutationSet{Replace: []Binding{binding}}}, pol)
 				require.Error(t, err)
+				require.Contains(t, err.Error(), fmt.Sprintf("binding %q host %q", binding.Name, pair[1]))
 				require.Equal(t, int64(1), store.revision)
 				require.Equal(t, tag, store.activeTag)
 			}
@@ -58,11 +66,28 @@ func TestStaticPassthroughCandidates(t *testing.T) {
 				store.bindings[key] = binding
 			}
 			_, err = store.FreezeForPolicy(pol)
-			require.Error(t, err)
+			require.ErrorIs(t, err, ErrInvalidCandidate)
+			require.Contains(t, err.Error(), fmt.Sprintf("binding %q host %q", req.Bindings[0].Name, pair[1]))
 			require.Equal(t, tag, store.activeTag)
 		})
 	}
 }
+
+func TestCredentialTLSSelectorErrorPreservesContextAndCause(t *testing.T) {
+	store := NewLiveStore(nil, nil, mitmpassthrough.Config{})
+	binding := testCredentialVaultRequest().Bindings[0]
+	binding.Match.Schemes = []string{"https"}
+	binding.Match.Hosts = []string{"invalid..example.com"}
+	_, parseErr := hostselector.ParseCanonical(binding.Match.Hosts[0])
+	require.Error(t, parseErr)
+
+	// Restored bindings are revalidated without normalization during policy freeze.
+	err := store.validateBindingPolicy(binding, nil)
+	require.ErrorIs(t, err, parseErr)
+	require.EqualError(t, err, fmt.Sprintf("binding %q host %q: invalid credential TLS selector: %v", binding.Name, binding.Match.Hosts[0], parseErr))
+	require.NotContains(t, err.Error(), "secret-token")
+}
+
 func TestStaticPassthroughApexAndEmptyWildcard(t *testing.T) {
 	cfg, err := mitmpassthrough.Parse(`["*.example.com"]`, true)
 	require.NoError(t, err)

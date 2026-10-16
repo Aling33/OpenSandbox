@@ -83,14 +83,14 @@ func startPolicyServer(
 	liveRevision := constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime))
 	rawPassthrough, passthroughPresent := os.LookupEnv(constants.EnvMitmproxyPassthroughHosts)
 	if passthroughPresent && !liveRevision {
-		return nil, nil, mitmpassthrough.ErrInvalid
+		return nil, nil, fmt.Errorf("%s requires %s: %w", constants.EnvMitmproxyPassthroughHosts, constants.EnvExperimentalRevisionRuntime, mitmpassthrough.ErrInvalid)
 	}
 	staticPassthrough, err := mitmpassthrough.Parse(rawPassthrough, passthroughPresent)
 	if err != nil {
 		return nil, nil, err
 	}
 	if !staticPassthrough.Empty() && strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxy)) != "" {
-		return nil, nil, mitmpassthrough.ErrInvalid
+		return nil, nil, fmt.Errorf("%s is incompatible with %s: %w", constants.EnvMitmproxyPassthroughHosts, constants.EnvUpstreamProxy, mitmpassthrough.ErrInvalid)
 	}
 	maxEgressRules := maxEgressRulesFromEnv()
 	if maxEgressRules > 0 {
@@ -115,9 +115,10 @@ func startPolicyServer(
 	if len(quarantineOwners) > 0 {
 		handler.quarantine = quarantineOwners[0]
 	}
-	handler.credentialVault = credentialvault.NewStore(mitmGate, func() bool { return strings.TrimSpace(token) != "" })
 	if liveRevision {
 		handler.credentialVault = credentialvault.NewLiveStore(mitmGate, func() bool { return strings.TrimSpace(token) != "" }, staticPassthrough)
+	} else {
+		handler.credentialVault = credentialvault.NewStore(mitmGate, func() bool { return strings.TrimSpace(token) != "" })
 	}
 	handler.credentialVaultRequireTLS = constants.IsTruthy(os.Getenv(constants.EnvCredentialVaultRequireTLS))
 	handler.setAlwaysRules(alwaysDeny, alwaysAllow)

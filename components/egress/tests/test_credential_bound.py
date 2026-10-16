@@ -969,16 +969,50 @@ class CredentialBoundEnvTest(unittest.TestCase):
 
     def test_native_selectors_rejected_on_configure_before_and_after_load(self) -> None:
         for option in ("ignore_hosts", "allow_hosts"):
-            for enabled in (False, True):
-                system = _load_system_module()
-                system._live_runtime = object() if enabled else None
-                setattr(system.ctx.options, option, [".*"])
-                with mock.patch.dict(os_environ(), {LIVE_ENV["tls_capacity"]: "64"}, clear=True):
-                    with self.assertRaises(SystemExit):
-                        system.configure({option})
-                system._live_runtime = None
-                with mock.patch.dict(os_environ(), {}, clear=True):
-                    system.configure({option})  # Legacy options stay supported.
+            for value in ([".*"], ("",)):
+                for enabled in (False, True):
+                    system = _load_system_module()
+                    system._live_runtime = object() if enabled else None
+                    setattr(system.ctx.options, option, value)
+                    with mock.patch.dict(os_environ(), {LIVE_ENV["tls_capacity"]: "64"}, clear=True):
+                        with self.assertRaises(SystemExit):
+                            system.configure({option})
+                    system._live_runtime = None
+                    with mock.patch.dict(os_environ(), {}, clear=True):
+                        system.configure({option})  # Legacy options stay supported.
+
+    def test_native_empty_regex_entries_never_start_ipc_on_either_path(self) -> None:
+        system = _load_system_module()
+        import credential_bound
+        from static_passthrough import NATIVE_OPTIONS_ERROR
+
+        live = {LIVE_ENV["tls_capacity"]: "64", LIVE_ENV["request_capacity"]: "256",
+                LIVE_ENV["drain_timeout"]: "5"}
+        actions = (lambda: system.load(None),
+                   lambda: credential_bound.configure(self.path, TOKEN, CONTROL, SUBJECT, 1048576))
+        for option in ("ignore_hosts", "allow_hosts"):
+            for value in (("",), [""]):
+                with self.subTest(option=option, value=value), \
+                        mock.patch.object(system.ctx.options, option, value, create=True), \
+                        mock.patch.dict(os_environ(), self._env(live), clear=True), \
+                        mock.patch("revision_ipc.Server.start") as start:
+                    for action in actions:
+                        with self.assertRaises(SystemExit) as raised:
+                            action()
+                        self.assertEqual(str(raised.exception), NATIVE_OPTIONS_ERROR)
+                    start.assert_not_called()
+                    self.assertFalse(Path(self.path).exists())
+
+    def test_empty_or_absent_native_options_are_valid_on_both_paths(self) -> None:
+        system = _load_system_module()
+        import credential_bound
+
+        for options in (types.SimpleNamespace(),
+                        types.SimpleNamespace(ignore_hosts=(), allow_hosts=()),
+                        types.SimpleNamespace(ignore_hosts=[], allow_hosts=[])):
+            with self.subTest(options=options), mock.patch.object(system.ctx, "options", options):
+                system._validate_live_options()
+                credential_bound.validate_live_options()
 
     def test_native_option_diagnostics_name_migration_without_values(self) -> None:
         for option in ("ignore_hosts", "allow_hosts"):

@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
+	"github.com/alibaba/opensandbox/egress/pkg/mitmpassthrough"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,7 +34,14 @@ func TestStaticPassthroughStartupRejectsBeforeRecovery(t *testing.T) {
 			t.Setenv(constants.EnvUpstreamProxy, item.upstream)
 			// Nil collaborators would panic if startup reached policy recovery or serving.
 			srv, handler, err := startPolicyServer(nil, nil, "dns+nft", "127.0.0.1:0", "", nil, "", nil, nil, nil)
-			require.Error(t, err)
+			require.ErrorIs(t, err, mitmpassthrough.ErrInvalid)
+			if item.name == "nonlive-empty" {
+				require.Contains(t, err.Error(), constants.EnvExperimentalRevisionRuntime)
+			}
+			if item.name == "chained-live" {
+				require.Contains(t, err.Error(), constants.EnvUpstreamProxy)
+			}
+			require.NotContains(t, err.Error(), "proxy.example")
 			require.Nil(t, srv)
 			require.Nil(t, handler)
 			require.Contains(t, err.Error(), constants.EnvMitmproxyPassthroughHosts)

@@ -498,10 +498,10 @@ func (v *Store) validateBindingPolicy(b Binding, pol *policy.NetworkPolicy) erro
 			}
 			selector, err := hostselector.ParseCanonical(host)
 			if err != nil {
-				return fmt.Errorf("invalid credential TLS selector")
+				return fmt.Errorf("binding %q host %q: invalid credential TLS selector: %w", b.Name, host, err)
 			}
 			if v.staticPassthrough.Overlaps(selector) {
-				return fmt.Errorf("credential TLS binding overlaps static passthrough")
+				return fmt.Errorf("binding %q host %q: credential TLS binding overlaps static passthrough", b.Name, host)
 			}
 		}
 	}

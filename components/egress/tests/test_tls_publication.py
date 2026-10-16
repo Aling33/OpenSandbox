@@ -64,15 +64,21 @@ class RevisionPublicationTest(unittest.TestCase):
                 self.install(owner, first)
                 token = self.admit(owner.registry, sni="other.example.net").token
                 request = owner.registry.acquire_request(token)
-                pending = self.snapshot(epoch=2, host="pending.example.net")
-                owner.prepare(pending.revision, pending.payload)
                 before = self.state(owner)
                 overlap = self.snapshot(epoch=3, host=host)
-                with self.assertRaises(receiver.RevisionError):
+                with self.assertRaises(receiver.RevisionError) as raised:
                     owner.prepare(overlap.revision, overlap.payload)
+                self.assertEqual(str(raised.exception), "static passthrough overlap")
+                self.assertIsNone(raised.exception.__context__)
                 self.assertEqual(self.state(owner), before)
                 self.assertEqual(request.snapshot, first)
                 self.assertEqual(owner.readback(), first.revision)
+                pending = self.snapshot(epoch=2, host="pending.example.net")
+                owner.prepare(pending.revision, pending.payload)
+                before = self.state(owner)
+                with self.assertRaises(receiver.RevisionError):
+                    owner.prepare(overlap.revision, overlap.payload)
+                self.assertEqual(self.state(owner), before)
                 owner.commit(pending.revision)
 
     def test_static_http_only_empty_and_exact_retry_stay_valid(self):
@@ -231,6 +237,7 @@ class RevisionPublicationTest(unittest.TestCase):
             try:
                 owner.prepare(next_snapshot.revision, next_snapshot.payload)
             except receiver.RevisionError as error:
+                self.assertEqual(str(error), "snapshot validation failed")
                 self.assertIsNone(error.__context__)
                 self.assertNotIn("TOP-SECRET", "".join(traceback.format_exception(error)))
             else:

@@ -60,7 +60,8 @@ func TestStaticPassthroughVaultMutationRejectsBeforeEffects(t *testing.T) {
 					}
 					return candidate, prepareErr
 				})
-				require.EqualError(t, prepareErr, "credential TLS binding overlaps static passthrough")
+				require.ErrorContains(t, prepareErr, "overlaps static passthrough")
+				require.ErrorContains(t, prepareErr, overlap.host)
 				require.Error(t, err)
 				require.NotContains(t, err.Error(), overlap.host)
 				after, afterTag, _, afterErr := s.credentialVault.ActiveSnapshotIfChanged(context.Background(), "")
@@ -103,6 +104,7 @@ func TestStaticPassthroughHandlerOverlapIsBadRequest(t *testing.T) {
 			s.credentialVault = credentialvault.NewLiveStore(s.mitmGate, func() bool { return true }, config)
 			setMutationFixturePolicy(t, s, liveWritePolicy(t, true))
 			request := testCredentialVaultRequest()
+			request.Bindings[0].Name = "private-binding-sentinel"
 			body, err := json.Marshal(request)
 			require.NoError(t, err)
 			if method == http.MethodPatch {
@@ -120,6 +122,7 @@ func TestStaticPassthroughHandlerOverlapIsBadRequest(t *testing.T) {
 			response := liveWriteDo(t, s, method, string(body))
 			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 			require.NotContains(t, response.Body.String(), "code.example.com")
+			require.NotContains(t, response.Body.String(), "private-binding-sentinel")
 			after, afterTag, _, afterErr := s.credentialVault.ActiveSnapshotIfChanged(context.Background(), "")
 			require.Equal(t, beforeErr, afterErr)
 			require.Equal(t, before, after)

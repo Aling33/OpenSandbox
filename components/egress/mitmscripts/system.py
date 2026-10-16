@@ -300,12 +300,9 @@ def configure(updated: set) -> None:
 
 
 def _validate_live_options() -> None:
-    if any(getattr(ctx.options, name, False) for name in ("ignore_hosts", "allow_hosts")):
-        from static_passthrough import NATIVE_OPTIONS_ERROR
+    from credential_bound import validate_live_options
 
-        raise SystemExit(NATIVE_OPTIONS_ERROR) from None
-    if getattr(ctx.options, "ssl_insecure", False):
-        _fatal_revision_runtime()
+    validate_live_options(ctx.options)
 
 
 def done() -> None:
