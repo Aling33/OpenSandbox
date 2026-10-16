@@ -24,6 +24,10 @@
 // cached; expectedIncarnation mismatch → 412; validation failure → 400 NACK
 // keeping last-good. Shares the per-subject store with the mitm addon's
 // active-vault socket.
+//
+// With persistence enabled (OSEP-0022 stage 2) every write runs the commit
+// protocol — persist → apply → ack — so the ack means durable AND applied
+// (see fastsandbox_vault_persist.go).
 package main
 
 import (
@@ -33,6 +37,7 @@ import (
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/credentialvault"
+	"github.com/alibaba/opensandbox/egress/pkg/log"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 	"github.com/alibaba/opensandbox/egress/pkg/subject"
 )
@@ -60,57 +65,193 @@ func (s *fastSandboxPolicyServer) handleVaultRelay(w http.ResponseWriter, r *htt
 		return
 	}
 	subj := subject.FromSandboxUID(uid)
-	vault, status, msg := s.selectRelayVault(r, subj)
-	if vault == nil {
-		http.Error(w, msg, status)
-		return
-	}
-	pol := s.vaultValidationPolicy(subj)
 	switch r.Method {
 	case http.MethodGet:
+		vault, status, msg := s.selectRelayVault(r, subj)
+		if vault == nil {
+			http.Error(w, msg, status)
+			return
+		}
 		full, err := vault.Full()
 		if err != nil {
 			writeVaultRelayError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, full)
+	case http.MethodPost, http.MethodPut, http.MethodDelete:
+		s.handleVaultRelayWrite(w, r, subj)
+	default:
+		w.Header().Set("Allow", "GET, POST, PUT, DELETE")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleVaultRelayWrite serves POST (create-only), PUT (full replace) and
+// DELETE.
+//
+// The body is parsed BEFORE the server lock: a stalled client must never be
+// able to hold s.mu (healthz, addon dispatch, and all other subjects' traffic
+// go through it) by dribbling bytes — the listener read timeouts are the
+// second line of defense.
+//
+// The rest of the mutation holds s.mu, serializing per-subject writers and
+// fencing rebind/terminal purges. Validation runs on a prepared candidate
+// before any durable effect: a rejected request never touches memory or file
+// (last-good kept, never half-open). With persistence enabled the protocol is
+// persist → apply → ack, so acked ⇒ durable and applied. Persistence
+// failures answer only the retryable classification (500, or 503 while
+// latched); detailed I/O errors stay in the log — they carry host paths.
+func (s *fastSandboxPolicyServer) handleVaultRelayWrite(w http.ResponseWriter, r *http.Request, subj subject.Subject) {
+	var (
+		createReq  credentialvault.CreateRequest
+		replaceReq credentialvault.ReplaceRequest
+	)
+	switch r.Method {
 	case http.MethodPost:
-		var req credentialvault.CreateRequest
-		if err := credentialvault.ReadJSON(r, &req); err != nil {
+		if err := credentialvault.ReadJSON(r, &createReq); err != nil {
 			http.Error(w, "invalid credential vault request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		state, err := vault.Create(req, pol)
-		if err != nil {
-			writeVaultRelayError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusCreated, state)
 	case http.MethodPut:
-		var req credentialvault.ReplaceRequest
-		if err := credentialvault.ReadJSON(r, &req); err != nil {
+		if err := credentialvault.ReadJSON(r, &replaceReq); err != nil {
 			http.Error(w, "invalid credential vault replace request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		state, created, err := vault.Replace(req, pol)
-		if err != nil {
-			writeVaultRelayError(w, err)
+	case http.MethodDelete:
+		// No body.
+	}
+	// The body has been consumed; a late response must not try to read it.
+	r.Body.Close()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fence, ok := s.reg.Fence(subj)
+	if !ok {
+		http.Error(w, "unknown subject", http.StatusNotFound)
+		return
+	}
+	if inc := strings.TrimSpace(r.Header.Get(constants.EgressVaultIncarnationHeader)); inc != "" && inc != fence.RuntimeInstanceID {
+		http.Error(w, "expectedIncarnation mismatch", http.StatusPreconditionFailed)
+		return
+	}
+	if recovery := s.vaultRecovery.Load(); recovery != nil {
+		http.Error(w, "vault persistence recovery required: "+recovery.reason, http.StatusServiceUnavailable)
+		return
+	}
+	store := s.vaultForLocked(subj, fence)
+	pol := s.vaultValidationPolicyLocked(subj)
+
+	var (
+		candidate *credentialvault.MutationCandidate
+		created   bool
+		err       error
+	)
+	switch r.Method {
+	case http.MethodPost:
+		candidate, err = store.PrepareCreate(createReq, pol)
+	case http.MethodPut:
+		candidate, err = store.PrepareReplace(replaceReq, pol)
+		created = candidate.Created()
+	case http.MethodDelete:
+		candidate, err = store.PrepareDelete()
+	}
+	if err != nil {
+		writeVaultRelayError(w, err)
+		return
+	}
+	defer candidate.Discard()
+
+	// Rendering is required before commit; an unresolvable credential is a
+	// NACK before anything durable happens.
+	if candidate.Exists() {
+		if _, err = candidate.ActiveSnapshot(r.Context()); err != nil {
+			http.Error(w, "credential vault candidate cannot be rendered", http.StatusBadRequest)
 			return
 		}
+	}
+
+	if s.vaultFiles == nil {
+		// Memory-only (persistence disabled): direct commit.
+		state, commitErr := store.CommitCandidate(candidate)
+		if commitErr != nil {
+			writeVaultRelayError(w, commitErr)
+			return
+		}
+		writeVaultRelayWriteResponse(w, r, state, created)
+		return
+	}
+
+	// Persistence enabled: encode the candidate — stamped with the owning
+	// runtime fence — then run the commit protocol.
+	var payload []byte
+	if candidate.Exists() {
+		full, fullErr := candidate.Full()
+		if fullErr != nil {
+			log.Errorf("subject %s: vault candidate read failed: %v", subj, fullErr)
+			http.Error(w, "vault persistence failure", http.StatusInternalServerError)
+			return
+		}
+		payload, err = credentialvault.EncodeVaultFile(fence.RuntimeInstanceID, fence.AttachmentID, full.Revision, credentialvault.VaultFileBody{
+			Credentials: full.Credentials,
+			Bindings:    full.Bindings,
+		})
+		if err != nil {
+			log.Errorf("subject %s: vault file encode failed: %v", subj, err)
+			http.Error(w, "vault persistence failure", http.StatusInternalServerError)
+			return
+		}
+	}
+	err = s.persistVaultCandidateLocked(
+		subj,
+		func(fs vaultFileStore) (policy.FileMutationState, error) {
+			if payload == nil {
+				return fs.Delete()
+			}
+			return fs.SaveRaw(payload)
+		},
+		func() error {
+			_, commitErr := store.CommitCandidate(candidate)
+			return commitErr
+		},
+	)
+	if err != nil {
+		// Uncertain persist latched → 503; every other failure kept last-good
+		// on both sides → retryable 500. Details stay in the log.
+		log.Errorf("subject %s: vault relay write failed: %v", subj, err)
+		status := http.StatusInternalServerError
+		if recovery := s.vaultRecovery.Load(); recovery != nil {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(w, "vault persistence failure", status)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	state, err := store.Sanitized()
+	if err != nil {
+		log.Errorf("subject %s: vault sanitized read failed: %v", subj, err)
+		http.Error(w, "vault persistence failure", http.StatusInternalServerError)
+		return
+	}
+	writeVaultRelayWriteResponse(w, r, state, created)
+}
+
+// writeVaultRelayWriteResponse maps the committed mutation onto the relay
+// contract: POST → 201, PUT → 200 (201 when it created), DELETE → 204.
+func writeVaultRelayWriteResponse(w http.ResponseWriter, r *http.Request, state credentialvault.State, created bool) {
+	switch r.Method {
+	case http.MethodPost:
+		writeJSON(w, http.StatusCreated, state)
+	case http.MethodPut:
 		status := http.StatusOK
 		if created {
 			status = http.StatusCreated
 		}
 		writeJSON(w, status, state)
-	case http.MethodDelete:
-		if err := vault.Delete(); err != nil {
-			writeVaultRelayError(w, err)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
 	default:
-		w.Header().Set("Allow", "GET, POST, PUT, DELETE")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
@@ -134,15 +275,16 @@ func (s *fastSandboxPolicyServer) selectRelayVault(r *http.Request, subj subject
 	return s.vaultForLocked(subj, fence), 0, ""
 }
 
-// vaultValidationPolicy returns the policy a vault op validates against: the
-// effective policy of an active subject, or — while the subject is still
-// denying — its pending binding policy (the op is held to the
+// vaultValidationPolicyLocked returns the policy a vault op validates
+// against: the effective policy of an active subject, or — while the subject
+// is still denying — its pending binding policy (the op is held to the
 // data-plane-ready barrier, so validation must not depend on hook timing).
-func (s *fastSandboxPolicyServer) vaultValidationPolicy(subj subject.Subject) *policy.NetworkPolicy {
+// Callers hold s.mu.
+func (s *fastSandboxPolicyServer) vaultValidationPolicyLocked(subj subject.Subject) *policy.NetworkPolicy {
 	if pol := s.reg.EffectivePolicy(subj); pol != nil {
 		return pol
 	}
-	if pending := s.pendingPolicy(subj); pending != nil {
+	if pending := s.pendingPolicies[subj]; pending != nil {
 		return s.reg.EffectiveOf(pending)
 	}
 	return nil

@@ -73,24 +73,31 @@ func newHandlerInstanceID() string {
 
 // handleActionsStatus serves GET /_fastlet/v1/actions/status: the Handler
 // process incarnation probe. ready mirrors the healthz gate (false while the
-// MITM stack is not ready); instanceId is the replay trigger. The pinned-CA
-// fields are additive observability (OSEP-0022): the CA fingerprint the addon
-// signed with, plus the explicit addon-down signal when the pinned CA is
-// missing or unloadable (the rest of egress keeps serving).
+// MITM stack is not ready or the vault recovery latch freezes writes);
+// instanceId is the replay trigger. A per-subject degraded vault is
+// deliberately not a readiness failure (it fails closed for that subject
+// only) — it is listed in degradedVaults instead.
 func (s *fastSandboxPolicyServer) handleActionsStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	recovery := s.vaultRecoveryActive()
+	degraded := s.degradedVaultUIDs()
 	ready := true
 	if s.mitmGate != nil && s.mitmGate.MitmPending() {
 		ready = false
 	}
+	if recovery {
+		ready = false
+	}
 	resp := actionhandler.StatusResponse{
-		APIVersion: constants.ActionsAPIVersion,
-		Ready:      ready,
-		InstanceID: s.instanceID,
+		APIVersion:     constants.ActionsAPIVersion,
+		Ready:          ready,
+		InstanceID:     s.instanceID,
+		Recovery:       recovery,
+		DegradedVaults: degraded,
 	}
 	if s.mitmGate != nil {
 		resp.MitmCaFingerprint = s.mitmGate.CAFingerprint()
@@ -165,11 +172,24 @@ func (s *fastSandboxPolicyServer) applySetBinding(env *actionhandler.Envelope) (
 	}
 	// A fence change is a rebind: discard ALL prior per-subject state. The
 	// registry drops its entry inside RegisterAndEnforce; the vault slice
-	// must go too, or the old instance's credentials would survive into the
-	// successor's flows. Same-UID actions serialize per subject.
+	// must go too (memory + persisted file), or the old instance's
+	// credentials would survive into the successor's flows. Same-UID actions
+	// serialize per subject; the vault relay writes hold the same lock for
+	// their whole commit protocol.
 	if old, ok := s.reg.Fence(subj); ok && !old.Matches(fence) {
+		s.mu.Lock()
 		s.dropVault(subj)
+		s.mu.Unlock()
 		log.Infof("subject %s: rebind (%s -> %s), vault slice purged", subj, old.RuntimeInstanceID, fence.RuntimeInstanceID)
+	}
+	// Egress-restart recovery (OSEP-0022 stage 2): a subject with no live
+	// vault slice reloads its persisted file here, fenced by the full runtime
+	// identity. This runs BEFORE the deny-first install so no interception
+	// entry can materialize an empty slice ahead of the reload. A removal
+	// binding skips the reload: with no policy to revalidate against, the
+	// file stays fenced on disk until the next registration or terminal purge.
+	if !env.Binding.IsRemoval() {
+		s.rehydrateVaultReload(subj, fence, pol)
 	}
 	state, err := s.reg.RegisterAndEnforce(subj, subject.SubjectKey{SourceIP: att.IP}, fence, func() error {
 		return s.OnRegistered(subj, att)
@@ -257,6 +277,10 @@ func (s *fastSandboxPolicyServer) applyLifecycleHook(env *actionhandler.Envelope
 // The subject stays registered until enforcement removal succeeds: a
 // transient failure returns 500 and the retried REMOVE_BINDING resumes
 // cleanup instead of succeeding with stale rules left in the kernel.
+//
+// The vault file is purged once more AFTER Unregister (under s.mu): a relay
+// write parked on s.mu during the first purge can still observe the old
+// fence and recreate the file before the unregister lands.
 func (s *fastSandboxPolicyServer) applyRemoveBinding(env *actionhandler.Envelope) (int, error) {
 	subj := subject.FromSandboxUID(env.Sandbox.UID)
 	fence := subject.FromRevision(env)
@@ -277,6 +301,7 @@ func (s *fastSandboxPolicyServer) applyRemoveBinding(env *actionhandler.Envelope
 		return http.StatusInternalServerError, fmt.Errorf("enforcement removal: %w", err)
 	}
 	s.reg.Unregister(subj)
+	s.dropSubjectState(subj)
 	log.Infof("subject %s: REMOVE_BINDING complete (was %s)", subj, prev)
 	return http.StatusOK, nil
 }

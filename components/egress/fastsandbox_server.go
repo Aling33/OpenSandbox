@@ -29,6 +29,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/actionhandler"
@@ -68,6 +69,14 @@ type fastSandboxPolicyServer struct {
 	// cleanup (gateway refcounts) even when the REMOVE_BINDING envelope omits
 	// the attachment block.
 	subjAtt map[subject.Subject]actionhandler.NetworkAttachment
+
+	// vaultFiles owns the per-subject vault files; nil keeps the vault
+	// memory-only (the default, and the sidecar posture).
+	vaultFiles *vaultPersistence
+	// vaultRecovery is the sticky recovery latch: non-nil freezes vault
+	// writes until the process restarts (first reason wins; reads are
+	// lock-free so healthz never contends).
+	vaultRecovery atomic.Pointer[vaultRecoveryState]
 
 	// gatewayDNSRefs maps each subject to its gateway so the shared
 	// prerouting REDIRECT (sandbox DNS -> loopback proxy) is installed once
@@ -241,12 +250,16 @@ type healthzResponse struct {
 	// latched until process restart.
 	MitmCaDown  bool   `json:"mitmCaDown,omitempty"`
 	MitmCaError string `json:"mitmCaError,omitempty"`
+	// VaultHealthIssue is the non-empty vault-persistence reason (recovery
+	// latch; see fastsandbox_vault_persist.go). Status mirrors its class.
+	VaultHealthIssue string `json:"vaultHealthIssue,omitempty"`
 }
 
 // handleHealthz: 503 while the mitm stack is not ready (pre-create probe) and
 // 503 with an explicit addon-down signal when the pinned CA failed (permanent
 // until process restart) — the runtime driver refuses sandbox creation for
-// both; policy actions keep serving regardless.
+// both; policy actions keep serving regardless. The vault recovery latch
+// reports 503 the same way.
 func (s *fastSandboxPolicyServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	if s.mitmGate != nil {
 		if reason, down := s.mitmGate.DownReason(); down {
@@ -257,6 +270,13 @@ func (s *fastSandboxPolicyServer) handleHealthz(w http.ResponseWriter, _ *http.R
 			})
 			return
 		}
+		if issue := s.vaultHealthIssue(); issue != "" {
+			writeJSON(w, http.StatusServiceUnavailable, healthzResponse{
+				Status:           "vault-unhealthy",
+				VaultHealthIssue: issue,
+			})
+			return
+		}
 		if s.mitmGate.MitmPending() {
 			writeJSON(w, http.StatusServiceUnavailable, healthzResponse{Status: "mitmproxy-not-ready"})
 			return
@@ -264,6 +284,13 @@ func (s *fastSandboxPolicyServer) handleHealthz(w http.ResponseWriter, _ *http.R
 		writeJSON(w, http.StatusOK, healthzResponse{
 			Status:            "ok",
 			MitmCaFingerprint: s.mitmGate.CAFingerprint(),
+		})
+		return
+	}
+	if issue := s.vaultHealthIssue(); issue != "" {
+		writeJSON(w, http.StatusServiceUnavailable, healthzResponse{
+			Status:           "vault-unhealthy",
+			VaultHealthIssue: issue,
 		})
 		return
 	}
@@ -321,13 +348,17 @@ func (s *fastSandboxPolicyServer) applyPolicy(subj subject.Subject, pol *policy.
 }
 
 // vaultEntry binds a vault store to the registration fence it was
-// materialized under.
+// materialized under. degraded is non-empty while the persisted vault could
+// not be reloaded: the slice stays empty (interception fails closed for that
+// subject, policy unaffected) until a successful relay write clears it.
 type vaultEntry struct {
-	store *credentialvault.Store
-	fence subject.Fencing
+	store    *credentialvault.Store
+	fence    subject.Fencing
+	degraded string
 }
 
-// vaultFor returns the memory-only per-subject vault, created on first use.
+// vaultFor returns the per-subject vault, created on first use (rehydrated
+// from its persisted file at registration, OSEP-0022 stage 2).
 // A store is only valid under the fence it was created with: a mismatch
 // (same-UID rebind without REMOVE_BINDING, or a TOCTOU store materialized
 // against an unregistered subject) is dropped, never inherited — a reset
@@ -353,11 +384,11 @@ func (s *fastSandboxPolicyServer) vaultForLocked(subj subject.Subject, fence sub
 	return v
 }
 
-// dropVault purges the subject's vault slice (rebind cleanup).
+// dropVault purges the subject's vault slice (rebind cleanup): memory and,
+// when persistence is enabled, the per-subject file. The caller holds s.mu.
 func (s *fastSandboxPolicyServer) dropVault(subj subject.Subject) {
-	s.mu.Lock()
 	delete(s.vaults, subj)
-	s.mu.Unlock()
+	s.purgeVaultFile(subj)
 }
 
 // OnRegistered implements subject.LifecycleHooks: deny-first enforcement
@@ -468,12 +499,14 @@ func (s *fastSandboxPolicyServer) takeoverStaleSubject(stale subject.Subject) er
 }
 
 // dropSubjectState removes every piece of per-subject bookkeeping (vault,
-// pending policy, attachment).
+// pending policy, attachment) plus the persisted vault file — terminal
+// cleanup (OSEP-0022: REMOVE_BINDING purges memory + file).
 func (s *fastSandboxPolicyServer) dropSubjectState(subj subject.Subject) {
 	s.mu.Lock()
 	delete(s.vaults, subj)
 	delete(s.pendingPolicies, subj)
 	delete(s.subjAtt, subj)
+	s.purgeVaultFile(subj)
 	s.mu.Unlock()
 }
 

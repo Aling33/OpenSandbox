@@ -111,6 +111,20 @@ func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.Upstream
 	reg := subject.NewRegistry(alwaysDeny, alwaysAllow)
 	fastSandboxSrv := newFastSandboxPolicyServer(ctx, reg, podNft)
 
+	// Vault persistence (OSEP-0022 stage 2): per-subject vault files under
+	// OPENSANDBOX_EGRESS_VAULT_DIR so an egress restart recovers locally at
+	// SET_BINDING replay. Empty/unset keeps the vault memory-only. Fail fast
+	// on an unusable directory: silently serving memory-only would break the
+	// acked ⇒ durable contract.
+	if vaultDir := strings.TrimSpace(os.Getenv(constants.EnvEgressVaultDir)); vaultDir != "" {
+		vp, err := newVaultPersistence(vaultDir)
+		if err != nil {
+			log.Fatalf("fast-sandbox vault persistence: %v", err)
+		}
+		fastSandboxSrv.SetVaultFiles(vp)
+		log.Infof("fast-sandbox vault persistence enabled at %s (one file per subject, atomic commit protocol)", vaultDir)
+	}
+
 	// Shared mitmproxy (OSEP-0022 A1): one mitmdump in the Pod netns serving
 	// every sandbox. Started BEFORE the HTTP listener so subjects can never
 	// register against a missing interceptor (fail-closed registration); the
@@ -216,7 +230,17 @@ func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.Upstream
 	log.Infof("fast-sandbox dns proxy listening on %s", dnsAddr)
 
 	httpAddr := envOrDefault(constants.EnvEgressHTTPAddr, constants.DefaultFastSandboxServerAddr)
-	srv := &http.Server{Addr: httpAddr, Handler: fastSandboxSrv.Handler()}
+	// Explicit read timeouts bound a stalled client; the vault relay parses
+	// bodies before taking the server lock, so these are the second line of
+	// defense (all bodies are bounded and small, handlers are quick).
+	srv := &http.Server{
+		Addr:              httpAddr,
+		Handler:           fastSandboxSrv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	safego.Go(func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("fast-sandbox policy server error: %v", err)
