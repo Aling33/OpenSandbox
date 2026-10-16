@@ -92,13 +92,16 @@ public sealed class Sandbox : IAsyncDisposable
     /// the revision — re-read and retry with the fresh <c>ExpectedRevision</c>.
     /// </remarks>
     /// <exception cref="SandboxException">
-    /// Thrown when the adapter factory did not provide a Credential Vault service.
+    /// Thrown for a template-backed sandbox whose adapter factory did not
+    /// provide a Credential Vault service. For direct sidecar sandboxes the
+    /// unavailable marker is returned instead and each operation throws
+    /// <see cref="InvalidArgumentException"/> when invoked.
     /// </exception>
     public ICredentialVault CredentialVault
     {
         get
         {
-            if (_credentialVault is UnavailableCredentialVault)
+            if (Origin == SandboxOrigin.Template && _credentialVault is UnavailableCredentialVault)
             {
                 throw new SandboxException(
                     "Credential Vault is not available: the adapter factory did not provide a Credential Vault service.");
