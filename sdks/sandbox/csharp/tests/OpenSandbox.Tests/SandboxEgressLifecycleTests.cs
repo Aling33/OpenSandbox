@@ -443,7 +443,7 @@ public class SandboxEgressLifecycleTests
         routedFactory.NetworkPolicyStackCallCount.Should().Be(1);
         _ = routedSandbox.CredentialVault;
         await routedSandbox.CredentialVault.GetAsync();
-        stubVault.GetCallCount.Should().Be(1);
+        stubVault.GetVaultCallCount.Should().Be(1);
     }
 
     [Fact]
@@ -620,54 +620,6 @@ public class SandboxEgressLifecycleTests
                 CredentialVault = _credentialVault
             };
         }
-    }
-
-    private sealed class StubCredentialVault : ICredentialVault
-    {
-        public int GetCallCount { get; private set; }
-
-        private static CredentialVaultState VaultState() => new()
-        {
-            Credentials = Array.Empty<CredentialMetadata>(),
-            Bindings = Array.Empty<CredentialBindingMetadata>()
-        };
-
-        public Task<CredentialVaultState> CreateAsync(
-            IReadOnlyList<Credential> credentials,
-            IReadOnlyList<CredentialBinding> bindings,
-            CancellationToken cancellationToken = default) =>
-            Task.FromResult(VaultState());
-
-        public Task<CredentialVaultState> GetAsync(CancellationToken cancellationToken = default)
-        {
-            GetCallCount++;
-            return Task.FromResult(VaultState());
-        }
-
-        public Task<CredentialVaultState> PatchAsync(
-            CredentialVaultPatchRequest request,
-            CancellationToken cancellationToken = default) =>
-            Task.FromResult(VaultState());
-
-        public Task DeleteAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
-
-        public Task<IReadOnlyList<CredentialMetadata>> ListCredentialsAsync(
-            CancellationToken cancellationToken = default) =>
-            Task.FromResult<IReadOnlyList<CredentialMetadata>>(Array.Empty<CredentialMetadata>());
-
-        public Task<CredentialMetadata> GetCredentialAsync(
-            string name,
-            CancellationToken cancellationToken = default) =>
-            Task.FromResult(new CredentialMetadata { Name = name, SourceType = "inline" });
-
-        public Task<IReadOnlyList<CredentialBindingMetadata>> ListBindingsAsync(
-            CancellationToken cancellationToken = default) =>
-            Task.FromResult<IReadOnlyList<CredentialBindingMetadata>>(Array.Empty<CredentialBindingMetadata>());
-
-        public Task<CredentialBindingMetadata> GetBindingAsync(
-            string name,
-            CancellationToken cancellationToken = default) =>
-            Task.FromResult(new CredentialBindingMetadata { Name = name });
     }
 
     private sealed class StubSandboxes : ISandboxes
