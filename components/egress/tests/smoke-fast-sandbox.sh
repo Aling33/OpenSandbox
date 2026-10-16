@@ -834,88 +834,208 @@ else
   echo "${out}" | grep -qi "client=10.99.0.2" || fail "chained path must work after restart; got: ${out}"
   pass "upstream containment across egress restart (drop re-seeded + chained path intact)"
 
- ###############################################################################
- info "Test 14: credential vault loop — relay write -> real mitm injection -> restart durability"
- # OSEP-0022 chain, every hop a real process: the relay POST acks only after
- # the vault file commit (persistence is on for the whole run), the addon
- # fetches subject a's active snapshot over the shared unix socket and
- # injects the Go-rendered credential into matching flows, and after an
- # egress restart the SET_BINDING replay reloads the vault from disk —
- # injection resumes with no relay write in between. Binding match rides the
- # Host header (transparent-mode pretty_host prefers it over the original
- # destination IP) and pins scheme http — the default binding scheme is
- # https-only.
- #
- # Decouple from Test 13 first: its chained CONNECT relay would wrap the
- # probe (the ext echo would see the relay's source 10.99.0.2, not the mitm's
- # 10.99.0.1), so drop the helper and restart the egress on the direct mitm
- # path. The restart also unregisters the subjects; replay subject a below.
- if [ -n "${PROXY_PID}" ]; then
-   kill "${PROXY_PID}" 2>/dev/null || true
-   wait "${PROXY_PID}" 2>/dev/null || true
-   PROXY_PID=""
- fi
- kill "${EGRESS_PID}" 2>/dev/null
- wait "${EGRESS_PID}" 2>/dev/null || true
- EGRESS_PID=""
- EGRESS_MITM=1 start_egress
- bind_and_ready a 10.10.0.5 13 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
- wait_for 15 "per-subject DNAT (vault preamble)" bash -c "nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '"
- CREATE_BODY='{"credentials":[{"name":"smoke-token","source":{"type":"inline","value":"smoke-vault-secret-1"}}],"bindings":[{"name":"ext-bearer","match":{"hosts":["ext.test"],"schemes":["http"]},"auth":{"type":"bearer","credential":"smoke-token"}}]}'
-  vault_inject_probe() {
-    ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/
-  }
-
-  # 14a: create-only relay POST — 201, then 409 on the second create.
-  code="$(curl -s -o "${VAULT_BODY}" -w '%{http_code}' -XPOST "http://127.0.0.1:${POLICY_PORT}/vault/a" -d "${CREATE_BODY}")"
-  [ "${code}" = "201" ] || fail "relay POST must create the vault (201), got ${code}: $(cat "${VAULT_BODY}")"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -XPOST "http://127.0.0.1:${POLICY_PORT}/vault/a" -d "${CREATE_BODY}")"
-  [ "${code}" = "409" ] || fail "relay POST must be create-only (409 on exists), got ${code}"
-  pass "relay POST create-only (201, then 409 on exists)"
-
-  # 14b: the real mitm request carries the injected credential, while the
-  # same subject's non-matching host stays uncredentialed (binding scope).
-  out="$(vault_inject_probe)"
-  echo "${out}" | grep -qi 'client=10.99.0.1' || fail "request did not traverse the shared mitm; got: ${out}"
-  echo "${out}" | grep -qi 'authorization: bearer smoke-vault-secret-1' \
-    || fail "injected credential missing at the upstream; got: ${out}"
-  out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: alt.test' http://10.99.0.2/)"
-  echo "${out}" | grep -qi 'client=10.99.0.1' || fail "non-matching host did not traverse the shared mitm; got: ${out}"
-  if echo "${out}" | grep -qi 'smoke-vault-secret-1'; then
-    fail "credential must not leak to a non-matching host; got: ${out}"
+  ###############################################################################
+  info "Test 14: credential vault happy-path matrix — relay CRUD, auth types, substitutions, isolation, durability"
+  # OSEP-0022 chain, every hop a real process: relay writes ack only after
+  # the vault file commit (persistence is on for the whole run), the addon
+  # fetches each subject's active snapshot over the shared unix socket and
+  # injects the Go-rendered credentials into matching flows, and an egress
+  # restart reloads the vault at the SET_BINDING replay. Covered happy
+  # paths: POST create-only, PUT full replace with expectedRevision
+  # (rotation), PUT create-when-absent, GET full revision, DELETE, the
+  # correct X-Fast-Sandbox-Incarnation precondition, the active ETag/304
+  # handshake, every injection auth type (bearer, basic, apiKey,
+  # customHeaders) plus query substitutions, host+path binding scope,
+  # vault-created-while-denying (pending-policy validation), per-subject
+  # isolation, and REMOVE_BINDING file purge across a restart.
+  #
+  # Binding match rides the Host header (transparent-mode pretty_host
+  # prefers it over the original destination IP) and pins scheme http — the
+  # default binding scheme is https-only.
+  #
+  # Decouple from Test 13 first: its chained CONNECT relay would wrap the
+  # probe (the ext echo would see the relay's source 10.99.0.2, not the mitm's
+  # 10.99.0.1), so drop the helper and restart the egress on the direct mitm
+  # path. The restart also unregisters the subjects; replay subject a below.
+  VAULT_POLICY_A='{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"},{"action":"allow","target":"api.test"},{"action":"allow","target":"custom.test"},{"action":"allow","target":"basic.test"},{"action":"allow","target":"sub.test"}]}'
+  VAULT_POLICY_B='{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
+  if [ -n "${PROXY_PID}" ]; then
+    kill "${PROXY_PID}" 2>/dev/null || true
+    wait "${PROXY_PID}" 2>/dev/null || true
+    PROXY_PID=""
   fi
-  pass "real mitm injection (matching host credentialed, alt host uncredentialed)"
-
-  # 14c: restart durability — with the daemon down the vault lives only in
-  # its file (the relay 404s the unregistered subject), the SET_BINDING
-  # replay reloads it from disk, and injection resumes with no relay write.
   kill "${EGRESS_PID}" 2>/dev/null
   wait "${EGRESS_PID}" 2>/dev/null || true
   EGRESS_PID=""
   EGRESS_MITM=1 start_egress
-  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/vault/a")"
+  bind_and_ready a 10.10.0.5 13 runtime-a-2 att-a-2 "${VAULT_POLICY_A}"
+  wait_for 15 "per-subject DNAT (vault preamble)" bash -c "nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '"
+
+  # vault_relay <subject> <method> [body] [incarnation]: one relay op;
+  # prints "<code>" and leaves the response body in ${VAULT_BODY}.
+  vault_relay() {
+    local subj="$1" method="$2" body="${3-}" inc="${4-}" extra=()
+    [ -n "${inc}" ] && extra=(-H "X-Fast-Sandbox-Incarnation: ${inc}")
+    if [ -n "${body}" ]; then
+      extra+=(-d "${body}")
+    fi
+    curl -s -o "${VAULT_BODY}" -w '%{http_code}' -X"${method}" \
+      "http://127.0.0.1:${POLICY_PORT}/vault/${subj}" "${extra[@]}"
+  }
+  # vault_probe <netns> <host> [uri]: one real request through the DNAT ->
+  # shared mitm -> ext echo (the echo prints client= and path= lines plus
+  # the request headers it received).
+  vault_probe() {
+    ip netns exec "osb-sandbox-$1" curl -s -m 5 -H "Host: $2" "http://10.99.0.2${3-/}"
+  }
+  assert_credential() { # assert_credential <out> <header-line>
+    echo "$1" | grep -qi "client=10.99.0.1" || fail "request did not traverse the shared mitm; got: $1"
+    echo "$1" | grep -qi "$2" || fail "expected '$2' at the upstream; got: $1"
+  }
+  assert_no_credential() { # assert_no_credential <out> <secret>
+    echo "$1" | grep -qi "client=10.99.0.1" || fail "request did not traverse the shared mitm; got: $1"
+    if echo "$1" | grep -qi "$2"; then
+      fail "credential leaked outside its binding scope; got: $1"
+    fi
+  }
+
+  V1_BODY='{"credentials":[{"name":"smoke-token","source":{"type":"inline","value":"smoke-vault-secret-1"}}],"bindings":[{"name":"ext-bearer","match":{"hosts":["ext.test"],"schemes":["http"]},"auth":{"type":"bearer","credential":"smoke-token"}}]}'
+
+  # 14a: create-only relay POST — 201, then 409 on the second create; the
+  # response is the sanitized State (credential metadata, never values).
+  code="$(vault_relay a POST "${V1_BODY}")"
+  [ "${code}" = "201" ] || fail "relay POST must create the vault (201), got ${code}: $(cat "${VAULT_BODY}")"
+  grep -q '"name":"smoke-token"' "${VAULT_BODY}" || fail "sanitized state must carry credential metadata, got: $(cat "${VAULT_BODY}")"
+  if grep -q 'smoke-vault-secret-1' "${VAULT_BODY}"; then
+    fail "sanitized state must not carry credential values, got: $(cat "${VAULT_BODY}")"
+  fi
+  code="$(vault_relay a POST "${V1_BODY}")"
+  [ "${code}" = "409" ] || fail "relay POST must be create-only (409 on exists), got ${code}"
+  pass "relay POST create-only (201 sanitized, then 409 on exists)"
+
+  # 14b: the real mitm request carries the injected credential; a
+  # non-matching host on the same subject stays uncredentialed.
+  out="$(vault_probe a ext.test)"
+  assert_credential "${out}" 'authorization: bearer smoke-vault-secret-1'
+  out="$(vault_probe a alt.test)"
+  assert_no_credential "${out}" 'smoke-vault-secret-1'
+  pass "real mitm injection (matching host credentialed, alt host uncredentialed)"
+
+  # 14c: PUT full replace (expectedRevision precondition + correct
+  # incarnation header — the Fastlet relay's happy shape) rotates the
+  # credential, scopes the bearer binding to /private*, and adds every
+  # remaining auth type: apiKey, customHeaders, basic, and a passthrough
+  # query substitution.
+  V2_BODY='{"expectedRevision":1,"credentials":[{"name":"smoke-token","source":{"type":"inline","value":"smoke-vault-secret-2"}},{"name":"api-token","source":{"type":"inline","value":"api-secret-1"}},{"name":"custom-a","source":{"type":"inline","value":"custom-a-secret"}},{"name":"custom-b","source":{"type":"inline","value":"custom-b-secret"}},{"name":"basic-token","source":{"type":"inline","value":"basic-secret"}},{"name":"sub-token","source":{"type":"inline","value":"sub-secret-1"}}],"bindings":[{"name":"ext-bearer","match":{"hosts":["ext.test"],"schemes":["http"],"paths":["/private*"]},"auth":{"type":"bearer","credential":"smoke-token"}},{"name":"api-key","match":{"hosts":["api.test"],"schemes":["http"]},"auth":{"type":"apiKey","name":"X-API-Key","credential":"api-token"}},{"name":"custom","match":{"hosts":["custom.test"],"schemes":["http"]},"auth":{"type":"customHeaders","headers":[{"name":"X-Custom-A","credential":"custom-a"},{"name":"X-Custom-B","credential":"custom-b"}]}},{"name":"basic-auth","match":{"hosts":["basic.test"],"schemes":["http"]},"auth":{"type":"basic","credential":"basic-token"}},{"name":"sub-query","match":{"hosts":["sub.test"],"schemes":["http"]},"auth":{"type":"passthrough","substitutions":[{"credential":"sub-token","placeholder":"$TOKEN","in":["query"]}]}}]}'
+  code="$(vault_relay a PUT "${V2_BODY}" runtime-a-2)"
+  [ "${code}" = "200" ] || fail "relay PUT replace must be 200, got ${code}: $(cat "${VAULT_BODY}")"
+  grep -q '"revision":2' "${VAULT_BODY}" || fail "replaced vault revision must be 2, got: $(cat "${VAULT_BODY}")"
+  out="$(vault_probe a ext.test /private)"
+  assert_credential "${out}" 'authorization: bearer smoke-vault-secret-2'
+  out="$(vault_probe a ext.test)"
+  assert_no_credential "${out}" 'smoke-vault-secret-2'
+  out="$(vault_probe a api.test)"
+  assert_credential "${out}" 'x-api-key: api-secret-1'
+  if echo "${out}" | grep -qi 'bearer'; then
+    fail "apiKey binding must not leak the bearer credential; got: ${out}"
+  fi
+  out="$(vault_probe a custom.test)"
+  assert_credential "${out}" 'x-custom-a: custom-a-secret'
+  assert_credential "${out}" 'x-custom-b: custom-b-secret'
+  out="$(vault_probe a basic.test)"
+  assert_credential "${out}" 'authorization: basic basic-secret'
+  out="$(vault_probe a sub.test '/sub?tok=$TOKEN')"
+  assert_credential "${out}" 'tok=sub-secret-1'
+  if echo "${out}" | grep -q 'TOKEN'; then
+    fail "query substitution must replace the placeholder; got: ${out}"
+  fi
+  pass "PUT replace (rotation, /private scope, apiKey/customHeaders/basic/query-substitution)"
+
+  # 14d: the addon's active-vault ETag handshake — a conditional re-fetch
+  # with the tag just served answers 304.
+  etag="$(curl -s -D - -o /dev/null "http://127.0.0.1:${POLICY_PORT}/credential-vault/_active?clientIp=10.10.0.5" | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: //p')"
+  [ -n "${etag}" ] || fail "active snapshot must serve an ETag"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: ${etag}" "http://127.0.0.1:${POLICY_PORT}/credential-vault/_active?clientIp=10.10.0.5")"
+  [ "${code}" = "304" ] || fail "conditional active fetch must be 304, got ${code}"
+  pass "active-vault ETag/304 handshake"
+
+  # 14e: restart durability — with the daemon down the vault lives only in
+  # its file (the relay 404s the unregistered subject), the SET_BINDING
+  # replay reloads it from disk, and the whole v2 matrix flows again with
+  # no relay write in between.
+  kill "${EGRESS_PID}" 2>/dev/null
+  wait "${EGRESS_PID}" 2>/dev/null || true
+  EGRESS_PID=""
+  EGRESS_MITM=1 start_egress
+  code="$(vault_relay a GET)"
   [ "${code}" = "404" ] || fail "unregistered subject must 404 before the replay, got ${code}"
-  bind_and_ready a 10.10.0.5 14 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
+  bind_and_ready a 10.10.0.5 14 runtime-a-2 att-a-2 "${VAULT_POLICY_A}"
   wait_for 15 "DNAT rebuilt after restart" bash -c "nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '"
-  code="$(curl -s -o "${VAULT_BODY}" -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/vault/a")"
+  code="$(vault_relay a GET)"
   [ "${code}" = "200" ] || fail "vault must survive the restart (reloaded at SET_BINDING), got ${code}"
-  grep -q '"revision":1' "${VAULT_BODY}" || fail "reloaded vault revision must be 1, got: $(cat "${VAULT_BODY}")"
-  out="$(vault_inject_probe)"
-  echo "${out}" | grep -qi 'authorization: bearer smoke-vault-secret-1' \
-    || fail "injection must resume after the restart without a relay write; got: ${out}"
+  grep -q '"revision":2' "${VAULT_BODY}" || fail "reloaded vault revision must be 2, got: $(cat "${VAULT_BODY}")"
+  out="$(vault_probe a ext.test /private)"
+  assert_credential "${out}" 'authorization: bearer smoke-vault-secret-2'
   pass "vault survives restart (file reload at SET_BINDING replay, injection resumes)"
 
-  # 14d: relay DELETE removes the vault — the addon drops back to the
-  # no-vault plain flow on the same matching host.
-  code="$(curl -s -o /dev/null -w '%{http_code}' -XDELETE "http://127.0.0.1:${POLICY_PORT}/vault/a")"
-  [ "${code}" = "204" ] || fail "relay DELETE must be 204, got ${code}"
-  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/vault/a")"
-  [ "${code}" = "404" ] || fail "vault must be gone after DELETE, got ${code}"
-  out="$(vault_inject_probe)"
-  echo "${out}" | grep -qi 'client=10.99.0.1' || fail "request did not traverse the shared mitm; got: ${out}"
-  if echo "${out}" | grep -qi 'smoke-vault-secret-1'; then
-    fail "credential must stop flowing after DELETE; got: ${out}"
+  # 14f: per-subject isolation + vault-created-while-denying — subject b is
+  # still deny-first when its relay POST lands, so the op validates against
+  # the PENDING binding policy; after activation b flows with its own
+  # credential while a keeps a separate one.
+  VB_BODY='{"credentials":[{"name":"smoke-b-token","source":{"type":"inline","value":"smoke-b-secret"}}],"bindings":[{"name":"ext-bearer","match":{"hosts":["ext.test"],"schemes":["http"],"paths":["/private*"]},"auth":{"type":"bearer","credential":"smoke-b-token"}}]}'
+  set_binding b 10.10.0.6 3 runtime-b att-b "${VAULT_POLICY_B}"
+  code="$(vault_relay b POST "${VB_BODY}")"
+  [ "${code}" = "201" ] || fail "relay POST must accept a denying subject (pending-policy validation), got ${code}: $(cat "${VAULT_BODY}")"
+  lifecycle_hook b runtime-b att-b sandbox.runtime-ready
+  lifecycle_hook b runtime-b att-b sandbox.data-plane-ready
+  wait_for 15 "subject b DNAT" bash -c "nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.6 '"
+  out="$(vault_probe b ext.test /private)"
+  echo "${out}" | grep -qi 'authorization: bearer smoke-b-secret' \
+    || fail "subject b must flow with its own pending-created credential; got: ${out}"
+  out="$(vault_probe a ext.test /private)"
+  assert_credential "${out}" 'authorization: bearer smoke-vault-secret-2'
+  if echo "${out}" | grep -qi 'smoke-b-secret'; then
+    fail "subject a must not receive subject b's credential; got: ${out}"
   fi
+  pass "per-subject isolation + pending-policy creation (b credentialed while denying)"
+
+  # 14g: teardown purge — REMOVE_BINDING drops the vault file with the
+  # subject, so a restart + replay finds nothing to resurrect.
+  remove_binding b runtime-b att-b
+  wait_for 15 "subject b unloaded" bash -c "! nft list table inet opensandbox-fast-sandbox | grep -q subj_s_b"
+  code="$(vault_relay b GET)"
+  [ "${code}" = "404" ] || fail "removed subject's vault must 404, got ${code}"
+  remove_binding a runtime-a-2 att-a-2
+  wait_for 15 "subject a unloaded" bash -c "! nft list table inet opensandbox-fast-sandbox | grep -q subj_s_a"
+  code="$(vault_relay a GET)"
+  [ "${code}" = "404" ] || fail "removed subject's vault must 404, got ${code}"
+  kill "${EGRESS_PID}" 2>/dev/null
+  wait "${EGRESS_PID}" 2>/dev/null || true
+  EGRESS_PID=""
+  EGRESS_MITM=1 start_egress
+  bind_and_ready a 10.10.0.5 15 runtime-a-2 att-a-2 "${VAULT_POLICY_A}"
+  wait_for 15 "DNAT rebuilt after purge restart" bash -c "nft list table inet opensandbox_gateway_mitm 2>/dev/null | grep -q 'ip saddr 10.10.0.5 '"
+  code="$(vault_relay a GET)"
+  [ "${code}" = "404" ] || fail "purged vault must not resurrect across a restart, got ${code}"
+  pass "REMOVE_BINDING purges the vault file (nothing resurrects after restart)"
+
+  # 14h: PUT create-when-absent — the purge left no vault, so an
+  # expectedRevision-free PUT creates one (201) and flows immediately.
+  V3_BODY='{"credentials":[{"name":"smoke-token","source":{"type":"inline","value":"smoke-vault-secret-3"}}],"bindings":[{"name":"ext-bearer","match":{"hosts":["ext.test"],"schemes":["http"],"paths":["/private*"]},"auth":{"type":"bearer","credential":"smoke-token"}}]}'
+  code="$(vault_relay a PUT "${V3_BODY}" runtime-a-2)"
+  [ "${code}" = "201" ] || fail "relay PUT must create when absent (201), got ${code}: $(cat "${VAULT_BODY}")"
+  out="$(vault_probe a ext.test /private)"
+  assert_credential "${out}" 'authorization: bearer smoke-vault-secret-3'
+  pass "PUT create-when-absent (201, injection flows immediately)"
+
+  # 14i: relay DELETE — 204, the relay GET 404s, and the same matching host
+  # drops back to the no-vault plain flow.
+  code="$(vault_relay a DELETE "" runtime-a-2)"
+  [ "${code}" = "204" ] || fail "relay DELETE must be 204, got ${code}"
+  code="$(vault_relay a GET)"
+  [ "${code}" = "404" ] || fail "vault must be gone after DELETE, got ${code}"
+  out="$(vault_probe a ext.test /private)"
+  assert_no_credential "${out}" 'smoke-vault-secret-3'
   pass "relay DELETE stops injection (no-vault plain flow)"
 fi
 
