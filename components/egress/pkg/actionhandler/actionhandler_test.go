@@ -16,6 +16,7 @@ package actionhandler
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -115,6 +116,39 @@ func TestParseEnvelopeRejects(t *testing.T) {
 		"missing fence":      strings.Replace(validEnvelopeJSON(), `, "runtimeInstanceId": "rt-1"`, "", 1),
 		"unknown hook":       `{"apiVersion":"sandbox.fast.io/actions/v1","operation":"LIFECYCLE_HOOK","sandbox":{"uid":"u"},"revision":{"runtimeInstanceId":"r","attachmentId":"a"},"hook":{"name":"sandbox.before-delete"}}`,
 		"missing hook":       `{"apiVersion":"sandbox.fast.io/actions/v1","operation":"LIFECYCLE_HOOK","sandbox":{"uid":"u"},"revision":{"runtimeInstanceId":"r","attachmentId":"a"}}`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseEnvelope([]byte(raw))
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestParseEnvelopeVaultSnapshot(t *testing.T) {
+	for _, op := range []Operation{OperationVaultExport, OperationVaultImport} {
+		raw := strings.Replace(validEnvelopeJSON(), `"operation": "SET_BINDING"`, fmt.Sprintf(`"operation": %q`, string(op)), 1)
+		raw = strings.Replace(raw, `"binding": {"input": "{\"defaultAction\":\"deny\"}"}`,
+			`"snapshot": {"path": "/var/lib/fast-sandbox/bundle/u-1.json"}`, 1)
+		env, err := ParseEnvelope([]byte(raw))
+		require.NoError(t, err, op)
+		assert.Equal(t, op, env.Operation)
+		require.NotNil(t, env.Snapshot)
+		assert.Equal(t, "/var/lib/fast-sandbox/bundle/u-1.json", env.Snapshot.Path)
+	}
+}
+
+func TestParseEnvelopeVaultSnapshotRejects(t *testing.T) {
+	replace := func(op Operation, snapshot string) string {
+		raw := strings.Replace(validEnvelopeJSON(), `"operation": "SET_BINDING"`, fmt.Sprintf(`"operation": %q`, string(op)), 1)
+		return strings.Replace(raw, `"binding": {"input": "{\"defaultAction\":\"deny\"}"}`, snapshot, 1)
+	}
+	cases := map[string]string{
+		"missing snapshot":   replace(OperationVaultExport, ""),
+		"blank path":         replace(OperationVaultExport, `"snapshot": {"path": "  "}`),
+		"relative path":      replace(OperationVaultImport, `"snapshot": {"path": "bundle/u-1.json"}`),
+		"parent traversal":   replace(OperationVaultImport, `"snapshot": {"path": "/bundle/../secrets/u-1.json"}`),
+		"export needs fence": `{"apiVersion":"sandbox.fast.io/actions/v1","operation":"VAULT_EXPORT","sandbox":{"uid":"u"},"snapshot":{"path":"/b.json"},"revision":{"specGeneration":1,"runtimeInstanceId":"","attachmentId":"a"}}`,
 	}
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {
