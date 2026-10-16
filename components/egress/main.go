@@ -57,6 +57,11 @@ func main() {
 	// fast-sandbox, without dns+nft enforcement) fails startup instead of
 	// being silently ignored.
 	profile := strings.TrimSpace(os.Getenv(constants.EnvEgressProfile))
+	if _, present := os.LookupEnv(constants.EnvMitmproxyPassthroughHosts); present &&
+		(profile == constants.ProfileFastSandbox || !constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime))) {
+		log.Fatalf("invalid %s configuration: requires sidecar live revision runtime", constants.EnvMitmproxyPassthroughHosts)
+	}
+
 	upstreamSpec, err := upstreamProxySpecForProfile(profile)
 	if err != nil {
 		log.Fatalf("invalid upstream proxy configuration: %v", err)

@@ -202,3 +202,6 @@ func IsTruthy(v string) bool {
 		return false
 	}
 }
+
+// EnvMitmproxyPassthroughHosts configures live-only static TLS/443 selectors.
+const EnvMitmproxyPassthroughHosts = "OPENSANDBOX_EGRESS_MITMPROXY_PASSTHROUGH_HOSTS"

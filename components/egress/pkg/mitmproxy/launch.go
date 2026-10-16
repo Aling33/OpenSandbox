@@ -32,6 +32,7 @@ import (
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/egress/pkg/mitmpassthrough"
 	"github.com/alibaba/opensandbox/egress/pkg/telemetry"
 	"github.com/alibaba/opensandbox/internal/safego"
 )
@@ -57,6 +58,7 @@ const (
 var (
 	errInvalidRevisionIPCConfig = errors.New("mitmproxy: invalid revision IPC configuration")
 	revisionIPCEnvNames         = []string{
+		constants.EnvMitmproxyPassthroughHosts,
 		revisionIPCSocketEnv,
 		revisionIPCTokenEnv,
 		revisionIPCControlGenerationEnv,
@@ -121,6 +123,7 @@ type RevisionIPCConfig struct {
 	// LiveAdmission selects the OSEP-0023 live credential-bound receiver: the
 	// addon consults the installed decision snapshot for TLS decrypt and
 	// request admission. False keeps the installation-only receiver.
+	StaticPassthrough   mitmpassthrough.Config
 	LiveAdmission       bool
 	TLSCapacity         int
 	RequestCapacity     int
@@ -303,6 +306,7 @@ func buildMitmdumpEnv(base []string, home string, revisionIPC *RevisionIPCConfig
 		)
 		if revisionIPC.LiveAdmission {
 			env = append(env,
+				constants.EnvMitmproxyPassthroughHosts+"="+revisionIPC.StaticPassthrough.JSON(),
 				revisionIPCTLSCapacityEnv+"="+strconv.Itoa(revisionIPC.TLSCapacity),
 				revisionIPCRequestCapacityEnv+"="+strconv.Itoa(revisionIPC.RequestCapacity),
 				revisionIPCDrainTimeoutSecondsEnv+"="+strconv.Itoa(revisionIPC.DrainTimeoutSeconds),
@@ -330,6 +334,9 @@ func validateRevisionIPCConfig(cfg *RevisionIPCConfig) error {
 	// The live credential-bound mode never runs with insecure upstream
 	// verification: credential injection requires the verified origin
 	// identity. The installation-only receiver keeps the legacy escape hatch.
+	if cfg.LiveAdmission && !cfg.StaticPassthrough.Empty() && strings.TrimSpace(os.Getenv(constants.EnvUpstreamProxy)) != "" {
+		return errInvalidRevisionIPCConfig
+	}
 	if cfg.LiveAdmission && constants.IsTruthy(os.Getenv(constants.EnvMitmproxySslInsecure)) {
 		return errInvalidRevisionIPCConfig
 	}

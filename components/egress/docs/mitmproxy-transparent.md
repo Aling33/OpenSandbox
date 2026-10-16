@@ -4,7 +4,7 @@ Transparent mode starts `mitmdump --mode transparent` inside the sidecar and red
 
 - **No application changes**: no need to set `HTTP_PROXY`; app traffic is intercepted transparently.
 - **Observability and extensibility**: use mitm scripts for header injection, auditing, and debugging.
-- **Controlled bypass**: use `ignore_hosts` for pass-through TLS (forward only, no decryption).
+- **Controlled bypass**: legacy mode uses `ignore_hosts`; the experimental live runtime uses typed static TLS/443 selectors (forward only, no decryption).
 
 Typical use case: add L7 visibility/processing at the egress boundary without changing the application networking stack.
 
@@ -37,6 +37,13 @@ export OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT=/path/to/your/addon.py,/path/to/anoth
 To bypass decryption for selected domains, edit the baked-in
 `components/egress/mitmproxy/config.yaml` and rebuild the image — see
 "Static Configuration (config.yaml)" below.
+
+## Experimental live static TLS bypass
+
+The default-off live revision runtime uses typed static TLS/443 selectors;
+legacy mode continues to use `ignore_hosts`. For configuration, migration,
+limits and verification boundaries, see the
+[credential vault guide](../../../docs/guides/credential-vault.md#experimental-live-credential-bound-admission-osep-0023).
 
 ## Configuration Reference
 

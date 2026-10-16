@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -34,7 +35,9 @@ import (
 	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
+	"github.com/alibaba/opensandbox/egress/pkg/hostselector"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/egress/pkg/mitmpassthrough"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 )
@@ -72,18 +75,20 @@ var (
 var activeSnapshotTagFallback atomic.Uint64
 
 type Store struct {
-	mu             sync.RWMutex
-	exists         bool
-	revision       int64
-	credentials    map[string]record
-	bindings       map[string]Binding
-	activeTag      string
-	activeSnapshot *ActiveSnapshot
-	mutationTag    string
-	mitmGate       *mitmproxy.HealthGate
-	requireToken   func() bool
-	sources        *SourceRegistry
-	strictMatch    bool
+	mu                sync.RWMutex
+	exists            bool
+	revision          int64
+	credentials       map[string]record
+	bindings          map[string]Binding
+	activeTag         string
+	activeSnapshot    *ActiveSnapshot
+	mutationTag       string
+	mitmGate          *mitmproxy.HealthGate
+	requireToken      func() bool
+	sources           *SourceRegistry
+	strictMatch       bool
+	liveAdmission     bool
+	staticPassthrough mitmpassthrough.Config
 }
 
 type record struct {
@@ -244,6 +249,14 @@ type InjectionSubstitution struct {
 	Placeholder string   `json:"placeholder"`
 	Value       string   `json:"value"`
 	In          []string `json:"in"`
+}
+
+// NewLiveStore freezes the live runtime's static passthrough policy.
+func NewLiveStore(gate *mitmproxy.HealthGate, requireToken func() bool, config mitmpassthrough.Config) *Store {
+	store := NewStore(gate, requireToken)
+	store.liveAdmission = true
+	store.staticPassthrough = config
+	return store
 }
 
 func NewStore(mitmGate *mitmproxy.HealthGate, requireToken func() bool) *Store {
@@ -497,11 +510,26 @@ func (v *Store) validateCandidate(credentials map[string]record, bindings map[st
 }
 
 func (v *Store) validateBindingPolicy(b Binding, pol *policy.NetworkPolicy) error {
+	if v.liveAdmission && slices.Contains(b.Match.Schemes, "https") {
+		for _, host := range b.Match.Hosts {
+			// Match the snapshot's exclusion of wildcards with an empty DNS language.
+			if strings.HasPrefix(host, "*.") && len(host[2:]) > 251 {
+				continue
+			}
+			selector, err := hostselector.ParseCanonical(host)
+			if err != nil {
+				return fmt.Errorf("binding %q host %q: invalid credential TLS selector: %w", b.Name, host, err)
+			}
+			if v.staticPassthrough.Overlaps(selector) {
+				return fmt.Errorf("binding %q host %q: credential TLS binding overlaps static passthrough", b.Name, host)
+			}
+		}
+	}
 	for _, host := range b.Match.Hosts {
 		if !explicitAllowCoversHost(pol, host) {
 			return fmt.Errorf("binding %q host %q is not allowed by egress policy", b.Name, host)
 		}
-		if bindingHostMatchesIgnoreHosts(host) {
+		if !v.liveAdmission && bindingHostMatchesIgnoreHosts(host) {
 			return fmt.Errorf("binding %q host %q matches mitmproxy ignore_hosts", b.Name, host)
 		}
 	}
