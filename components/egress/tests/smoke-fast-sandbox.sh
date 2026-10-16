@@ -835,17 +835,32 @@ else
   pass "upstream containment across egress restart (drop re-seeded + chained path intact)"
 
  ###############################################################################
-  info "Test 14: credential vault loop — relay write -> real mitm injection -> restart durability"
-  # OSEP-0022 chain, every hop a real process: the relay POST acks only after
-  # the vault file commit (persistence is on for the whole run), the addon
-  # fetches subject a's active snapshot over the shared unix socket and
-  # injects the Go-rendered credential into matching flows, and after an
-  # egress restart the SET_BINDING replay reloads the vault from disk —
-  # injection resumes with no relay write in between. Binding match rides the
-  # Host header (transparent-mode pretty_host prefers it over the original
-  # destination IP) and pins scheme http — the default binding scheme is
-  # https-only.
-  CREATE_BODY='{"credentials":[{"name":"smoke-token","source":{"type":"inline","value":"smoke-vault-secret-1"}}],"bindings":[{"name":"ext-bearer","match":{"hosts":["ext.test"],"schemes":["http"]},"auth":{"type":"bearer","credential":"smoke-token"}}]}'
+ info "Test 14: credential vault loop — relay write -> real mitm injection -> restart durability"
+ # OSEP-0022 chain, every hop a real process: the relay POST acks only after
+ # the vault file commit (persistence is on for the whole run), the addon
+ # fetches subject a's active snapshot over the shared unix socket and
+ # injects the Go-rendered credential into matching flows, and after an
+ # egress restart the SET_BINDING replay reloads the vault from disk —
+ # injection resumes with no relay write in between. Binding match rides the
+ # Host header (transparent-mode pretty_host prefers it over the original
+ # destination IP) and pins scheme http — the default binding scheme is
+ # https-only.
+ #
+ # Decouple from Test 13 first: its chained CONNECT relay would wrap the
+ # probe (the ext echo would see the relay's source 10.99.0.2, not the mitm's
+ # 10.99.0.1), so drop the helper and restart the egress on the direct mitm
+ # path. The restart also unregisters the subjects; replay subject a below.
+ if [ -n "${PROXY_PID}" ]; then
+   kill "${PROXY_PID}" 2>/dev/null || true
+   wait "${PROXY_PID}" 2>/dev/null || true
+   PROXY_PID=""
+ fi
+ kill "${EGRESS_PID}" 2>/dev/null
+ wait "${EGRESS_PID}" 2>/dev/null || true
+ EGRESS_PID=""
+ EGRESS_MITM=1 start_egress
+ bind_and_ready a 10.10.0.5 13 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
+ CREATE_BODY='{"credentials":[{"name":"smoke-token","source":{"type":"inline","value":"smoke-vault-secret-1"}}],"bindings":[{"name":"ext-bearer","match":{"hosts":["ext.test"],"schemes":["http"]},"auth":{"type":"bearer","credential":"smoke-token"}}]}'
   vault_inject_probe() {
     ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2/
   }
@@ -879,7 +894,7 @@ else
   start_egress
   code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/vault/a")"
   [ "${code}" = "404" ] || fail "unregistered subject must 404 before the replay, got ${code}"
-  bind_and_ready a 10.10.0.5 13 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
+  bind_and_ready a 10.10.0.5 14 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
   code="$(curl -s -o "${VAULT_BODY}" -w '%{http_code}' "http://127.0.0.1:${POLICY_PORT}/vault/a")"
   [ "${code}" = "200" ] || fail "vault must survive the restart (reloaded at SET_BINDING), got ${code}"
   grep -q '"revision":1' "${VAULT_BODY}" || fail "reloaded vault revision must be 1, got: $(cat "${VAULT_BODY}")"
