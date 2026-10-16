@@ -39,9 +39,10 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/subject"
 )
 
-// maxVaultSnapshotBytes bounds a bundle read: a vault file is a
-// relay-body-sized artifact, anything over this is not a v1 vault file.
-const maxVaultSnapshotBytes = maxPolicyBodyBytes
+// maxVaultSnapshotBytes bounds a bundle read: the largest valid vault file
+// is a max relay body plus the encoded envelope — anything over this is not
+// a v1 vault file.
+const maxVaultSnapshotBytes = credentialvault.MaxEncodedVaultFileBytes
 
 var errVaultSnapshotTooLarge = fmt.Errorf("vault bundle file exceeds %d bytes", maxVaultSnapshotBytes)
 
@@ -54,14 +55,17 @@ func (p *vaultPersistence) reservesPath(path string) bool {
 		// Uncomparable — fail closed.
 		return true
 	}
-	return !strings.HasPrefix(rel, "..")
+	// Only the parent chain is outside; children whose names begin with
+	// dots (e.g. "..victim.json") are inside the reserved subtree.
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // applyVaultExport copies the subject's vault file into the bundle target and
 // marks the subject sealed. A subject without a vault file just seals. Any
-// failure leaves the subject unsealed and active — the pause proceeds without
-// the vault; a retried export re-copies idempotently (while sealed no vault
-// op can change the source).
+// failure leaves the subject unsealed and active; what the pause flow does
+// with that is the caller's call — the fast-sandbox driver fails the pause
+// checkpoint, so the teardown never runs without a bundle. A retried export
+// re-copies idempotently (while sealed no vault op can change the source).
 //
 // Three phases: guards + a consistent source image under s.mu, the
 // driver-owned copy without the lock (it may be slow; every action and vault
@@ -112,6 +116,24 @@ func (s *fastSandboxPolicyServer) applyVaultExport(env *actionhandler.Envelope) 
 	if live.Exists() != snap.Exists() || (snap.Exists() && !bytes.Equal(live.Data(), snap.Data())) {
 		return http.StatusConflict, fmt.Errorf("vault file changed during export for subject %s; bundle copy not sealed", subj)
 	}
+	if !snap.Exists() {
+		// Nothing to carry: a previous attempt may have left stale bytes at
+		// the target — remove them, or a later import would restore
+		// credentials deleted during the pause.
+		bundle, err := s.vaultFiles.newFile(target)
+		if err != nil {
+			return http.StatusInternalServerError, fmt.Errorf("vault bundle target unavailable: %w", err)
+		}
+		state, err := bundle.Delete()
+		if err != nil || (state != policy.FileCommitted && state != policy.FileUnchanged) {
+			return http.StatusInternalServerError, fmt.Errorf("vault bundle removal failed (state %v): %v", state, err)
+		}
+	}
+	// Durable seal first: a restart before REMOVE_BINDING must reload the
+	// entry sealed, or relay writes would stale the taken bundle.
+	if err := s.vaultFiles.seal(subj); err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("vault seal marker: %w", err)
+	}
 	s.vaultForLocked(subj, fence)
 	e := s.vaults[subj]
 	e.sealed = true
@@ -144,6 +166,23 @@ func (s *fastSandboxPolicyServer) exportSourceImageLocked(subj subject.Subject, 
 	snap, err := fs.Snapshot()
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("vault file snapshot: %w", err)
+	}
+	if snap.Exists() {
+		// Carry only bytes attributable to the registered fence: a leftover
+		// from a previous incarnation (purge failed), a corrupt file, or a
+		// newer schema is treated as absent — never exported, or import
+		// would re-stamp foreign credentials as current.
+		vf, _, decErr := credentialvault.DecodeVaultFile(snap.Data())
+		if decErr != nil || vf.Incarnation != regFence.RuntimeInstanceID || vf.AttachmentID != regFence.AttachmentID {
+			what := "unattributable fence"
+			if errors.Is(decErr, credentialvault.ErrUnsupportedFileVersion) {
+				what = "newer schema (preserved for the newer writer)"
+			} else if decErr != nil {
+				what = "unreadable"
+			}
+			log.Infof("subject %s: vault file not carried (%s)", subj, what)
+			return policy.NewFileSnapshot("", nil, false), 0, nil
+		}
 	}
 	return snap, 0, nil
 }
@@ -201,10 +240,15 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 	if recovery := s.vaultRecovery.Load(); recovery != nil {
 		return http.StatusServiceUnavailable, fmt.Errorf("vault persistence recovery required: %s", recovery.reason)
 	}
-	// At-least-once delivery: never roll a newer local revision back.
+	// At-least-once delivery: never roll a newer local revision back. The
+	// guard requires the stored fence to match the envelope — a newer file
+	// under an old incarnation is stale local state the import must
+	// supersede, not ack.
 	if fs, fsErr := s.vaultFiles.storeFor(subj); fsErr == nil {
 		if cur, snapErr := fs.Snapshot(); snapErr == nil && cur.Exists() {
-			if curVF, _, decErr := credentialvault.DecodeVaultFile(cur.Data()); decErr == nil && curVF.Revision > vf.Revision {
+			if curVF, _, decErr := credentialvault.DecodeVaultFile(cur.Data()); decErr == nil &&
+				curVF.Incarnation == fence.RuntimeInstanceID && curVF.AttachmentID == fence.AttachmentID &&
+				curVF.Revision > vf.Revision {
 				log.Infof("subject %s: vault import superseded (local revision %d > bundle revision %d), idempotent ack", subj, curVF.Revision, vf.Revision)
 				return http.StatusOK, nil
 			}
@@ -229,7 +273,7 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 		func() error {
 			if !registered {
 				// Before SET_BINDING: registration reloads and validates.
-				return nil
+				return s.vaultFiles.unseal(subj)
 			}
 			return s.installImportedVaultLocked(subj, fence, vf, body)
 		},
@@ -263,6 +307,11 @@ func (s *fastSandboxPolicyServer) installImportedVaultLocked(subj subject.Subjec
 		entry = vaultEntry{store: credentialvault.NewStore(nil, func() bool { return true }), fence: fence}
 	}
 	if err := entry.store.Reload(vf.Revision, credentialvault.CreateRequest(body), pol); err != nil {
+		return err
+	}
+	// Unseal only after the store accepted — a failed apply rolls the file
+	// back and keeps the seal.
+	if err := s.vaultFiles.unseal(subj); err != nil {
 		return err
 	}
 	entry.sealed = false

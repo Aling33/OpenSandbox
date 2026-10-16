@@ -32,6 +32,13 @@ import (
 // preserve files written by a newer consumer.
 const VaultFileVersion = 1
 
+// MaxEncodedVaultFileBytes bounds one encoded vault file: a relay body up to
+// maxCredentialVaultBodyBytes plus the envelope (version, fence, revision,
+// JSON framing). Consumers sizing storage or transfers for vault files use
+// this instead of re-deriving the body limit — a cap at the body size alone
+// would reject files the egress itself wrote.
+const MaxEncodedVaultFileBytes = maxCredentialVaultBodyBytes + 4<<10
+
 // ErrUnsupportedFileVersion marks a DecodeVaultFile failure caused solely by
 // an unknown schema version — structurally fine for a newer reader.
 var ErrUnsupportedFileVersion = errors.New("unsupported vault file version")
