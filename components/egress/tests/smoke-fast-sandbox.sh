@@ -951,11 +951,13 @@ else
   fi
   pass "PUT replace (rotation, /private scope, apiKey/customHeaders/basic/query-substitution)"
 
-  # 14d: the addon's active-vault ETag handshake — a conditional re-fetch
-  # with the tag just served answers 304.
-  etag="$(curl -s -D - -o /dev/null "http://127.0.0.1:${POLICY_PORT}/credential-vault/_active?clientIp=10.10.0.5" | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: //p')"
+  # 14d: the addon's active-vault ETag handshake on the shared unix socket
+  # (the addon-facing surface) — a conditional re-fetch with the tag just
+  # served answers 304.
+  ACTIVE_SOCK="/run/opensandbox/credential-proxy/active.sock"
+  etag="$(curl -s -D - -o /dev/null --unix-socket "${ACTIVE_SOCK}" "http://localhost/credential-vault/_active?clientIp=10.10.0.5" | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: //p')"
   [ -n "${etag}" ] || fail "active snapshot must serve an ETag"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -H "If-None-Match: ${etag}" "http://127.0.0.1:${POLICY_PORT}/credential-vault/_active?clientIp=10.10.0.5")"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --unix-socket "${ACTIVE_SOCK}" -H "If-None-Match: ${etag}" "http://localhost/credential-vault/_active?clientIp=10.10.0.5")"
   [ "${code}" = "304" ] || fail "conditional active fetch must be 304, got ${code}"
   pass "active-vault ETag/304 handshake"
 
