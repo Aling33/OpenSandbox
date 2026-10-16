@@ -16,10 +16,12 @@ echo "     deerflow --print \"...\"  one headless agent turn (model required)"
 echo "     make setup           (in /opt/deer-flow) configure models via wizard"
 echo "=============================================================="
 
-# Generate config.yaml on first boot: copy the example, switch the provider.
-if [ ! -f /opt/deer-flow/config.yaml ]; then
-  enable-opensandbox
-fi
+# Ensure config.yaml exists AND points at OpenSandboxProvider on every boot:
+# the Web first-run setup regenerates config.yaml with the default
+# LocalSandboxProvider, which would silently route agent tools back to the
+# gateway host. enable-opensandbox is idempotent and only touches the
+# sandbox.use line, leaving model keys and other user settings alone.
+enable-opensandbox
 
 # Nginx is the only externally bound entry (gateway/frontend stay on
 # loopback), so it must listen on all interfaces for port mapping to work.
