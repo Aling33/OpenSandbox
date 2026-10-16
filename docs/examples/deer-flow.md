@@ -184,9 +184,9 @@ deployment reaches the provider through the `UV_EXTRAS=opensandbox` setting in `
 | `OPEN_SANDBOX_DOMAIN` | _(unset)_ | Server address when the DeerFlow config omits `domain` |
 | `OPEN_SANDBOX_API_KEY` | _(unset)_ | API key when the DeerFlow config omits `api_key` |
 
-## All-in-one Docker image (server + DeerFlow)
+## All-in-one Docker image (server + DeerFlow Web UI)
 
-`examples/deer-flow/` ships an all-in-one lab image bundling both sides of the integration: the OpenSandbox server (docker runtime) and the DeerFlow backend with the OpenSandboxProvider extra preinstalled. Sandbox containers run on the **host** Docker daemon: the image mounts `docker.sock` at run time and drives the host daemon through it — the same topology as `server/docker-compose.example.yaml`.
+`examples/deer-flow/` ships an all-in-one lab image bundling both sides of the integration: the OpenSandbox server (docker runtime) and the DeerFlow backend with the OpenSandboxProvider extra preinstalled — plus the **pre-built Web UI**, served by the bundled nginx on `:2026`. Sandbox containers run on the **host** Docker daemon: the image mounts `docker.sock` at run time and drives the host daemon through it — the same topology as `server/docker-compose.example.yaml`.
 
 Build and run:
 
@@ -194,29 +194,35 @@ Build and run:
 cd examples/deer-flow
 docker build -t deerflow-opensandbox .
 docker run -d --name deerflow-opensandbox \
+  -p 2026:2026 \
   -p 8080:8080 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   --add-host host.docker.internal:host-gateway \
   deerflow-opensandbox
-
-docker exec -it deerflow-opensandbox bash
 ```
 
 `--add-host host.docker.internal:host-gateway` is required on Linux so the server can reach the host-published sandbox ports; Docker Desktop resolves that name already, and the flag is harmless there.
 
-Inside the container:
+Two entry points:
+
+- **DeerFlow Web UI**: <http://localhost:2026> — the teaching path. Complete the first-run setup in the page, configure a model under Settings → Models (API key stays in the Web UI), then chat: the agent's `bash` and file tools execute inside an OpenSandbox sandbox.
+- **OpenSandbox server API**: <http://localhost:8080> — for `curl` checks and the `osb` CLI.
+
+Verify from a shell on the host:
 
 ```shell
-# 0) server ready
 curl -s http://127.0.0.1:8080/health        # -> {"status":"healthy"}
+docker ps | grep -i sandbox                 # sandbox containers appear as you chat
+```
 
-# 1) model-free path: drive OpenSandboxProvider directly (no API key needed)
+Headless / model-free paths inside the container (`docker exec -it deerflow-opensandbox bash`):
+
+```shell
+# 1) model-free: drive OpenSandboxProvider directly (no API key needed)
 cd /opt/OpenSandbox
 uv run --project /opt/deer-flow/backend python examples/deer-flow/main.py
-#   in another terminal: docker ps | grep -i sandbox   (watch containers appear)
 
-# 2) full agent path (requires a model key)
-cd /opt/deer-flow && make setup             # interactive wizard, writes .env
+# 2) full agent turn via CLI (requires a configured model)
 deerflow --print "Run python3 -c 'print(2 ** 16)' and report the output"
 ```
 
@@ -226,8 +232,10 @@ On first boot the entrypoint generates `/opt/deer-flow/config.yaml` from `config
 
 Notes:
 
+- The Web UI stack starts in production mode (background `serve.sh --prod --daemon --skip-install --skip-frontend-build`), reusing the frontend build baked at image build time; the frontend build requires Node.js + pnpm, both installed in the image.
+- `UV_EXTRAS=opensandbox` is set in the image so DeerFlow's own start-time `uv sync --locked` (in `scripts/serve.sh`) keeps the `opensandbox` extra instead of pruning it.
 - Sandbox images (default `python:3.11`) are pulled by the **host** Docker; the provider's `ready_timeout` is set to 300s to cover the first pull.
-- `DEERFLOW_REPO` / `DEERFLOW_REF` / `OPENSANDBOX_REPO` build args let network-restricted environments point the clones at mirrors; pip/uv honor `PIP_INDEX_URL` / `UV_INDEX_URL`.
+- `DEERFLOW_REPO` / `DEERFLOW_REF` / `OPENSANDBOX_REPO` build args let network-restricted environments point the clones at mirrors; pip/uv honor `PIP_INDEX_URL` / `UV_INDEX_URL`, and pnpm uses the configured registry.
 
 ## References
 
