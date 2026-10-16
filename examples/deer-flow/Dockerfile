@@ -48,7 +48,10 @@ ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable
 
 # ---- OpenSandbox: server + Python SDK + osb CLI ----
-RUN pip install opensandbox-server opensandbox opensandbox-cli
+# Pinned to the latest stable release (1.1.1) for reproducible classroom
+# builds; the execd/egress images in opensandbox-server.toml are the
+# versions that release pairs with.
+RUN pip install opensandbox-server==1.1.1 opensandbox==1.1.1 opensandbox-cli==1.1.1
 
 # ---- DeerFlow: backend (with the opensandbox extra) + pre-built frontend ----
 # UV_EXTRAS keeps the extra across DeerFlow's own `uv sync --locked` runs
