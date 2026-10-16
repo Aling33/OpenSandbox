@@ -234,7 +234,7 @@ Notes:
 
 - The Web UI stack starts in production mode (background `serve.sh --prod --daemon --skip-install --skip-frontend-build`), reusing the frontend build baked at image build time; the frontend build requires Node.js + pnpm, both installed in the image.
 - `UV_EXTRAS=opensandbox` is set in the image so DeerFlow's own start-time `uv sync --locked` (in `scripts/serve.sh`) keeps the `opensandbox` extra instead of pruning it.
-- Sandbox images (default `python:3.11`) are pulled by the **host** Docker; the provider's `ready_timeout` is set to 300s to cover the first pull.
+- Sandbox images default to the lab image itself (`opensandbox/deerflow-example:latest` on the ACR mirror — a python base with a rich preinstalled environment); any image with a POSIX shell works, e.g. Docker Hub `python:3.11`. Images are pulled by the **host** Docker; the provider's `ready_timeout` is set to 600s to cover the first pull of the larger default.
 - `DEERFLOW_REPO` / `DEERFLOW_REF` / `OPENSANDBOX_REPO` build args let network-restricted environments point the clones at mirrors; pip/uv honor `PIP_INDEX_URL` / `UV_INDEX_URL`, and pnpm uses the configured registry.
 
 ## References

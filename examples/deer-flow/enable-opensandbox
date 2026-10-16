@@ -43,10 +43,12 @@ if any(provider_re.match(line) for line in lines):
 block = (
     "use: deerflow.community.opensandbox:OpenSandboxProvider\n"
     "  # ---- OpenSandbox server bundled in this image ----\n"
-    "  image: python:3.11\n"
+    "  # Sandbox image: the lab image itself (python base, rich preinstalled\n"
+    "  # env). Docker Hub python:3.11 also works, but pulls slower in CN.\n"
+    "  image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/deerflow-example:latest\n"
     "  domain: localhost:8080\n"
     "  protocol: http\n"
-    "  ready_timeout: 300        # covers the first sandbox image pull\n"
+    "  ready_timeout: 600        # covers the first sandbox image pull\n"
     "  replicas: 3\n"
     "  idle_timeout: 600\n"
 )
