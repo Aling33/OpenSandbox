@@ -351,10 +351,13 @@ func (s *fastSandboxPolicyServer) applyPolicy(subj subject.Subject, pol *policy.
 // materialized under. degraded is non-empty while the persisted vault could
 // not be reloaded: the slice stays empty (interception fails closed for that
 // subject, policy unaffected) until a successful relay write clears it.
+// sealed marks a paused subject whose vault file was exported into the
+// snapshot bundle: every vault op answers 409; enforcement is unchanged.
 type vaultEntry struct {
 	store    *credentialvault.Store
 	fence    subject.Fencing
 	degraded string
+	sealed   bool
 }
 
 // vaultFor returns the per-subject vault, created on first use (rehydrated

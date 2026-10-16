@@ -134,6 +134,10 @@ func (s *fastSandboxPolicyServer) handleVaultRelayWrite(w http.ResponseWriter, r
 		http.Error(w, "expectedIncarnation mismatch", http.StatusPreconditionFailed)
 		return
 	}
+	if s.vaultSealedLocked(subj) {
+		http.Error(w, "subject vault is sealed (paused); the bundle copy is already taken", http.StatusConflict)
+		return
+	}
 	if recovery := s.vaultRecovery.Load(); recovery != nil {
 		http.Error(w, "vault persistence recovery required: "+recovery.reason, http.StatusServiceUnavailable)
 		return
@@ -272,7 +276,17 @@ func (s *fastSandboxPolicyServer) selectRelayVault(r *http.Request, subj subject
 	if inc := strings.TrimSpace(r.Header.Get(constants.EgressVaultIncarnationHeader)); inc != "" && inc != fence.RuntimeInstanceID {
 		return nil, http.StatusPreconditionFailed, "expectedIncarnation mismatch"
 	}
+	if s.vaultSealedLocked(subj) {
+		return nil, http.StatusConflict, "subject vault is sealed (paused); the bundle copy is already taken"
+	}
 	return s.vaultForLocked(subj, fence), 0, ""
+}
+
+// vaultSealedLocked reports whether the subject's vault is sealed (paused);
+// it never materializes an entry. Callers hold s.mu.
+func (s *fastSandboxPolicyServer) vaultSealedLocked(subj subject.Subject) bool {
+	e, ok := s.vaults[subj]
+	return ok && e.sealed
 }
 
 // vaultValidationPolicyLocked returns the policy a vault op validates

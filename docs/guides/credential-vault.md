@@ -122,9 +122,12 @@ sandbox** under `OPENSANDBOX_EGRESS_VAULT_DIR` (a Pod-scoped `emptyDir`). An
 egress container restart inside the live Pod recovers locally when the Fastlet
 replays the bindings — no server re-push is needed, and the vault files die
 with the Pod, so a Kubernetes pause/resume still follows the re-injection
-procedure above. The files are plaintext v1: the vault volume is part of the
-credential trust surface (mount it with `medium: Memory` to keep plaintext off
-node disk). See
+procedure above. The egress-side snapshot transfer for pause/resume (export
+into the bundle before teardown, re-stamped import at restore) is implemented
+but awaits the fast-sandbox driver hooks that invoke it; until then the
+re-injection procedure applies unchanged. The files are plaintext v1: the
+vault volume is part of the credential trust surface (mount it with
+`medium: Memory` to keep plaintext off node disk). See
 [fast-sandbox networking](/architecture/fast-sandbox/networking#credential-delivery).
 :::
 

@@ -22,6 +22,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -161,6 +162,7 @@ func (p *vaultPersistence) storeFor(subj subject.Subject) (vaultFileStore, error
 // purge removes the subject's file and evicts the cached store. An
 // already-absent file is a complete purge; an uncertain outcome is reported —
 // the leftover stays fenced out by its recorded runtime fence either way.
+// The seal marker (if any) goes with it.
 func (p *vaultPersistence) purge(subj subject.Subject) error {
 	fs, err := p.storeFor(subj)
 	if err != nil {
@@ -178,7 +180,52 @@ func (p *vaultPersistence) purge(subj subject.Subject) error {
 	if state == policy.FileUnknown {
 		return errors.New("vault file unlink outcome uncertain")
 	}
+	return p.unseal(subj)
+}
+
+// markerFor names the durable seal marker: export writes it before acking
+// sealed, and a handler restart between export and REMOVE_BINDING restores
+// the seal from it — otherwise binding replay would reload the vault writable
+// with a bundle already taken.
+func (p *vaultPersistence) markerFor(subj subject.Subject) (string, error) {
+	path, err := p.pathFor(subj)
+	if err != nil {
+		return "", err
+	}
+	return path + ".sealed", nil
+}
+
+// seal writes the marker durably. Presence is the signal; no fsync — the
+// marker only needs to survive a container restart, and a torn write still
+// exists.
+func (p *vaultPersistence) seal(subj subject.Subject) error {
+	path, err := p.markerFor(subj)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte("sealed"), 0o600)
+}
+
+// unseal removes the marker; an absent marker is a complete unseal.
+func (p *vaultPersistence) unseal(subj subject.Subject) error {
+	path, err := p.markerFor(subj)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	return nil
+}
+
+// isSealed reports whether the durable seal marker exists.
+func (p *vaultPersistence) isSealed(subj subject.Subject) bool {
+	path, err := p.markerFor(subj)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(path)
+	return err == nil
 }
 
 // SetVaultFiles wires persistence under the relay handlers; nil (the default)
@@ -401,6 +448,13 @@ func (s *fastSandboxPolicyServer) rehydrateVaultReload(subj subject.Subject, fen
 				log.Infof("subject %s: stale vault file discarded (fence %s/%s ≠ %s/%s)", subj, vf.Incarnation, vf.AttachmentID, fence.RuntimeInstanceID, fence.AttachmentID)
 			}
 		}
+	}
+	// A durable seal marker (export acked, teardown not yet delivered)
+	// restores the sealed entry across a restart: vault ops stay 409 until
+	// REMOVE_BINDING purges or an import unseals.
+	if s.vaultFiles.isSealed(subj) {
+		entry.sealed = true
+		log.Infof("subject %s: seal restored from marker (exported bundle pending)", subj)
 	}
 	s.vaults[subj] = entry
 }

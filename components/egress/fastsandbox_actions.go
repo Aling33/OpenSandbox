@@ -34,6 +34,10 @@
 //	                   rejected, never silently ignored.
 //	REMOVE_BINDING     terminal cleanup; a fence mismatch (stale removal for
 //	                   a previous instance of the same UID) is ignored.
+//	VAULT_EXPORT       copy the vault file into the snapshot bundle and seal
+//	                   the subject — pause flow, before teardown.
+//	VAULT_IMPORT       land the bundle re-stamped with the restored fence —
+//	                   resume flow, before data-plane-ready.
 //
 // Fail-closed invariants: the subject is deny-first from registration until
 // its data-plane-ready Hook succeeds, so policy delivery can be late but
@@ -146,6 +150,10 @@ func (s *fastSandboxPolicyServer) dispatchAction(env *actionhandler.Envelope) (i
 		return s.applyLifecycleHook(env)
 	case actionhandler.OperationRemoveBinding:
 		return s.applyRemoveBinding(env)
+	case actionhandler.OperationVaultExport:
+		return s.applyVaultExport(env)
+	case actionhandler.OperationVaultImport:
+		return s.applyVaultImport(env)
 	default:
 		// Unreachable: ParseEnvelope validated the operation.
 		return http.StatusBadRequest, fmt.Errorf("unknown operation %q", env.Operation)
