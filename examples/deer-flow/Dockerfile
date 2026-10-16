@@ -45,7 +45,11 @@ COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 COPY --from=node:22-bookworm-slim /usr/local /usr/local
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-RUN corepack enable
+# The copied image ships corepack shims (yarn etc.) that may dangle; clear
+# them and enable only pnpm — the one manager DeerFlow's frontend needs.
+RUN rm -f /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/local/bin/pnpm /usr/local/bin/pnpx \
+    && corepack enable pnpm \
+    && pnpm --version
 
 # ---- OpenSandbox: server + Python SDK + osb CLI ----
 # Pinned to the latest stable release (1.1.1) for reproducible classroom
