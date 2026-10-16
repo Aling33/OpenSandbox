@@ -230,6 +230,10 @@ deerflow --print "Run python3 -c 'print(2 ** 16)' and report the output"
 On first boot the entrypoint generates `/opt/deer-flow/config.yaml` from `config.example.yaml` and switches the sandbox section to `OpenSandboxProvider` via `enable-opensandbox` (on PATH, idempotent). If `make setup` or any wizard later overwrites the config, rerun `enable-opensandbox` to switch back.
 :::
 
+::: warning
+The image ships a fixed teaching API key (`deerflow-lab-key`, set as `server.api_key` and `OPEN_SANDBOX_API_KEY`) — required since the server refuses to start with an empty key in non-interactive mode. Fine for a classroom laptop; for any shared deployment mount your own config and override the env var.
+:::
+
 Notes:
 
 - The Web UI stack starts in production mode (background `serve.sh --prod --daemon --skip-install --skip-frontend-build`), reusing the frontend build baked at image build time; the frontend build requires Node.js + pnpm, both installed in the image.
