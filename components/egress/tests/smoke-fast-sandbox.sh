@@ -894,6 +894,11 @@ else
   }
   assert_no_credential() { # assert_no_credential <out> <secret>
     echo "$1" | grep -qi "client=10.99.0.1" || fail "request did not traverse the shared mitm; got: $1"
+    # No credential header may flow at all — a stale-cache injection of a
+    # previous revision's secret must fail the probe, not just the named one.
+    if echo "$1" | grep -Eqi '^(authorization|x-api-key|x-custom-a|x-custom-b):'; then
+      fail "out-of-scope request must carry no credential header; got: $1"
+    fi
     if echo "$1" | grep -qi "$2"; then
       fail "credential leaked outside its binding scope; got: $1"
     fi
@@ -976,6 +981,8 @@ else
   code="$(vault_relay a GET)"
   [ "${code}" = "200" ] || fail "vault must survive the restart (reloaded at SET_BINDING), got ${code}"
   grep -q '"revision":2' "${VAULT_BODY}" || fail "reloaded vault revision must be 2, got: $(cat "${VAULT_BODY}")"
+  grep -q 'smoke-vault-secret-2' "${VAULT_BODY}" \
+    || fail "relay GET must return the full revision including credential values, got: $(cat "${VAULT_BODY}")"
   out="$(vault_probe a ext.test /private)"
   assert_credential "${out}" 'authorization: bearer smoke-vault-secret-2'
   pass "vault survives restart (file reload at SET_BINDING replay, injection resumes)"
