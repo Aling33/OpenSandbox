@@ -352,9 +352,7 @@ func (s *fastSandboxPolicyServer) applyPolicy(subj subject.Subject, pol *policy.
 // not be reloaded: the slice stays empty (interception fails closed for that
 // subject, policy unaffected) until a successful relay write clears it.
 // sealed marks a paused subject whose vault file was exported into the
-// snapshot bundle (OSEP-0022 "Vault Lifecycle"): every vault op answers 409 —
-// a mutation would go stale, the bundle copy is already taken. Policy
-// enforcement is unchanged while sealed; REMOVE_BINDING purges as today.
+// snapshot bundle: every vault op answers 409; enforcement is unchanged.
 type vaultEntry struct {
 	store    *credentialvault.Store
 	fence    subject.Fencing

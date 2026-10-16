@@ -32,9 +32,8 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/subject"
 )
 
-// Vault snapshot transfer across pause/resume (OSEP-0022 "Vault Lifecycle").
-// The driver side (pause/resume hooks, snapshot manifest) is platform work —
-// these tests drive the egress hooks directly through the action protocol.
+// Vault snapshot transfer across pause/resume (OSEP-0022). The driver side
+// is platform work — these tests drive the egress hooks via the actions.
 
 const (
 	snapshotTestUID  = "snapshot-u"
@@ -88,10 +87,8 @@ func bundleVaultBody(t *testing.T) credentialvault.VaultFileBody {
 	return credentialvault.VaultFileBody{Credentials: req.Credentials, Bindings: req.Bindings}
 }
 
-// seedBundle writes a real bundle file carrying the OLD runtime fence — what
-// an export on the previous Pod left behind in the driver's staging area.
-// Import reads the source with plain bounded I/O (no injected seam), so the
-// fixture is a real file.
+// seedBundle writes a real bundle file carrying the OLD runtime fence
+// (import reads the source with plain I/O — no injected seam).
 func (h *vaultPersistHarness) seedBundle(t *testing.T, path string) []byte {
 	t.Helper()
 	raw, err := credentialvault.EncodeVaultFile(testFenceR, testFenceA, bundleTestOldRev, bundleVaultBody(t))
@@ -208,8 +205,6 @@ func TestVaultSnapshotExportGuards(t *testing.T) {
 		assert.False(t, h.srv.vaultSealedLocked(subject.FromSandboxUID(snapshotTestUID)))
 	})
 	t.Run("recovery latch rejects the export", func(t *testing.T) {
-		// With on-disk state unconfirmed, the bundle copy plus the teardown
-		// purge could make uncertain bytes the only surviving vault content.
 		h := newVaultPersistHarness(t)
 		h.snapshotSubject(t)
 		h.srv.requireVaultRecoveryLocked("simulated latch")
@@ -223,15 +218,12 @@ func TestVaultSnapshotExportGuards(t *testing.T) {
 	t.Run("target under the vault persistence directory", func(t *testing.T) {
 		h := newVaultPersistHarness(t)
 		h.snapshotSubject(t)
-		// A driver-provided target that would clobber ANOTHER subject's
-		// vault file.
-		inside := filepath.Join(h.dir, "other.json")
+		inside := filepath.Join(h.dir, "other.json") // another subject's file
 
 		rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, testFenceR, testFenceA, "VAULT_EXPORT", inside))
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 		assert.False(t, h.srv.vaultSealedLocked(subject.FromSandboxUID(snapshotTestUID)))
-		// No store may be materialized for the rejected target
-		// (fakeForPath would create one, so scan the map directly).
+		// fakeForPath would create one, so scan the map directly.
 		h.mapMu.Lock()
 		_, materialized := h.files[inside]
 		h.mapMu.Unlock()
@@ -243,8 +235,8 @@ func TestVaultSnapshotExportGuards(t *testing.T) {
 		bundlePath := filepath.Join(t.TempDir(), "bundle", snapshotTestUID+".json")
 		copied := h.fileFor(snapshotTestUID).data
 
-		// A relay write lands while the (slow, unlocked) bundle copy is in
-		// flight: the copy is stale, so phase 3 must refuse to seal.
+		// A relay write lands mid-copy: the copy is stale, phase 3 refuses
+		// to seal.
 		newer, err := credentialvault.EncodeVaultFile(testFenceR, testFenceA, 2, credentialvault.VaultFileBody{})
 		require.NoError(t, err)
 		bundle := h.fakeForPath(bundlePath)
@@ -433,8 +425,7 @@ func TestVaultSnapshotDuplicateImportDoesNotRollBack(t *testing.T) {
 	rec = doVault(t, h.srv, http.MethodPut, snapshotTestUID, vaultPut(fmt.Sprint(bundleTestOldRev)), "")
 	require.Equal(t, http.StatusOK, rec.Code)
 
-	// A lost-ack retry of the SAME import must not roll the vault back to
-	// revision 3 — the local file is newer, so it acks idempotently.
+	// A lost-ack retry must not roll revision 4 back to the bundle's 3.
 	rec = doAction(t, h.srv, snapshotBody(t, snapshotTestUID, snapshotResumeR, snapshotResumeA, "VAULT_IMPORT", bundlePath))
 	require.Equal(t, http.StatusOK, rec.Code)
 

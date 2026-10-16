@@ -55,9 +55,8 @@ type fakeVaultFile struct {
 	saveErr   error
 	saveCalls int
 	lastSaved []byte
-	// onSave fires when SaveRaw starts — the seam for simulating a
-	// concurrent mutation of ANOTHER file while this (slow) write is in
-	// flight, e.g. a relay write landing during a snapshot bundle copy.
+	// onSave fires when SaveRaw starts — simulate a concurrent mutation of
+	// another file mid-write.
 	onSave      func()
 	deleteState policy.FileMutationState
 	deleteErr   error

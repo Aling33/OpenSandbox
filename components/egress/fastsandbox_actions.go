@@ -34,12 +34,10 @@
 //	                   rejected, never silently ignored.
 //	REMOVE_BINDING     terminal cleanup; a fence mismatch (stale removal for
 //	                   a previous instance of the same UID) is ignored.
-//	VAULT_EXPORT       copy the subject's vault file into the snapshot bundle
-//	                   and seal it (vault ops 409) — pause flow, invoked
-//	                   strictly before the runtime teardown.
-//	VAULT_IMPORT       land the bundle file re-stamped with the restored
-//	                   fence — resume flow, invoked before data-plane-ready.
-//	                   The only authorized incarnation transfer.
+//	VAULT_EXPORT       copy the vault file into the snapshot bundle and seal
+//	                   the subject — pause flow, before teardown.
+//	VAULT_IMPORT       land the bundle re-stamped with the restored fence —
+//	                   resume flow, before data-plane-ready.
 //
 // Fail-closed invariants: the subject is deny-first from registration until
 // its data-plane-ready Hook succeeds, so policy delivery can be late but

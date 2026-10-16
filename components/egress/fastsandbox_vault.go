@@ -282,9 +282,8 @@ func (s *fastSandboxPolicyServer) selectRelayVault(r *http.Request, subj subject
 	return s.vaultForLocked(subj, fence), 0, ""
 }
 
-// vaultSealedLocked reports whether the subject's vault is sealed (paused).
-// It never materializes an entry: sealing exists only where export put it.
-// Callers hold s.mu.
+// vaultSealedLocked reports whether the subject's vault is sealed (paused);
+// it never materializes an entry. Callers hold s.mu.
 func (s *fastSandboxPolicyServer) vaultSealedLocked(subj subject.Subject) bool {
 	e, ok := s.vaults[subj]
 	return ok && e.sealed

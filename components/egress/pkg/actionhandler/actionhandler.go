@@ -50,11 +50,10 @@ const (
 	OperationSetBinding    Operation = "SET_BINDING"
 	OperationLifecycleHook Operation = "LIFECYCLE_HOOK"
 	OperationRemoveBinding Operation = "REMOVE_BINDING"
-	// VaultExport/Import carry the per-subject vault file across pause/resume
-	// (OSEP-0022 "Vault Lifecycle"): export copies it into the snapshot bundle
-	// strictly before the runtime teardown, import lands the re-stamped bundle
-	// file before data-plane-ready at restore — the only authorized
-	// incarnation transfer. Driver-invoked via the Fastlet.
+	// VaultExport/Import carry the subject's vault file across pause/resume
+	// (OSEP-0022): export into the snapshot bundle before teardown, import
+	// re-stamped before data-plane-ready — the only authorized incarnation
+	// transfer.
 	OperationVaultExport Operation = "VAULT_EXPORT"
 	OperationVaultImport Operation = "VAULT_IMPORT"
 )
@@ -110,17 +109,14 @@ type Hook struct {
 }
 
 // SnapshotTransfer names the driver-provided staging file for one subject's
-// vault snapshot (OSEP-0022 "Vault Lifecycle"): the export target inside the
-// snapshot bundle, or the bundle source at restore. One file per invocation;
-// the path is Pod-local and validated (absolute, no parent traversal).
+// vault snapshot: the export target, or the bundle source at restore.
 type SnapshotTransfer struct {
 	Path string `json:"path"`
 }
 
-// validatePath enforces the Pod-local absolute-path contract at parse time:
-// permanently invalid input must fail closed before any handler runs. The
-// raw path segments are checked before any normalization — the same contract
-// the atomic file machinery enforces on every real store it constructs.
+// validatePath enforces the Pod-local absolute-path contract at parse time,
+// checking raw segments before normalization — the same contract the atomic
+// file machinery enforces.
 func (t *SnapshotTransfer) validatePath() error {
 	path := strings.TrimSpace(t.Path)
 	if !filepath.IsAbs(path) {

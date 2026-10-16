@@ -12,26 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Vault snapshot transfer across pause/resume (OSEP-0022 "Vault Lifecycle"):
-// the driver invokes VAULT_EXPORT inside the pause flow — strictly before the
-// runtime teardown, because REMOVE_BINDING purges the local file — and
-// VAULT_IMPORT at restore, before data-plane-ready, possibly on a different
-// Pod. Export copies vault/<sandboxUid>.json into the bundle and seals the
-// subject (vault ops 409; policy enforcement unchanged); the copy runs
-// WITHOUT the server lock (a slow or stuck driver-owned target must never
-// block the shared data plane) and is sealed only after re-checking under
-// the lock that the source is still exactly the copied image — a concurrent
-// relay write abandons the seal, and the recovery latch (uncertain on-disk
-// state) rejects the export outright so uncertain bytes can never become the
-// only surviving copy. Import validates the bundle file (format v: 1,
-// size-capped), re-stamps it with the restored runtime fence — the only
-// authorized incarnation transfer — and lands it through the same commit
-// protocol as the relay writes, so an interrupted import cannot half-land;
-// a local revision newer than the bundle means relay writes landed after the
-// first import, so the retry acks idempotently instead of rolling back. The
-// vault activates at the same data-plane-ready barrier as policy. The
-// invocation side (driver/Fastlet hooks, snapshot-manifest entry) is platform
-// work: until it lands this slice is exercised by unit tests.
+// Vault snapshot transfer across pause/resume (OSEP-0022 "Vault Lifecycle").
+// VAULT_EXPORT copies the subject's vault file into the snapshot bundle
+// strictly before the runtime teardown and seals the subject; VAULT_IMPORT
+// lands the bundle file re-stamped with the restored fence — the only
+// authorized incarnation transfer — through the same commit protocol as the
+// relay writes. The invocation side (driver/Fastlet hooks, snapshot manifest)
+// is platform work: until it lands this slice is unit-test only.
 package main
 
 import (
@@ -52,21 +39,15 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/subject"
 )
 
-// maxVaultSnapshotBytes bounds a bundle file read: a vault file is a
-// relay-body-sized artifact, so anything over the actions body limit is not
-// a v1 vault file. The cap keeps a huge or growing driver-provided source
-// from being pulled into memory unbounded.
+// maxVaultSnapshotBytes bounds a bundle read: a vault file is a
+// relay-body-sized artifact, anything over this is not a v1 vault file.
 const maxVaultSnapshotBytes = maxPolicyBodyBytes
 
-// errVaultSnapshotTooLarge marks a bundle over maxVaultSnapshotBytes —
-// permanently invalid for this protocol version.
 var errVaultSnapshotTooLarge = fmt.Errorf("vault bundle file exceeds %d bytes", maxVaultSnapshotBytes)
 
-// reservesPath reports whether path falls inside the vault persistence
-// directory (or is the directory itself). That subtree is reserved for the
-// per-subject vault files: driver-provided snapshot paths must never land
-// there, or an export target could clobber another subject's vault file and
-// an import source could read one subject's vault into another's.
+// reservesPath reports whether a driver-provided snapshot path resolves
+// inside the vault persistence directory — reserved for per-subject vault
+// files (an export target there could clobber another subject's vault).
 func (p *vaultPersistence) reservesPath(path string) bool {
 	rel, err := filepath.Rel(filepath.Clean(p.dir), filepath.Clean(path))
 	if err != nil {
@@ -76,25 +57,19 @@ func (p *vaultPersistence) reservesPath(path string) bool {
 	return !strings.HasPrefix(rel, "..")
 }
 
-// applyVaultExport copies the subject's vault file into the bundle target
-// provided by the driver and marks the subject sealed. A successful export of
-// a subject without a vault file just seals (nothing to carry). Any failure —
-// unreadable source, unwritable target, source changed mid-copy — leaves the
-// subject unsealed and active (the pause proceeds without the vault; the
-// driver surfaces it, and a missing bundle file fails closed at restore).
-// Repeated export (a retry after a lost ack) re-copies and re-seals: while
-// sealed no vault op can change the source, so the copy stays current.
+// applyVaultExport copies the subject's vault file into the bundle target and
+// marks the subject sealed. A subject without a vault file just seals. Any
+// failure leaves the subject unsealed and active — the pause proceeds without
+// the vault; a retried export re-copies idempotently (while sealed no vault
+// op can change the source).
 //
-// The copy runs in three phases. Phase 1 takes the guards and a consistent
-// image of the source under s.mu; phase 2 writes the driver-owned target
-// WITHOUT the lock (it may be slow or stuck — every action, vault op, and
-// active-vault resolution goes through s.mu); phase 3 re-checks under the
-// lock and seals only if the source is still exactly the copied image. A
-// relay write that lands in between makes the copy stale: 409, unsealed, the
-// driver retries against the newer state. The recovery latch rejects the
-// export in both guarded phases — with on-disk state unconfirmed, the bundle
-// copy plus the teardown purge could otherwise make uncertain bytes the only
-// surviving vault content, invisibly.
+// Three phases: guards + a consistent source image under s.mu, the
+// driver-owned copy without the lock (it may be slow; every action and vault
+// op goes through s.mu), then a re-check under the lock — sealed only if the
+// source is still the exact copied image, else 409. The recovery latch
+// rejects the export in both guarded phases: with on-disk state unconfirmed,
+// the copy plus the teardown purge would make uncertain bytes the only
+// surviving vault content.
 func (s *fastSandboxPolicyServer) applyVaultExport(env *actionhandler.Envelope) (int, error) {
 	if s.vaultFiles == nil {
 		return http.StatusInternalServerError, errors.New("vault export requires vault persistence (OPENSANDBOX_EGRESS_VAULT_DIR)")
@@ -174,23 +149,18 @@ func (s *fastSandboxPolicyServer) exportSourceImageLocked(subj subject.Subject, 
 }
 
 // applyVaultImport lands the bundle file as the subject's vault file,
-// re-stamped with the restored runtime fence from the envelope. Restore may
-// land on any Pod, so unlike every other path the recorded incarnation here
-// is replaced, not compared. The file goes through the commit protocol
-// (persist → apply → ack), so the ack means durable AND applied; the vault
-// activates at the same data-plane-ready barrier as policy.
+// re-stamped with the restored fence from the envelope (restore may land on
+// any Pod, so the recorded incarnation is replaced, not compared). The file
+// goes through the commit protocol; the vault activates at the same
+// data-plane-ready barrier as policy.
 //
-// Delivery is at-least-once: before any durable effect the local vault file
-// is compared under the lock, and a local revision newer than the bundle acks
-// idempotently — relay writes that landed after the first import (or an
-// out-of-order import) must never be rolled back. When the subject is not
-// (yet) registered — import before SET_BINDING — the guard runs against the
-// file alone; the registration-time reload installs and validates the memory
-// slice against the real binding policy. When the subject is already
-// registered under the envelope fence (import after SET_BINDING, before
-// data-plane-ready), the content is additionally validated against the
-// current validation policy on a scratch store before anything durable
-// happens, and a rejected bundle answers 400 with last-good kept.
+// The bundle is read and decoded before the lock. Delivery is at-least-once:
+// a local revision newer than the bundle acks idempotently — relay writes
+// after the first import are never rolled back. Unregistered (before
+// SET_BINDING), only the file lands and the registration-time reload
+// validates it; registered under the envelope fence, the content is
+// validated on a scratch store before anything durable happens, and a
+// rejected bundle is a 400 with last-good kept.
 func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) (int, error) {
 	if s.vaultFiles == nil {
 		return http.StatusInternalServerError, errors.New("vault import requires vault persistence (OPENSANDBOX_EGRESS_VAULT_DIR)")
@@ -202,9 +172,8 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 		return http.StatusBadRequest, fmt.Errorf("vault bundle source %q must not live under the vault persistence directory", source)
 	}
 
-	// Read + validate the bundle before locking (a stalled or huge source
-	// must never hold s.mu). A missing, oversized, or unreadable source is
-	// permanent: the fastlet retry cannot repair it.
+	// Read before locking; a missing/oversized/unreadable source is
+	// permanent — the fastlet retry cannot repair it.
 	data, err := readVaultBundle(source)
 	if errors.Is(err, fs.ErrNotExist) {
 		return http.StatusNotFound, fmt.Errorf("vault bundle file %q does not exist", source)
@@ -219,7 +188,7 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("invalid vault bundle file: %v", err)
 	}
-	// The authorized incarnation transfer: re-stamp the full runtime fence.
+	// The authorized incarnation transfer.
 	payload, err := credentialvault.EncodeVaultFile(fence.RuntimeInstanceID, fence.AttachmentID, vf.Revision, body)
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("vault bundle re-stamp failed: %w", err)
@@ -227,13 +196,12 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// The recovery latch freezes every vault file mutation, import included:
-	// only a restart reconciles the committed files (relay-write parity).
+	// The latch freezes every vault file mutation; only a restart
+	// reconciles (relay-write parity).
 	if recovery := s.vaultRecovery.Load(); recovery != nil {
 		return http.StatusServiceUnavailable, fmt.Errorf("vault persistence recovery required: %s", recovery.reason)
 	}
-	// At-least-once delivery guard (see above): never roll a newer local
-	// revision back to the bundle.
+	// At-least-once delivery: never roll a newer local revision back.
 	if fs, fsErr := s.vaultFiles.storeFor(subj); fsErr == nil {
 		if cur, snapErr := fs.Snapshot(); snapErr == nil && cur.Exists() {
 			if curVF, _, decErr := credentialvault.DecodeVaultFile(cur.Data()); decErr == nil && curVF.Revision > vf.Revision {
@@ -247,10 +215,8 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 		if !regFence.Matches(fence) {
 			return http.StatusConflict, fmt.Errorf("stale vault import (fence mismatch) for subject %s", subj)
 		}
-		// Validate before any durable effect: a bundle the current validation
-		// policy rejects — including "bindings require an egress policy" for
-		// a policy-less subject — is permanently broken. NACK with last-good
-		// kept, never half-open.
+		// Validate before any durable effect — a permanently broken bundle
+		// is a 400 with last-good kept, never half-open.
 		if err := validateImportedVault(vf, body, s.vaultValidationPolicyLocked(subj)); err != nil {
 			return http.StatusBadRequest, fmt.Errorf("vault bundle rejected: %v", err)
 		}
@@ -262,8 +228,7 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 		},
 		func() error {
 			if !registered {
-				// Import before SET_BINDING: the registration-time reload
-				// (rehydrateVaultReload) installs and validates the slice.
+				// Before SET_BINDING: registration reloads and validates.
 				return nil
 			}
 			return s.installImportedVaultLocked(subj, fence, vf, body)
@@ -289,9 +254,8 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 
 // installImportedVaultLocked binds the imported revision into the live
 // per-subject slice under the restored fence, replacing any stale entry.
-// Callers hold s.mu. The slice is only replaced once Reload has accepted the
-// content — a failure here leaves the live entry untouched, and the commit
-// protocol rolls the file back (last-good kept on both sides).
+// The slice is only replaced once Reload accepts — a failure leaves the live
+// entry untouched while the commit protocol rolls the file back.
 func (s *fastSandboxPolicyServer) installImportedVaultLocked(subj subject.Subject, fence subject.Fencing, vf credentialvault.VaultFile, body credentialvault.VaultFileBody) error {
 	pol := s.vaultValidationPolicyLocked(subj)
 	entry, ok := s.vaults[subj]
@@ -306,19 +270,16 @@ func (s *fastSandboxPolicyServer) installImportedVaultLocked(subj subject.Subjec
 	return nil
 }
 
-// validateImportedVault runs the full validation pipeline for the imported
-// revision on a scratch store — the exact Reload the live install will run,
-// so a bundle accepted here cannot fail the apply.
+// validateImportedVault runs the imported revision through the exact Reload
+// the live install will use, on a scratch store.
 func validateImportedVault(vf credentialvault.VaultFile, body credentialvault.VaultFileBody, pol *policy.NetworkPolicy) error {
 	scratch := credentialvault.NewStore(nil, func() bool { return true })
 	return scratch.Reload(vf.Revision, credentialvault.CreateRequest(body), pol)
 }
 
-// readVaultBundle reads the driver-provided bundle source with a hard size
-// cap. The source lives in the driver's staging area (a read-only lookup in
-// the same trust domain — the write paths keep the hardened atomic
-// machinery), so plain bounded I/O is sufficient here; what matters is that
-// a huge or growing file can never be pulled into memory unbounded.
+// readVaultBundle reads the driver-staged bundle source with a hard size
+// cap — a read-only lookup in the driver's trust domain, so plain bounded
+// I/O suffices (writes keep the hardened atomic machinery).
 func readVaultBundle(path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
