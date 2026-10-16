@@ -17,19 +17,32 @@
 // runtime teardown, because REMOVE_BINDING purges the local file — and
 // VAULT_IMPORT at restore, before data-plane-ready, possibly on a different
 // Pod. Export copies vault/<sandboxUid>.json into the bundle and seals the
-// subject (vault ops 409; policy enforcement unchanged). Import validates the
-// bundle file (format v: 1), re-stamps it with the restored runtime fence —
-// the only authorized incarnation transfer — and lands it through the same
-// commit protocol as the relay writes, so an interrupted import cannot
-// half-land; the vault activates at the same data-plane-ready barrier as
-// policy. The invocation side (driver/Fastlet hooks, snapshot-manifest entry)
-// is platform work: until it lands this slice is exercised by unit tests.
+// subject (vault ops 409; policy enforcement unchanged); the copy runs
+// WITHOUT the server lock (a slow or stuck driver-owned target must never
+// block the shared data plane) and is sealed only after re-checking under
+// the lock that the source is still exactly the copied image — a concurrent
+// relay write abandons the seal, and the recovery latch (uncertain on-disk
+// state) rejects the export outright so uncertain bytes can never become the
+// only surviving copy. Import validates the bundle file (format v: 1,
+// size-capped), re-stamps it with the restored runtime fence — the only
+// authorized incarnation transfer — and lands it through the same commit
+// protocol as the relay writes, so an interrupted import cannot half-land;
+// a local revision newer than the bundle means relay writes landed after the
+// first import, so the retry acks idempotently instead of rolling back. The
+// vault activates at the same data-plane-ready barrier as policy. The
+// invocation side (driver/Fastlet hooks, snapshot-manifest entry) is platform
+// work: until it lands this slice is exercised by unit tests.
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/alibaba/opensandbox/egress/pkg/actionhandler"
@@ -39,14 +52,49 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/subject"
 )
 
+// maxVaultSnapshotBytes bounds a bundle file read: a vault file is a
+// relay-body-sized artifact, so anything over the actions body limit is not
+// a v1 vault file. The cap keeps a huge or growing driver-provided source
+// from being pulled into memory unbounded.
+const maxVaultSnapshotBytes = maxPolicyBodyBytes
+
+// errVaultSnapshotTooLarge marks a bundle over maxVaultSnapshotBytes —
+// permanently invalid for this protocol version.
+var errVaultSnapshotTooLarge = fmt.Errorf("vault bundle file exceeds %d bytes", maxVaultSnapshotBytes)
+
+// reservesPath reports whether path falls inside the vault persistence
+// directory (or is the directory itself). That subtree is reserved for the
+// per-subject vault files: driver-provided snapshot paths must never land
+// there, or an export target could clobber another subject's vault file and
+// an import source could read one subject's vault into another's.
+func (p *vaultPersistence) reservesPath(path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(p.dir), filepath.Clean(path))
+	if err != nil {
+		// Uncomparable — fail closed.
+		return true
+	}
+	return !strings.HasPrefix(rel, "..")
+}
+
 // applyVaultExport copies the subject's vault file into the bundle target
 // provided by the driver and marks the subject sealed. A successful export of
 // a subject without a vault file just seals (nothing to carry). Any failure —
-// unreadable source, unwritable target — leaves the subject unsealed and
-// active (the pause proceeds without the vault; the driver surfaces it, and a
-// missing bundle file fails closed at restore). Repeated export (a retry
-// after a lost ack) re-copies and re-seals: while sealed no vault op can
-// change the source, so the copy stays current.
+// unreadable source, unwritable target, source changed mid-copy — leaves the
+// subject unsealed and active (the pause proceeds without the vault; the
+// driver surfaces it, and a missing bundle file fails closed at restore).
+// Repeated export (a retry after a lost ack) re-copies and re-seals: while
+// sealed no vault op can change the source, so the copy stays current.
+//
+// The copy runs in three phases. Phase 1 takes the guards and a consistent
+// image of the source under s.mu; phase 2 writes the driver-owned target
+// WITHOUT the lock (it may be slow or stuck — every action, vault op, and
+// active-vault resolution goes through s.mu); phase 3 re-checks under the
+// lock and seals only if the source is still exactly the copied image. A
+// relay write that lands in between makes the copy stale: 409, unsealed, the
+// driver retries against the newer state. The recovery latch rejects the
+// export in both guarded phases — with on-disk state unconfirmed, the bundle
+// copy plus the teardown purge could otherwise make uncertain bytes the only
+// surviving vault content, invisibly.
 func (s *fastSandboxPolicyServer) applyVaultExport(env *actionhandler.Envelope) (int, error) {
 	if s.vaultFiles == nil {
 		return http.StatusInternalServerError, errors.New("vault export requires vault persistence (OPENSANDBOX_EGRESS_VAULT_DIR)")
@@ -54,30 +102,20 @@ func (s *fastSandboxPolicyServer) applyVaultExport(env *actionhandler.Envelope) 
 	subj := subject.FromSandboxUID(env.Sandbox.UID)
 	fence := subject.FromRevision(env)
 	target := strings.TrimSpace(env.Snapshot.Path)
+	if s.vaultFiles.reservesPath(target) {
+		return http.StatusBadRequest, fmt.Errorf("vault bundle target %q must not live under the vault persistence directory", target)
+	}
 
+	// Phase 1: guards + consistent source image.
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	regFence, ok := s.reg.Fence(subj)
-	if !ok {
-		return http.StatusNotFound, fmt.Errorf("vault export for unknown subject %s", subj)
-	}
-	if !regFence.Matches(fence) {
-		return http.StatusConflict, fmt.Errorf("stale vault export (fence mismatch) for subject %s", subj)
-	}
-	// A registered subject always has a slice here: export must find (or
-	// create) the entry it seals. A stale entry left under a different fence
-	// is replaced by vaultForLocked — the seal never lands on a predecessor
-	// slice.
-	s.vaultForLocked(subj, regFence)
-	e := s.vaults[subj]
-	fs, err := s.vaultFiles.storeFor(subj)
+	snap, status, err := s.exportSourceImageLocked(subj, fence)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("vault file store unavailable: %w", err)
+		s.mu.Unlock()
+		return status, err
 	}
-	snap, err := fs.Snapshot()
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("vault file snapshot: %w", err)
-	}
+	s.mu.Unlock()
+
+	// Phase 2: no lock held across the driver-owned write.
 	if snap.Exists() {
 		bundle, err := s.vaultFiles.newFile(target)
 		if err != nil {
@@ -88,6 +126,19 @@ func (s *fastSandboxPolicyServer) applyVaultExport(env *actionhandler.Envelope) 
 			return http.StatusInternalServerError, fmt.Errorf("vault bundle copy failed (state %v): %v", state, err)
 		}
 	}
+
+	// Phase 3: seal only against the exact copied image.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live, status, err := s.exportSourceImageLocked(subj, fence)
+	if err != nil {
+		return status, err
+	}
+	if live.Exists() != snap.Exists() || (snap.Exists() && !bytes.Equal(live.Data(), snap.Data())) {
+		return http.StatusConflict, fmt.Errorf("vault file changed during export for subject %s; bundle copy not sealed", subj)
+	}
+	s.vaultForLocked(subj, fence)
+	e := s.vaults[subj]
 	e.sealed = true
 	s.vaults[subj] = e
 	if snap.Exists() {
@@ -98,6 +149,30 @@ func (s *fastSandboxPolicyServer) applyVaultExport(env *actionhandler.Envelope) 
 	return http.StatusOK, nil
 }
 
+// exportSourceImageLocked runs the export guards and returns a consistent
+// image of the subject's vault file. Callers hold s.mu.
+func (s *fastSandboxPolicyServer) exportSourceImageLocked(subj subject.Subject, fence subject.Fencing) (*policy.PolicyFileSnapshot, int, error) {
+	regFence, ok := s.reg.Fence(subj)
+	if !ok {
+		return nil, http.StatusNotFound, fmt.Errorf("vault export for unknown subject %s", subj)
+	}
+	if !regFence.Matches(fence) {
+		return nil, http.StatusConflict, fmt.Errorf("stale vault export (fence mismatch) for subject %s", subj)
+	}
+	if recovery := s.vaultRecovery.Load(); recovery != nil {
+		return nil, http.StatusServiceUnavailable, fmt.Errorf("vault persistence recovery required: %s", recovery.reason)
+	}
+	fs, err := s.vaultFiles.storeFor(subj)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("vault file store unavailable: %w", err)
+	}
+	snap, err := fs.Snapshot()
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("vault file snapshot: %w", err)
+	}
+	return snap, 0, nil
+}
+
 // applyVaultImport lands the bundle file as the subject's vault file,
 // re-stamped with the restored runtime fence from the envelope. Restore may
 // land on any Pod, so unlike every other path the recorded incarnation here
@@ -105,17 +180,17 @@ func (s *fastSandboxPolicyServer) applyVaultExport(env *actionhandler.Envelope) 
 // (persist → apply → ack), so the ack means durable AND applied; the vault
 // activates at the same data-plane-ready barrier as policy.
 //
-// Ordering: the bundle is read and decoded before the server lock (a stalled
-// or huge source must never hold s.mu), then the landing holds s.mu for the
-// whole transaction like every other vault writer.
-//
-// When the subject is not (yet) registered — import before SET_BINDING — only
-// the file lands; the registration-time reload installs and validates the
-// memory slice against the real binding policy. When the subject is already
+// Delivery is at-least-once: before any durable effect the local vault file
+// is compared under the lock, and a local revision newer than the bundle acks
+// idempotently — relay writes that landed after the first import (or an
+// out-of-order import) must never be rolled back. When the subject is not
+// (yet) registered — import before SET_BINDING — the guard runs against the
+// file alone; the registration-time reload installs and validates the memory
+// slice against the real binding policy. When the subject is already
 // registered under the envelope fence (import after SET_BINDING, before
-// data-plane-ready), the content is validated against the current validation
-// policy on a scratch store before any durable effect, and a rejected bundle
-// answers 400 with last-good kept on both sides.
+// data-plane-ready), the content is additionally validated against the
+// current validation policy on a scratch store before anything durable
+// happens, and a rejected bundle answers 400 with last-good kept.
 func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) (int, error) {
 	if s.vaultFiles == nil {
 		return http.StatusInternalServerError, errors.New("vault import requires vault persistence (OPENSANDBOX_EGRESS_VAULT_DIR)")
@@ -123,21 +198,24 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 	subj := subject.FromSandboxUID(env.Sandbox.UID)
 	fence := subject.FromRevision(env)
 	source := strings.TrimSpace(env.Snapshot.Path)
-
-	// Read + validate the bundle before locking (see above). A missing or
-	// unreadable source is permanent: the fastlet retry cannot repair it.
-	bundle, err := s.vaultFiles.newFile(source)
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("vault bundle source unavailable: %w", err)
+	if s.vaultFiles.reservesPath(source) {
+		return http.StatusBadRequest, fmt.Errorf("vault bundle source %q must not live under the vault persistence directory", source)
 	}
-	snap, err := bundle.Snapshot()
+
+	// Read + validate the bundle before locking (a stalled or huge source
+	// must never hold s.mu). A missing, oversized, or unreadable source is
+	// permanent: the fastlet retry cannot repair it.
+	data, err := readVaultBundle(source)
+	if errors.Is(err, fs.ErrNotExist) {
+		return http.StatusNotFound, fmt.Errorf("vault bundle file %q does not exist", source)
+	}
+	if errors.Is(err, errVaultSnapshotTooLarge) {
+		return http.StatusBadRequest, err
+	}
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("vault bundle read failed: %w", err)
 	}
-	if !snap.Exists() {
-		return http.StatusNotFound, fmt.Errorf("vault bundle file %q does not exist", source)
-	}
-	vf, body, err := credentialvault.DecodeVaultFile(snap.Data())
+	vf, body, err := credentialvault.DecodeVaultFile(data)
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("invalid vault bundle file: %v", err)
 	}
@@ -153,6 +231,16 @@ func (s *fastSandboxPolicyServer) applyVaultImport(env *actionhandler.Envelope) 
 	// only a restart reconciles the committed files (relay-write parity).
 	if recovery := s.vaultRecovery.Load(); recovery != nil {
 		return http.StatusServiceUnavailable, fmt.Errorf("vault persistence recovery required: %s", recovery.reason)
+	}
+	// At-least-once delivery guard (see above): never roll a newer local
+	// revision back to the bundle.
+	if fs, fsErr := s.vaultFiles.storeFor(subj); fsErr == nil {
+		if cur, snapErr := fs.Snapshot(); snapErr == nil && cur.Exists() {
+			if curVF, _, decErr := credentialvault.DecodeVaultFile(cur.Data()); decErr == nil && curVF.Revision > vf.Revision {
+				log.Infof("subject %s: vault import superseded (local revision %d > bundle revision %d), idempotent ack", subj, curVF.Revision, vf.Revision)
+				return http.StatusOK, nil
+			}
+		}
 	}
 	regFence, registered := s.reg.Fence(subj)
 	if registered {
@@ -224,4 +312,25 @@ func (s *fastSandboxPolicyServer) installImportedVaultLocked(subj subject.Subjec
 func validateImportedVault(vf credentialvault.VaultFile, body credentialvault.VaultFileBody, pol *policy.NetworkPolicy) error {
 	scratch := credentialvault.NewStore(nil, func() bool { return true })
 	return scratch.Reload(vf.Revision, credentialvault.CreateRequest(body), pol)
+}
+
+// readVaultBundle reads the driver-provided bundle source with a hard size
+// cap. The source lives in the driver's staging area (a read-only lookup in
+// the same trust domain — the write paths keep the hardened atomic
+// machinery), so plain bounded I/O is sufficient here; what matters is that
+// a huge or growing file can never be pulled into memory unbounded.
+func readVaultBundle(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxVaultSnapshotBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxVaultSnapshotBytes {
+		return nil, errVaultSnapshotTooLarge
+	}
+	return data, nil
 }

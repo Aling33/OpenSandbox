@@ -51,10 +51,14 @@ type fakeVaultFile struct {
 
 	snapErr error
 
-	saveState   policy.FileMutationState
-	saveErr     error
-	saveCalls   int
-	lastSaved   []byte
+	saveState policy.FileMutationState
+	saveErr   error
+	saveCalls int
+	lastSaved []byte
+	// onSave fires when SaveRaw starts — the seam for simulating a
+	// concurrent mutation of ANOTHER file while this (slow) write is in
+	// flight, e.g. a relay write landing during a snapshot bundle copy.
+	onSave      func()
 	deleteState policy.FileMutationState
 	deleteErr   error
 	// failFirstDelete injects exactly one failed (uncertain) Delete — the
@@ -90,6 +94,9 @@ func (f *fakeVaultFile) saveCallsSnapshotGuard() {}
 func (f *fakeVaultFile) SaveRaw(data []byte) (policy.FileMutationState, error) {
 	f.saveCalls++
 	f.lastSaved = append([]byte(nil), data...)
+	if f.onSave != nil {
+		f.onSave()
+	}
 	if f.saveErr != nil {
 		return f.saveState, f.saveErr
 	}

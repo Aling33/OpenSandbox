@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -87,15 +88,16 @@ func bundleVaultBody(t *testing.T) credentialvault.VaultFileBody {
 	return credentialvault.VaultFileBody{Credentials: req.Credentials, Bindings: req.Bindings}
 }
 
-// seedBundle writes simulated committed bundle bytes carrying the OLD runtime
-// fence — what an export on the previous Pod left behind.
+// seedBundle writes a real bundle file carrying the OLD runtime fence — what
+// an export on the previous Pod left behind in the driver's staging area.
+// Import reads the source with plain bounded I/O (no injected seam), so the
+// fixture is a real file.
 func (h *vaultPersistHarness) seedBundle(t *testing.T, path string) []byte {
 	t.Helper()
 	raw, err := credentialvault.EncodeVaultFile(testFenceR, testFenceA, bundleTestOldRev, bundleVaultBody(t))
 	require.NoError(t, err)
-	f := h.fakeForPath(path)
-	f.data = raw
-	f.exists = true
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	require.NoError(t, os.WriteFile(path, raw, 0o600))
 	return raw
 }
 
@@ -205,6 +207,58 @@ func TestVaultSnapshotExportGuards(t *testing.T) {
 		assert.Equal(t, http.StatusConflict, rec.Code)
 		assert.False(t, h.srv.vaultSealedLocked(subject.FromSandboxUID(snapshotTestUID)))
 	})
+	t.Run("recovery latch rejects the export", func(t *testing.T) {
+		// With on-disk state unconfirmed, the bundle copy plus the teardown
+		// purge could make uncertain bytes the only surviving vault content.
+		h := newVaultPersistHarness(t)
+		h.snapshotSubject(t)
+		h.srv.requireVaultRecoveryLocked("simulated latch")
+		bundlePath := filepath.Join(t.TempDir(), "bundle", snapshotTestUID+".json")
+
+		rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, testFenceR, testFenceA, "VAULT_EXPORT", bundlePath))
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		assert.False(t, h.srv.vaultSealedLocked(subject.FromSandboxUID(snapshotTestUID)))
+		assert.False(t, h.fakeForPath(bundlePath).exists, "no bundle copy while the latch holds")
+	})
+	t.Run("target under the vault persistence directory", func(t *testing.T) {
+		h := newVaultPersistHarness(t)
+		h.snapshotSubject(t)
+		// A driver-provided target that would clobber ANOTHER subject's
+		// vault file.
+		inside := filepath.Join(h.dir, "other.json")
+
+		rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, testFenceR, testFenceA, "VAULT_EXPORT", inside))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.False(t, h.srv.vaultSealedLocked(subject.FromSandboxUID(snapshotTestUID)))
+		// No store may be materialized for the rejected target
+		// (fakeForPath would create one, so scan the map directly).
+		h.mapMu.Lock()
+		_, materialized := h.files[inside]
+		h.mapMu.Unlock()
+		assert.False(t, materialized, "no store materialized for the rejected target")
+	})
+	t.Run("concurrent vault write abandons the seal", func(t *testing.T) {
+		h := newVaultPersistHarness(t)
+		h.snapshotSubject(t)
+		bundlePath := filepath.Join(t.TempDir(), "bundle", snapshotTestUID+".json")
+		copied := h.fileFor(snapshotTestUID).data
+
+		// A relay write lands while the (slow, unlocked) bundle copy is in
+		// flight: the copy is stale, so phase 3 must refuse to seal.
+		newer, err := credentialvault.EncodeVaultFile(testFenceR, testFenceA, 2, credentialvault.VaultFileBody{})
+		require.NoError(t, err)
+		bundle := h.fakeForPath(bundlePath)
+		bundle.onSave = func() {
+			f := h.fileFor(snapshotTestUID)
+			f.data = newer
+			f.exists = true
+		}
+
+		rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, testFenceR, testFenceA, "VAULT_EXPORT", bundlePath))
+		assert.Equal(t, http.StatusConflict, rec.Code)
+		assert.False(t, h.srv.vaultSealedLocked(subject.FromSandboxUID(snapshotTestUID)))
+		assert.Equal(t, copied, bundle.data, "the stale copy exists but is not sealed — the driver retries against the newer state")
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +284,9 @@ func TestVaultSnapshotImportLandsFileBeforeRegistration(t *testing.T) {
 	assert.Equal(t, int64(bundleTestOldRev), vf.Revision)
 	require.Len(t, body.Credentials, 1)
 	require.Len(t, body.Bindings, 1)
-	assert.Equal(t, oldBytes, h.fakeForPath(bundlePath).data, "the bundle source is read, never consumed")
+	carried, err := os.ReadFile(bundlePath)
+	require.NoError(t, err)
+	assert.Equal(t, oldBytes, carried, "the bundle source is read, never consumed")
 
 	// No memory slice before registration (the reload happens at
 	// SET_BINDING, fenced by the same identity).
@@ -297,18 +353,30 @@ func TestVaultSnapshotImportRejects(t *testing.T) {
 	})
 	t.Run("corrupt bundle", func(t *testing.T) {
 		h, bundlePath := newHarness(t)
-		f := h.fakeForPath(bundlePath)
-		f.data = []byte(`{"v":1,`)
-		f.exists = true
+		require.NoError(t, os.MkdirAll(filepath.Dir(bundlePath), 0o700))
+		require.NoError(t, os.WriteFile(bundlePath, []byte(`{"v":1,`), 0o600))
 		rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, snapshotResumeR, snapshotResumeA, "VAULT_IMPORT", bundlePath))
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 	t.Run("newer file version", func(t *testing.T) {
 		h, bundlePath := newHarness(t)
-		f := h.fakeForPath(bundlePath)
-		f.data = []byte(`{"v":99,"incarnation":"old","attachmentId":"old","revision":1,"vault":{"credentials":[],"bindings":[]}}` + "\n")
-		f.exists = true
+		require.NoError(t, os.MkdirAll(filepath.Dir(bundlePath), 0o700))
+		require.NoError(t, os.WriteFile(bundlePath,
+			[]byte(`{"v":99,"incarnation":"old","attachmentId":"old","revision":1,"vault":{"credentials":[],"bindings":[]}}`+"\n"), 0o600))
 		rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, snapshotResumeR, snapshotResumeA, "VAULT_IMPORT", bundlePath))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+	t.Run("oversized bundle", func(t *testing.T) {
+		h, bundlePath := newHarness(t)
+		require.NoError(t, os.MkdirAll(filepath.Dir(bundlePath), 0o700))
+		require.NoError(t, os.WriteFile(bundlePath, make([]byte, maxVaultSnapshotBytes+1), 0o600))
+		rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, snapshotResumeR, snapshotResumeA, "VAULT_IMPORT", bundlePath))
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+	t.Run("source under the vault persistence directory", func(t *testing.T) {
+		h, _ := newHarness(t)
+		inside := filepath.Join(h.dir, "staged.json")
+		rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, snapshotResumeR, snapshotResumeA, "VAULT_IMPORT", inside))
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 	})
 	t.Run("stale fence while registered", func(t *testing.T) {
@@ -334,9 +402,8 @@ func TestVaultSnapshotImportRejects(t *testing.T) {
 		}
 		raw, err := credentialvault.EncodeVaultFile(testFenceR, testFenceA, bundleTestOldRev, denied)
 		require.NoError(t, err)
-		f := h.fakeForPath(bundlePath)
-		f.data = raw
-		f.exists = true
+		require.NoError(t, os.MkdirAll(filepath.Dir(bundlePath), 0o700))
+		require.NoError(t, os.WriteFile(bundlePath, raw, 0o600))
 
 		rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, testFenceR, testFenceA, "VAULT_IMPORT", bundlePath))
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -349,6 +416,33 @@ func TestVaultSnapshotImportRejects(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), `"revision":1`)
 		assert.False(t, h.srv.vaultRecoveryActive(), "a pre-rename NACK never latches recovery")
 	})
+}
+
+func TestVaultSnapshotDuplicateImportDoesNotRollBack(t *testing.T) {
+	h := newVaultPersistHarness(t)
+	bundlePath := filepath.Join(t.TempDir(), "bundle", snapshotTestUID+".json")
+	h.seedBundle(t, bundlePath)
+
+	// First import lands revision 3 (registered, denying).
+	rec := doAction(t, h.srv, bindBody(t, snapshotTestUID, snapshotTestIP, snapshotResumeR, snapshotResumeA, 1, vaultAllowPolicy()))
+	require.Equal(t, http.StatusOK, rec.Code)
+	rec = doAction(t, h.srv, snapshotBody(t, snapshotTestUID, snapshotResumeR, snapshotResumeA, "VAULT_IMPORT", bundlePath))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// Relay writes resume: revision 4 lands.
+	rec = doVault(t, h.srv, http.MethodPut, snapshotTestUID, vaultPut(fmt.Sprint(bundleTestOldRev)), "")
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	// A lost-ack retry of the SAME import must not roll the vault back to
+	// revision 3 — the local file is newer, so it acks idempotently.
+	rec = doAction(t, h.srv, snapshotBody(t, snapshotTestUID, snapshotResumeR, snapshotResumeA, "VAULT_IMPORT", bundlePath))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	vf, _ := decodeFile(t, h.fileFor(snapshotTestUID))
+	assert.Equal(t, int64(bundleTestOldRev+1), vf.Revision, "the newer relay write survives the retried import")
+	rec = doVault(t, h.srv, http.MethodGet, snapshotTestUID, "", "")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), fmt.Sprintf(`"revision":%d`, bundleTestOldRev+1))
 }
 
 func TestVaultSnapshotImportCommitProtocolOutcomes(t *testing.T) {
