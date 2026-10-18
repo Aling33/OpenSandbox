@@ -330,6 +330,25 @@ def test_patch_composes_get_merge_put_with_expected_revision(vault_fsb):
     assert merged["bindings"] == []
 
 
+def test_patch_stamps_expected_revision_when_client_omits_it(vault_fsb):
+    """A PATCH without expectedRevision is still fenced: the composed PUT
+    carries the revision just read, so a concurrent replica's commit turns
+    the relay PUT into 412 instead of a silent last-writer-wins overwrite."""
+    client, fake, _ = vault_fsb
+    fake.outcomes = [
+        (200, json.dumps(_FULL_REVISION).encode()),
+        (200, _vault_ack(3)),
+    ]
+    response = client.patch(
+        f"/v1/sandboxes/{_SANDBOX_ID}/credential-vault",
+        json={"credentials": {"add": [{"name": "tok2", "source": {"type": "inline", "value": "s2"}}]}},
+    )
+
+    assert response.status_code == 200, response.text
+    merged = json.loads(fake.payloads[1])
+    assert merged["expectedRevision"] == 2
+
+
 def test_patch_fencing_and_mutation_semantics(vault_fsb):
     client, fake, _ = vault_fsb
     fake.outcome = (200, json.dumps(_FULL_REVISION).encode())

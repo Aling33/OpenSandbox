@@ -523,6 +523,11 @@ class FastSandboxService(SandboxService, ExtensionService):
             raise self._fastpath_http_error(exc) from exc
         finally:
             self._cr_reader.invalidate(namespace)
+            # Evict the per-sandbox vault PATCH lock so the map stays bounded
+            # over the process lifetime (a concurrent PATCH holding the entry
+            # completes against a sandbox being torn down anyway).
+            with self._vault_locks_guard:
+                self._vault_locks.pop(sandbox_id, None)
 
     def pause_sandbox(self, sandbox_id: str) -> None:
         """Persist the pause intent; PAUSING -> PAUSED completes asynchronously."""

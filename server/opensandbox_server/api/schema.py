@@ -236,6 +236,7 @@ class Credential(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CredentialSubstitution(BaseModel):
@@ -252,6 +253,7 @@ class CredentialSubstitution(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CustomHeaderEntry(BaseModel):
@@ -264,6 +266,7 @@ class CustomHeaderEntry(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class BearerCredentialAuth(BaseModel):
@@ -275,6 +278,7 @@ class BearerCredentialAuth(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class BasicCredentialAuth(BaseModel):
@@ -288,6 +292,7 @@ class BasicCredentialAuth(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class ApiKeyCredentialAuth(BaseModel):
@@ -302,6 +307,7 @@ class ApiKeyCredentialAuth(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CustomHeadersCredentialAuth(BaseModel):
@@ -311,6 +317,7 @@ class CustomHeadersCredentialAuth(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class PassthroughCredentialAuth(BaseModel):
@@ -319,6 +326,7 @@ class PassthroughCredentialAuth(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 CredentialAuth = Annotated[
@@ -351,6 +359,7 @@ class CredentialMatch(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CredentialBinding(BaseModel):
@@ -360,6 +369,7 @@ class CredentialBinding(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CredentialVaultCreateRequest(BaseModel):
@@ -370,6 +380,7 @@ class CredentialVaultCreateRequest(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CredentialMutationSet(BaseModel):
@@ -385,6 +396,7 @@ class CredentialMutationSet(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CredentialBindingMutationSet(BaseModel):
@@ -400,6 +412,7 @@ class CredentialBindingMutationSet(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CredentialVaultMutationRequest(BaseModel):
@@ -419,6 +432,7 @@ class CredentialVaultMutationRequest(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CredentialAuthMetadata(BaseModel):

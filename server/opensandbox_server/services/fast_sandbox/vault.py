@@ -130,12 +130,9 @@ def _normalize_ack(body: bytes) -> dict:
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={
-                "code": SandboxErrorCodes.FSB_API_ERROR,
-                "message": "Credential Vault ack was not valid JSON.",
-            },
+        raise vault_relay_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Credential Vault ack was not valid JSON.",
         ) from exc
     return CredentialVaultState.model_validate(payload).model_dump(
         by_alias=True, exclude_none=True
@@ -247,7 +244,10 @@ def merge_mutation(
 
     Existing records round-trip verbatim (values included — the merge runs in
     server memory only); replaced/added records are re-serialized from the
-    validated request shapes.
+    validated request shapes. The composed PUT is always revision-fenced:
+    the client's ``expectedRevision`` when provided, otherwise the revision
+    just read — an unfenced full replace would let two replicas race a
+    GET-merge-PUT and silently drop one side's mutations.
     """
     credentials = _index_records(full.get("credentials"))
     bindings = _index_records(full.get("bindings"))
@@ -277,8 +277,11 @@ def merge_mutation(
             for name in sorted(bindings)
         ],
     }
-    if mutation.expected_revision is not None:
-        body["expectedRevision"] = mutation.expected_revision
+    body["expectedRevision"] = (
+        mutation.expected_revision
+        if mutation.expected_revision is not None
+        else full.get("revision")
+    )
     return body
 
 
@@ -335,12 +338,9 @@ def _relay_get_full(service, sandbox_id: str) -> dict:
     try:
         return json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={
-                "code": SandboxErrorCodes.FSB_API_ERROR,
-                "message": "Credential Vault relay returned an invalid revision.",
-            },
+        raise vault_relay_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Credential Vault relay returned an invalid revision.",
         ) from exc
 
 
