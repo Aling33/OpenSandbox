@@ -252,7 +252,7 @@ internal fun JsonObject.requiredInt(name: String): Int =
         ?: throw IllegalStateException("Credential Vault response missing required integer field: $name")
 
 internal fun JsonObject.requiredArray(name: String): JsonArray =
-    get(name)?.jsonArray
+    get(name)?.takeUnless { it is JsonNull }?.jsonArray
         ?: throw IllegalStateException("Credential Vault response missing required array field: $name")
 
 internal fun JsonObject.optionalObject(name: String): JsonObject? = get(name)?.takeUnless { it is JsonNull }?.jsonObject

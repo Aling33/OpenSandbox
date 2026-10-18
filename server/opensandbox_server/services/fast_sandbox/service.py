@@ -109,6 +109,10 @@ from opensandbox_server.services.validators import (
 
 _SUPPORTED_EVENT_SCOPES = ("runtime", "all")
 
+# Fixed shard count for the per-process vault PATCH locks (bounded memory;
+# see FastSandboxService.__init__).
+_VAULT_LOCK_SHARDS = 64
+
 logger = logging.getLogger(__name__)
 
 
@@ -136,16 +140,18 @@ class FastSandboxService(SandboxService, ExtensionService):
         self._cr_reader = SandboxCRReader(self._k8s, k8s_client)
         self._template_service = template_service
         self._activity_recorder: Optional[ActivityRecorder] = None
-        # Per-sandbox locks serialize the server-side vault PATCH
-        # (relay GET → merge → relay PUT) within this process; the revision
-        # precondition inside the merged PUT is the cross-replica backstop.
-        self._vault_locks: dict[str, Lock] = {}
-        self._vault_locks_guard = Lock()
+        # Fixed-size shard locks serialize the server-side vault PATCH
+        # (relay GET -> merge -> relay PUT) within this process. A fixed map
+        # keeps memory bounded: fsb sandboxes mostly expire through FastPath
+        # instead of going through delete_sandbox, so per-sandbox entries
+        # would leak for the process lifetime. Shard collisions only widen
+        # the serialization scope; the revision precondition inside the
+        # merged PUT stays the cross-replica backstop either way.
+        self._vault_locks = [Lock() for _ in range(_VAULT_LOCK_SHARDS)]
 
     def vault_lock(self, sandbox_id: str) -> Lock:
-        """Return the process-local PATCH lock for one sandbox."""
-        with self._vault_locks_guard:
-            return self._vault_locks.setdefault(sandbox_id, Lock())
+        """Return the process-local PATCH shard lock for one sandbox."""
+        return self._vault_locks[hash(sandbox_id) % _VAULT_LOCK_SHARDS]
 
     @property
     def cr_reader(self) -> SandboxCRReader:
@@ -523,11 +529,6 @@ class FastSandboxService(SandboxService, ExtensionService):
             raise self._fastpath_http_error(exc) from exc
         finally:
             self._cr_reader.invalidate(namespace)
-            # Evict the per-sandbox vault PATCH lock so the map stays bounded
-            # over the process lifetime (a concurrent PATCH holding the entry
-            # completes against a sandbox being torn down anyway).
-            with self._vault_locks_guard:
-                self._vault_locks.pop(sandbox_id, None)
 
     def pause_sandbox(self, sandbox_id: str) -> None:
         """Persist the pause intent; PAUSING -> PAUSED completes asynchronously."""

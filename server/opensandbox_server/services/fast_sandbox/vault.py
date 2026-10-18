@@ -172,7 +172,8 @@ def _merge_records(
 
     for entry in mutation_set.replace or []:
         dump_result = dump(entry)
-        name = dump_result["name"]
+        name = str(dump_result["name"]).strip()
+        dump_result["name"] = name
         if name in mentioned:
             raise _mentioned_twice(kind, name)
         mentioned.add(name)
@@ -183,7 +184,8 @@ def _merge_records(
     add_seen: set[str] = set()
     for entry in mutation_set.add or []:
         dump_result = dump(entry)
-        name = dump_result["name"]
+        name = str(dump_result["name"]).strip()
+        dump_result["name"] = name
         if name in mentioned:
             raise _mentioned_twice(kind, name)
         if name in add_seen:

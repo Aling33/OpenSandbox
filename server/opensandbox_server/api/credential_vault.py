@@ -20,8 +20,13 @@ from fastapi.responses import Response
 from opensandbox_server.api import lifecycle
 from opensandbox_server.api.proxy import _proxy_http_request
 from opensandbox_server.api.schema import (
+    CredentialBindingListResponse,
+    CredentialBindingMetadata,
+    CredentialListResponse,
+    CredentialMetadata,
     CredentialVaultCreateRequest,
     CredentialVaultMutationRequest,
+    CredentialVaultState,
 )
 from opensandbox_server.services.composite_service import CompositeSandboxService
 from opensandbox_server.services.fast_sandbox import FastSandboxService
@@ -42,7 +47,7 @@ def _quote_segment(name: str) -> str:
     return quote(name, safe="")
 
 
-@router.post("/sandboxes/{sandbox_id}/credential-vault", status_code=201)
+@router.post("/sandboxes/{sandbox_id}/credential-vault", status_code=201, response_model=CredentialVaultState, response_model_exclude_none=True)
 async def create_credential_vault(
     request: Request, sandbox_id: str, body: CredentialVaultCreateRequest
 ):
@@ -52,7 +57,7 @@ async def create_credential_vault(
     return await _proxy_http_request(request, sandbox_id, 18080, "credential-vault", internal=True)
 
 
-@router.get("/sandboxes/{sandbox_id}/credential-vault")
+@router.get("/sandboxes/{sandbox_id}/credential-vault", response_model=CredentialVaultState, response_model_exclude_none=True)
 async def get_credential_vault(request: Request, sandbox_id: str):
     """Sanitized Credential Vault state (values never appear)."""
     if sandbox_id.startswith("fsb-"):
@@ -60,7 +65,7 @@ async def get_credential_vault(request: Request, sandbox_id: str):
     return await _proxy_http_request(request, sandbox_id, 18080, "credential-vault", internal=True)
 
 
-@router.patch("/sandboxes/{sandbox_id}/credential-vault")
+@router.patch("/sandboxes/{sandbox_id}/credential-vault", response_model=CredentialVaultState, response_model_exclude_none=True)
 async def patch_credential_vault(
     request: Request, sandbox_id: str, body: CredentialVaultMutationRequest
 ):
@@ -78,7 +83,7 @@ async def delete_credential_vault(request: Request, sandbox_id: str):
     return await _proxy_http_request(request, sandbox_id, 18080, "credential-vault", internal=True)
 
 
-@router.get("/sandboxes/{sandbox_id}/credential-vault/credentials")
+@router.get("/sandboxes/{sandbox_id}/credential-vault/credentials", response_model=CredentialListResponse, response_model_exclude_none=True)
 async def list_credential_vault_credentials(request: Request, sandbox_id: str):
     if sandbox_id.startswith("fsb-"):
         return await asyncio.to_thread(
@@ -89,7 +94,7 @@ async def list_credential_vault_credentials(request: Request, sandbox_id: str):
     )
 
 
-@router.get("/sandboxes/{sandbox_id}/credential-vault/credentials/{credential_name}")
+@router.get("/sandboxes/{sandbox_id}/credential-vault/credentials/{credential_name}", response_model=CredentialMetadata, response_model_exclude_none=True)
 async def get_credential_vault_credential(
     request: Request, sandbox_id: str, credential_name: str
 ):
@@ -106,7 +111,7 @@ async def get_credential_vault_credential(
     )
 
 
-@router.get("/sandboxes/{sandbox_id}/credential-vault/bindings")
+@router.get("/sandboxes/{sandbox_id}/credential-vault/bindings", response_model=CredentialBindingListResponse, response_model_exclude_none=True)
 async def list_credential_vault_bindings(request: Request, sandbox_id: str):
     if sandbox_id.startswith("fsb-"):
         return await asyncio.to_thread(_fsb_service().list_credential_vault_bindings, sandbox_id)
@@ -115,7 +120,7 @@ async def list_credential_vault_bindings(request: Request, sandbox_id: str):
     )
 
 
-@router.get("/sandboxes/{sandbox_id}/credential-vault/bindings/{binding_name}")
+@router.get("/sandboxes/{sandbox_id}/credential-vault/bindings/{binding_name}", response_model=CredentialBindingMetadata, response_model_exclude_none=True)
 async def get_credential_vault_binding(request: Request, sandbox_id: str, binding_name: str):
     if sandbox_id.startswith("fsb-"):
         return await asyncio.to_thread(

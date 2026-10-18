@@ -17,6 +17,7 @@ using System.Text;
 using System.Text.Json;
 using FluentAssertions;
 using OpenSandbox.Adapters;
+using OpenSandbox.Core;
 using OpenSandbox.Internal;
 using OpenSandbox.Models;
 using Xunit;
@@ -114,7 +115,9 @@ public class NetworkPolicyAdapterTests
     [Fact]
     public async Task GetVaultAsync_ShouldGetSanitizedState()
     {
-        const string payload = """{"revision":2,"credentials":[{"name":"tok","sourceType":"inline","revision":2}],"bindings":[]}""";
+        // A non-conforming upstream echoes the write-only value inside the
+        // credential metadata; the parsed model must drop it.
+        const string payload = """{"revision":2,"credentials":[{"name":"tok","sourceType":"inline","revision":2,"source":{"type":"inline","value":"sekrit"}}],"bindings":[]}""";
         var handler = new CapturingHandler(payload);
         var adapter = CreateAdapter(handler, "fsb-1");
 
@@ -125,6 +128,56 @@ public class NetworkPolicyAdapterTests
         state.Revision.Should().Be(2);
         state.Credentials.Should().ContainSingle();
         state.Credentials[0].SourceType.Should().Be("inline");
+        System.Text.Json.JsonSerializer.Serialize(state).Should().NotContain("sekrit");
+    }
+
+    [Fact]
+    public async Task PatchVaultAsync_ShouldSurface412WithStatusCode()
+    {
+        var handler = new CapturingHandler(
+            """{"code":"FSB::API_ERROR","message":"credential vault revision conflict"}""",
+            statusCode: 412);
+        var adapter = CreateAdapter(handler, "fsb-1");
+
+        var act = async () => await adapter.PatchAsync(new CredentialVaultPatchRequest { ExpectedRevision = 2 });
+
+        var exception = (SandboxApiException)(await act.Should()
+            .ThrowAsync<SandboxApiException>()).Which;
+        exception.StatusCode.Should().Be(412);
+        handler.Method.Should().Be(HttpMethod.Patch);
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/fsb-1/credential-vault");
+    }
+
+    [Fact]
+    public async Task ListCredentialsAsync_ShouldGetCredentialsSubresource()
+    {
+        const string payload = """{"revision":2,"credentials":[{"name":"tok","sourceType":"inline","revision":2}]}""";
+        var handler = new CapturingHandler(payload);
+        var adapter = CreateAdapter(handler, "fsb-1");
+
+        var credentials = await adapter.ListCredentialsAsync();
+
+        handler.Method.Should().Be(HttpMethod.Get);
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/fsb-1/credential-vault/credentials");
+        credentials.Should().ContainSingle();
+        credentials[0].Name.Should().Be("tok");
+    }
+
+    [Fact]
+    public async Task GetBindingAsync_ShouldEncodeNameAndParseMetadata()
+    {
+        const string payload = """{"name":"ext","revision":2,"match":{"hosts":["ext.test"]},"auth":{"type":"apiKey","name":"X-Api-Key"}}""";
+        var handler = new CapturingHandler(payload);
+        var adapter = CreateAdapter(handler, "fsb-1");
+
+        var binding = await adapter.GetBindingAsync("ext/primary");
+
+        handler.Method.Should().Be(HttpMethod.Get);
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/fsb-1/credential-vault/bindings/ext%2Fprimary");
+        binding.Name.Should().Be("ext");
+        binding.Match!.Hosts.Should().ContainSingle().Which.Should().Be("ext.test");
+        binding.Auth!.Type.Should().Be("apiKey");
+        binding.Auth.Name.Should().Be("X-Api-Key");
     }
 
     [Fact]
@@ -202,7 +255,7 @@ public class NetworkPolicyAdapterTests
         return new NetworkPolicyAdapter(wrapper, sandboxId);
     }
 
-    private sealed class CapturingHandler(string payload) : HttpMessageHandler
+    private sealed class CapturingHandler(string payload, int statusCode = 200) : HttpMessageHandler
     {
         public HttpMethod? Method { get; private set; }
 
@@ -219,7 +272,7 @@ public class NetworkPolicyAdapterTests
             RequestBody = request.Content is null
                 ? null
                 : await request.Content.ReadAsStringAsync();
-            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            var response = new HttpResponseMessage((HttpStatusCode)statusCode)
             {
                 Content = new StringContent(payload, Encoding.UTF8, "application/json")
             };

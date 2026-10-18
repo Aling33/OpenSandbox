@@ -104,7 +104,7 @@ public sealed class Sandbox : IAsyncDisposable
             if (Origin == SandboxOrigin.Template && _credentialVault is UnavailableCredentialVault)
             {
                 throw new SandboxException(
-                    "Credential Vault is not available: the adapter factory did not provide a Credential Vault service.");
+                    "Credential Vault is not available: the adapter factory did not provide a Credential Vault service. Provide NetworkPolicyStack.CredentialVault (the server-routed vault for template-backed sandboxes) or EgressStack.CredentialVault in the adapter factory.");
             }
 
             return _credentialVault;

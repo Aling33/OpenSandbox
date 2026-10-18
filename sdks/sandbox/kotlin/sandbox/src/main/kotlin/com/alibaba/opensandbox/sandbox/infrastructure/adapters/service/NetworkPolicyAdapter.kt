@@ -18,6 +18,7 @@ package com.alibaba.opensandbox.sandbox.infrastructure.adapters.service
 
 import com.alibaba.opensandbox.sandbox.HttpClientProvider
 import com.alibaba.opensandbox.sandbox.api.SandboxesApi
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialBindingMetadata
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialMetadata
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialVaultCreateRequest
@@ -85,124 +86,132 @@ internal class NetworkPolicyAdapter(
     }
 
     override fun create(request: CredentialVaultCreateRequest): CredentialVaultState {
-        return try {
+        return vaultCall("Create credential vault") {
             val responseBody =
                 vaultRequestJson(
                     method = "POST",
                     pathSuffix = "",
                     operation = "Create credential vault",
                     jsonBody = request.toJsonObject(),
-                ) ?: throw IllegalStateException("Credential Vault create response did not contain body")
+                ) ?: throw IllegalStateException("Create credential vault response did not contain body")
             responseBody.toCredentialVaultState()
-        } catch (e: Exception) {
-            logger.error("Failed to create credential vault for sandbox {}", sandboxId, e)
-            throw e.toSandboxException()
         }
     }
 
     override fun get(): CredentialVaultState {
-        return try {
+        return vaultCall("Get credential vault") {
             val responseBody =
                 vaultRequestJson(
                     method = "GET",
                     pathSuffix = "",
                     operation = "Get credential vault",
-                ) ?: throw IllegalStateException("Credential Vault get response did not contain body")
+                ) ?: throw IllegalStateException("Get credential vault response did not contain body")
             responseBody.toCredentialVaultState()
-        } catch (e: Exception) {
-            logger.error("Failed to get credential vault for sandbox {}", sandboxId, e)
-            throw e.toSandboxException()
         }
     }
 
     override fun patch(request: CredentialVaultPatchRequest): CredentialVaultState {
-        return try {
+        return vaultCall("Patch credential vault") {
             val responseBody =
                 vaultRequestJson(
                     method = "PATCH",
                     pathSuffix = "",
                     operation = "Patch credential vault",
                     jsonBody = request.toJsonObject(),
-                ) ?: throw IllegalStateException("Credential Vault patch response did not contain body")
+                ) ?: throw IllegalStateException("Patch credential vault response did not contain body")
             responseBody.toCredentialVaultState()
-        } catch (e: Exception) {
-            logger.error("Failed to patch credential vault for sandbox {}", sandboxId, e)
-            throw e.toSandboxException()
         }
     }
 
-    override fun delete() {
-        try {
+    override fun delete(): Unit =
+        vaultCall("Delete credential vault") {
             vaultRequestJson(
                 method = "DELETE",
                 pathSuffix = "",
                 operation = "Delete credential vault",
             )
-        } catch (e: Exception) {
-            logger.error("Failed to delete credential vault for sandbox {}", sandboxId, e)
-            throw e.toSandboxException()
         }
-    }
 
     override fun listCredentials(): List<CredentialMetadata> {
-        return try {
+        return vaultCall("List credential vault credentials") {
             val responseBody =
                 vaultRequestJson(
                     method = "GET",
                     pathSuffix = "/credentials",
                     operation = "List credential vault credentials",
-                ) ?: throw IllegalStateException("Credential Vault credential list response did not contain body")
+                )
+                    ?: throw IllegalStateException(
+                        "List credential vault credentials response did not contain body",
+                    )
             responseBody.toCredentialListResponse().credentials
-        } catch (e: Exception) {
-            logger.error("Failed to list credential vault credentials for sandbox {}", sandboxId, e)
-            throw e.toSandboxException()
         }
     }
 
     override fun getCredential(name: String): CredentialMetadata {
-        return try {
+        return vaultCall("Get credential vault credential") {
             vaultRequestJson(
                 method = "GET",
                 pathSuffix = "/credentials",
                 pathSegment = name,
                 operation = "Get credential vault credential",
             )?.toCredentialMetadata()
-                ?: throw IllegalStateException("Credential Vault credential response did not contain body")
-        } catch (e: Exception) {
-            logger.error("Failed to get credential vault credential for sandbox {}", sandboxId, e)
-            throw e.toSandboxException()
+                ?: throw IllegalStateException("Get credential vault credential response did not contain body")
         }
     }
 
     override fun listBindings(): List<CredentialBindingMetadata> {
-        return try {
+        return vaultCall("List credential vault bindings") {
             val responseBody =
                 vaultRequestJson(
                     method = "GET",
                     pathSuffix = "/bindings",
                     operation = "List credential vault bindings",
-                ) ?: throw IllegalStateException("Credential Vault binding list response did not contain body")
+                )
+                    ?: throw IllegalStateException(
+                        "List credential vault bindings response did not contain body",
+                    )
             responseBody.toCredentialBindingListResponse().bindings
-        } catch (e: Exception) {
-            logger.error("Failed to list credential vault bindings for sandbox {}", sandboxId, e)
-            throw e.toSandboxException()
         }
     }
 
     override fun getBinding(name: String): CredentialBindingMetadata {
-        return try {
+        return vaultCall("Get credential vault binding") {
             vaultRequestJson(
                 method = "GET",
                 pathSuffix = "/bindings",
                 pathSegment = name,
                 operation = "Get credential vault binding",
             )?.toCredentialBindingMetadata()
-                ?: throw IllegalStateException("Credential Vault binding response did not contain body")
-        } catch (e: Exception) {
-            logger.error("Failed to get credential vault binding for sandbox {}", sandboxId, e)
-            throw e.toSandboxException()
+                ?: throw IllegalStateException("Get credential vault binding response did not contain body")
         }
     }
+
+    /**
+     * Uniform error handling for the vault operations: API failures are
+     * logged as operation + HTTP status only — the exception message and
+     * responseBody can carry a backend error body that echoes submitted
+     * vault material, so the exception object itself is never logged.
+     * Transport-level failures (no vault material involved) keep the full
+     * stack trace.
+     */
+    private fun <T> vaultCall(
+        operation: String,
+        block: () -> T,
+    ): T =
+        try {
+            block()
+        } catch (e: SandboxApiException) {
+            logger.error(
+                "Credential Vault {} failed for sandbox {} with HTTP status {}",
+                operation,
+                sandboxId,
+                e.statusCode,
+            )
+            throw e
+        } catch (e: Exception) {
+            logger.error("Credential Vault {} failed for sandbox {}", operation, sandboxId, e)
+            throw e.toSandboxException()
+        }
 
     /**
      * Raw vault request against the lifecycle control plane

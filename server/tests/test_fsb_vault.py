@@ -139,6 +139,14 @@ def vault_fsb(monkeypatch):
 
     app = FastAPI()
     app.add_middleware(RequestIdMiddleware)
+    # Mirror main.py's request-validation handler so the 422 sanitize
+    # assertions exercise the production error shape.
+    from fastapi.exceptions import RequestValidationError
+    from opensandbox_server.main import request_validation_exception_handler
+
+    app.add_exception_handler(
+        RequestValidationError, request_validation_exception_handler
+    )
     app.include_router(lifecycle.router, prefix="/v1")
     app.include_router(credential_vault.router, prefix="/v1")
     try:
@@ -451,6 +459,26 @@ def test_relay_unavailable_maps_to_503(vault_fsb):
     fake.outcome = (500, b"vault persistence failure")
     response = client.get(f"/v1/sandboxes/{_SANDBOX_ID}/credential-vault")
     assert response.status_code == 503
+
+
+def test_validation_errors_do_not_echo_submitted_values(vault_fsb):
+    """A 422 must not carry the submitted input back: pydantic error entries
+    contain `input` (the whole body, including write-only credential values),
+    which the request-validation handler strips."""
+    client, _, _ = vault_fsb
+    response = client.post(
+        f"/v1/sandboxes/{_SANDBOX_ID}/credential-vault",
+        json={
+            "bindings": [],
+            "credentials": [{"source": {"type": "inline", "value": "sekrit"}}],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "sekrit" not in response.text
+    for error in response.json()["detail"]:
+        assert "input" not in error
+        assert "ctx" not in error
 
 
 def test_unknown_sandbox_is_404(vault_fsb):

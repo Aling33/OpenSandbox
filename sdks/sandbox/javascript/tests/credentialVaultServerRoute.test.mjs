@@ -26,14 +26,16 @@ function createCaptureClient(handler) {
   const fetchImpl = async (input, init) => {
     const isRequest = typeof input !== "string" && !(input instanceof URL);
     const url = new URL(isRequest ? input.url : String(input));
+    let body = null;
+    if (isRequest) {
+      body = input.body === null ? null : await input.clone().text();
+    } else {
+      body = init?.body ?? null;
+    }
     requests.push({
       method: isRequest ? input.method : (init?.method ?? "GET"),
       path: url.pathname,
-      body: isRequest
-        ? input.body === null
-          ? null
-          : await input.clone().text()
-        : (init?.body ?? null),
+      body,
     });
     const payload = handler(requests[requests.length - 1]);
     return new Response(payload.body ?? "", {
@@ -129,6 +131,29 @@ test("patch sends the mutation body and surfaces 412 with the server message", a
   assert.equal(requests[0].method, "PATCH");
   assert.equal(requests[0].path, "/v1/sandboxes/fsb-1/credential-vault");
   assert.deepEqual(JSON.parse(requests[0].body), { expectedRevision: 2 });
+});
+
+test("getBinding hits the encoded bindings subresource and parses metadata", async () => {
+  const { adapter, requests } = createCaptureClient(() => ({
+    status: 200,
+    body: JSON.stringify({
+      name: "ext",
+      revision: 2,
+      match: { hosts: ["ext.test"] },
+      auth: { type: "apiKey", name: "X-Api-Key" },
+    }),
+  }));
+
+  const binding = await adapter.getBinding("ext/one");
+
+  assert.equal(requests[0].method, "GET");
+  assert.equal(
+    requests[0].path,
+    "/v1/sandboxes/fsb-1/credential-vault/bindings/ext%2Fone",
+  );
+  assert.equal(binding.name, "ext");
+  assert.equal(binding.match.hosts[0], "ext.test");
+  assert.equal(binding.auth.type, "apiKey");
 });
 
 test("list reads hit the credentials and bindings subresources", async () => {
