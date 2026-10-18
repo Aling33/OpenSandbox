@@ -601,15 +601,16 @@ public sealed class Sandbox : IAsyncDisposable
                 logger.LogInformation(
                     "Sandbox {SandboxId} is template-backed; routing egress policy through the lifecycle control plane",
                     options.SandboxId);
-                egress = adapterFactory.CreateNetworkPolicyStack(new CreateNetworkPolicyStackOptions
+                var policyStack = adapterFactory.CreateNetworkPolicyStack(new CreateNetworkPolicyStackOptions
                 {
                     ConnectionConfig = connectionConfig,
                     LifecycleBaseUrl = lifecycleBaseUrl,
                     SandboxId = options.SandboxId,
                     HttpClientProvider = httpClientProvider,
                     LoggerFactory = loggerFactory
-                }).Egress;
-                credentialVault = null;
+                });
+                egress = policyStack.Egress;
+                credentialVault = policyStack.CredentialVault;
             }
             else
             {

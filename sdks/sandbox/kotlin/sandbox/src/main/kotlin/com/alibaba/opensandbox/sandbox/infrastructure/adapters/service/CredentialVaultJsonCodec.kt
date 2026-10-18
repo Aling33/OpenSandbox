@@ -36,6 +36,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialVaultSt
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CustomHeaderEntry
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.InlineCredentialSource
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.jsonParser
+import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandboxApiException
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -47,6 +48,11 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.HttpUrl
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 
 /** Shared Credential Vault JSON codec for the sidecar and lifecycle transports. */
 
@@ -236,13 +242,13 @@ internal fun String.toCredentialMatchScheme(): CredentialMatch.Scheme =
     }
 
 internal fun JsonObject.requiredString(name: String): String =
-    get(name)?.jsonPrimitive?.content
+    get(name)?.takeUnless { it is JsonNull }?.jsonPrimitive?.content
         ?: throw IllegalStateException("Credential Vault response missing required string field: $name")
 
 internal fun JsonObject.optionalString(name: String): String? = get(name)?.takeUnless { it is JsonNull }?.jsonPrimitive?.contentOrNull
 
 internal fun JsonObject.requiredInt(name: String): Int =
-    get(name)?.jsonPrimitive?.int
+    get(name)?.takeUnless { it is JsonNull }?.jsonPrimitive?.int
         ?: throw IllegalStateException("Credential Vault response missing required integer field: $name")
 
 internal fun JsonObject.requiredArray(name: String): JsonArray =
@@ -257,6 +263,48 @@ internal fun JsonObject.requiredStringArray(name: String): List<String> = requir
 
 internal fun JsonObject.optionalStringArray(name: String): List<String>? = optionalArray(name)?.map { it.requiredStringValue() }
 
-internal fun JsonObject.optionalIntArray(name: String): List<Int>? = optionalArray(name)?.map { it.jsonPrimitive.int }
+internal fun JsonElement.requiredStringValue(): String =
+    takeUnless { it is JsonNull }?.jsonPrimitive?.content
+        ?: throw IllegalStateException("Credential Vault response contains a null string value")
 
-internal fun JsonElement.requiredStringValue(): String = jsonPrimitive.content
+/** JSON media type shared by both vault transports. */
+internal val VAULT_JSON_MEDIA_TYPE = "application/json".toMediaType()
+
+/**
+ * Shared raw transport for the vault surfaces: executes one request and
+ * returns the decoded body, or null for a 204/empty response. Error messages
+ * carry the operation and status only — a backend error body may echo
+ * submitted vault material, so it stays on the exception's responseBody for
+ * programmatic use and never lands in messages or logs.
+ */
+internal fun OkHttpClient.executeVaultRequest(
+    url: HttpUrl,
+    method: String,
+    operation: String,
+    jsonBody: JsonObject? = null,
+): String? {
+    val requestBuilder =
+        Request.Builder()
+            .url(url)
+            .header("Accept", "application/json")
+
+    when (method) {
+        "GET" -> requestBuilder.get()
+        "DELETE" -> requestBuilder.delete()
+        else ->
+            requestBuilder.method(
+                method,
+                (jsonBody ?: buildJsonObject { }).toString().toRequestBody(VAULT_JSON_MEDIA_TYPE),
+            )
+    }
+
+    newCall(requestBuilder.build()).execute().use { response ->
+        val responseBody = response.body?.string().orEmpty()
+        if (response.isSuccessful) {
+            return if (response.code == 204 || responseBody.isBlank()) null else responseBody
+        }
+        throw response.toSandboxApiException(responseBody) { statusCode, _ ->
+            "$operation failed. Status code: $statusCode"
+        }
+    }
+}

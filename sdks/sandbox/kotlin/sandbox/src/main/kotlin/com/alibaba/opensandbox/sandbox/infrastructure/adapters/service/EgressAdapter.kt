@@ -30,25 +30,16 @@ import com.alibaba.opensandbox.sandbox.domain.services.CredentialVault
 import com.alibaba.opensandbox.sandbox.domain.services.Egress
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.SandboxModelConverter.toApiEgressNetworkRule
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.SandboxModelConverter.toDomainEgressNetworkPolicy
-import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandboxApiException
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandboxException
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.buildJsonObject
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
 
 internal class EgressAdapter(
     private val httpClientProvider: HttpClientProvider,
     private val egressEndpoint: SandboxEndpoint,
 ) : Egress, CredentialVault {
-    companion object {
-        private val JSON_MEDIA_TYPE = "application/json".toMediaType()
-    }
-
     private val logger = LoggerFactory.getLogger(EgressAdapter::class.java)
     private val egressBaseUrl = "${httpClientProvider.config.protocol}://${egressEndpoint.endpoint}"
     private val egressClient =
@@ -218,32 +209,13 @@ internal class EgressAdapter(
         operation: String,
         pathSegments: List<String> = emptyList(),
         jsonBody: JsonObject? = null,
-    ): String? {
-        val requestBuilder =
-            Request.Builder()
-                .url(credentialVaultUrl(pathSegments))
-                .header("Accept", "application/json")
-
-        when (method) {
-            "GET" -> requestBuilder.get()
-            "DELETE" -> requestBuilder.delete()
-            else ->
-                requestBuilder.method(
-                    method,
-                    (jsonBody ?: buildJsonObject { }).toString().toRequestBody(JSON_MEDIA_TYPE),
-                )
-        }
-
-        egressClient.newCall(requestBuilder.build()).execute().use { response ->
-            val responseBody = response.body?.string().orEmpty()
-            if (response.isSuccessful) {
-                return if (response.code == 204 || responseBody.isBlank()) null else responseBody
-            }
-            throw response.toSandboxApiException(responseBody) { statusCode, body ->
-                "$operation failed. Status code: $statusCode, Body: $body"
-            }
-        }
-    }
+    ): String? =
+        egressClient.executeVaultRequest(
+            url = credentialVaultUrl(pathSegments),
+            method = method,
+            operation = operation,
+            jsonBody = jsonBody,
+        )
 
     private fun credentialVaultUrl(pathSegments: List<String>): HttpUrl {
         val builder = egressBaseUrl.toHttpUrl().newBuilder().addPathSegment("credential-vault")

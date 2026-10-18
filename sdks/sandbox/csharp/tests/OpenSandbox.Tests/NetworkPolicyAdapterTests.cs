@@ -89,6 +89,112 @@ public class NetworkPolicyAdapterTests
         json.RootElement[1].GetString().Should().Be("*.blocked.org");
     }
 
+    [Fact]
+    public async Task CreateVaultAsync_ShouldPostToLifecycleVaultPath()
+    {
+        var handler = new CapturingHandler("""{"revision":1,"credentials":[],"bindings":[]}""");
+        var adapter = CreateAdapter(handler, "fsb-1");
+
+        var state = await adapter.CreateAsync(
+        [
+            new Credential
+            {
+                Name = "tok",
+                Source = new InlineCredentialSource { Type = "inline", Value = "sekrit" }
+            }
+        ],
+        []);
+
+        handler.Method.Should().Be(HttpMethod.Post);
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/fsb-1/credential-vault");
+        handler.RequestBody.Should().Contain("\"source\":{\"type\":\"inline\",\"value\":\"sekrit\"}");
+        state.Revision.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task GetVaultAsync_ShouldGetSanitizedState()
+    {
+        const string payload = """{"revision":2,"credentials":[{"name":"tok","sourceType":"inline","revision":2}],"bindings":[]}""";
+        var handler = new CapturingHandler(payload);
+        var adapter = CreateAdapter(handler, "fsb-1");
+
+        var state = await adapter.GetAsync();
+
+        handler.Method.Should().Be(HttpMethod.Get);
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/fsb-1/credential-vault");
+        state.Revision.Should().Be(2);
+        state.Credentials.Should().ContainSingle();
+        state.Credentials[0].SourceType.Should().Be("inline");
+    }
+
+    [Fact]
+    public async Task PatchVaultAsync_ShouldSendMutationBody()
+    {
+        var handler = new CapturingHandler("""{"revision":3,"credentials":[],"bindings":[]}""");
+        var adapter = CreateAdapter(handler, "fsb-1");
+
+        var request = new CredentialVaultPatchRequest
+        {
+            ExpectedRevision = 2,
+            Credentials = new CredentialMutationSet
+            {
+                Delete = ["tok"]
+            }
+        };
+        var state = await adapter.PatchAsync(request);
+
+        handler.Method.Should().Be(HttpMethod.Patch);
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/fsb-1/credential-vault");
+        using var json = JsonDocument.Parse(handler.RequestBody!);
+        json.RootElement.GetProperty("expectedRevision").GetInt32().Should().Be(2);
+        json.RootElement.GetProperty("credentials").GetProperty("delete")[0].GetString().Should().Be("tok");
+        state.Revision.Should().Be(3);
+    }
+
+    [Fact]
+    public async Task DeleteVaultAsync_ShouldDeleteVaultPath()
+    {
+        var handler = new CapturingHandler("");
+        var adapter = CreateAdapter(handler, "fsb-1");
+
+        await adapter.DeleteAsync();
+
+        handler.Method.Should().Be(HttpMethod.Delete);
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/fsb-1/credential-vault");
+    }
+
+    [Theory]
+    [InlineData("tok/primary", "/v1/sandboxes/fsb-1/credential-vault/credentials/tok%2Fprimary")]
+    [InlineData("api key", "/v1/sandboxes/fsb-1/credential-vault/credentials/api%20key")]
+    [InlineData("100%", "/v1/sandboxes/fsb-1/credential-vault/credentials/100%25")]
+    public async Task GetCredentialAsync_ShouldEncodeSubresourceNames(
+        string name,
+        string expectedPath)
+    {
+        var handler = new CapturingHandler("""{"name":"x","sourceType":"inline","revision":1}""");
+        var adapter = CreateAdapter(handler, "fsb-1");
+
+        await adapter.GetCredentialAsync(name);
+
+        handler.Method.Should().Be(HttpMethod.Get);
+        handler.PathAndQuery.Should().Be(expectedPath);
+    }
+
+    [Fact]
+    public async Task ListBindingsAsync_ShouldGetBindingsSubresource()
+    {
+        const string payload = """{"revision":2,"bindings":[{"name":"b","revision":2}]}""";
+        var handler = new CapturingHandler(payload);
+        var adapter = CreateAdapter(handler, "fsb-1");
+
+        var bindings = await adapter.ListBindingsAsync();
+
+        handler.Method.Should().Be(HttpMethod.Get);
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/fsb-1/credential-vault/bindings");
+        bindings.Should().ContainSingle();
+        bindings[0].Name.Should().Be("b");
+    }
+
     private static NetworkPolicyAdapter CreateAdapter(CapturingHandler handler, string sandboxId)
     {
         var client = new HttpClient(handler);

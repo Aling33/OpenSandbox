@@ -174,6 +174,68 @@ class NetworkPolicyAdapterTest {
     }
 
     @Test
+    fun `credential vault subresource reads and delete hit the encoded lifecycle paths`() {
+        // credential metadata read with a name that needs percent-encoding
+        mockWebServer.enqueue(
+            MockResponse()
+                .setBody("""{"name":"tok/one","sourceType":"inline","revision":2}""")
+                .setResponseCode(200),
+        )
+        val credential = networkPolicyAdapter.getCredential("tok/one")
+        val credentialRequest = mockWebServer.takeRequest()
+        assertEquals("GET", credentialRequest.method)
+        assertEquals(
+            "/v1/sandboxes/fsb-001/credential-vault/credentials/tok%2Fone",
+            credentialRequest.path,
+        )
+        assertEquals("tok/one", credential.name)
+
+        // credential list
+        mockWebServer.enqueue(
+            MockResponse()
+                .setBody("""{"revision":2,"credentials":[]}""")
+                .setResponseCode(200),
+        )
+        val credentials = networkPolicyAdapter.listCredentials()
+        val listRequest = mockWebServer.takeRequest()
+        assertEquals("/v1/sandboxes/fsb-001/credential-vault/credentials", listRequest.path)
+        assertEquals(0, credentials.size)
+
+        // binding metadata read with a space in the name
+        mockWebServer.enqueue(
+            MockResponse()
+                .setBody("""{"name":"b two","revision":2}""")
+                .setResponseCode(200),
+        )
+        val binding = networkPolicyAdapter.getBinding("b two")
+        val bindingRequest = mockWebServer.takeRequest()
+        assertEquals(
+            "/v1/sandboxes/fsb-001/credential-vault/bindings/b%20two",
+            bindingRequest.path,
+        )
+        assertEquals("b two", binding.name)
+
+        // binding list
+        mockWebServer.enqueue(
+            MockResponse()
+                .setBody("""{"revision":2,"bindings":[]}""")
+                .setResponseCode(200),
+        )
+        networkPolicyAdapter.listBindings()
+        assertEquals(
+            "/v1/sandboxes/fsb-001/credential-vault/bindings",
+            mockWebServer.takeRequest().path,
+        )
+
+        // delete: 204 with no body
+        mockWebServer.enqueue(MockResponse().setResponseCode(204))
+        networkPolicyAdapter.delete()
+        val deleteRequest = mockWebServer.takeRequest()
+        assertEquals("DELETE", deleteRequest.method)
+        assertEquals("/v1/sandboxes/fsb-001/credential-vault", deleteRequest.path)
+    }
+
+    @Test
     fun `credential vault get parses state and patch surfaces 412`() {
         val stateBody =
             """
@@ -209,7 +271,10 @@ class NetworkPolicyAdapterTest {
             assertThrows(SandboxApiException::class.java) {
                 networkPolicyAdapter.patch(CredentialVaultPatchRequest.builder().expectedRevision(1).build())
             }
-        assertTrue(exception.message!!.contains("revision conflict"))
+        // The exception message carries the operation and status only; the raw
+        // server body stays on responseBody for programmatic use.
+        assertEquals(412, exception.statusCode)
+        assertTrue(exception.responseBody!!.contains("revision conflict"))
 
         val patchRecorded = mockWebServer.takeRequest()
         assertEquals("PATCH", patchRecorded.method)

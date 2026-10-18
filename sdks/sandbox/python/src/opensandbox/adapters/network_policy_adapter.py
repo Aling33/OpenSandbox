@@ -207,9 +207,6 @@ class NetworkPolicyAdapter(Egress):
             return None
         return response.json()
 
-    def _vault_url(self, suffix: str) -> str:
-        return _VAULT_PATH.format(sandbox_id=quote(self.sandbox_id, safe="")) + suffix
-
     async def create(
         self,
         *,

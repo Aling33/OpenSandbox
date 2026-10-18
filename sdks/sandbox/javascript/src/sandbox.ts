@@ -738,9 +738,12 @@ export class Sandbox {
    * (control-plane state, not workload shape) may accompany the template id,
    * and the timeout is required.
    *
-   * The returned sandbox routes egress policy operations through the
-   * lifecycle control plane and has no Credential Vault (template-backed
-   * sandboxes have no sandbox-side egress sidecar).
+   * The returned sandbox routes egress policy operations and the Credential
+   * Vault through the lifecycle control plane: the server relays vault
+   * revisions to the egress-held vault over the FastPath handler relay, so
+   * the ack is synchronous and credential values never appear on any read
+   * (OSEP-0022). A 412 patch failure means another writer won the revision —
+   * re-read and retry with the fresh `expectedRevision`.
    */
   static async createFromTemplate(opts: SandboxCreateFromTemplateOptions): Promise<Sandbox> {
     if (!opts.templateId?.trim()) {

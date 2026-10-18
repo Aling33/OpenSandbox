@@ -166,5 +166,13 @@ internal sealed class NetworkPolicyAdapter : IEgress, ICredentialVault
             cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
-    private static string EncodePathSegment(string value) => Uri.EscapeDataString(value);
+    private static string EncodePathSegment(string value)
+    {
+        if (value is null)
+        {
+            throw new ArgumentNullException(nameof(value));
+        }
+
+        return Uri.EscapeDataString(value);
+    }
 }

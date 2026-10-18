@@ -29,18 +29,10 @@ import com.alibaba.opensandbox.sandbox.domain.services.CredentialVault
 import com.alibaba.opensandbox.sandbox.domain.services.Egress
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.SandboxModelConverter.toApiNetworkRule
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.SandboxModelConverter.toDomainNetworkPolicy
-import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandboxApiException
 import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toSandboxException
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.buildJsonObject
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
-
-/** JSON media type shared by the raw vault transport. */
-private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
 /**
  * Egress and Credential Vault implementation backed by the lifecycle control
@@ -237,29 +229,11 @@ internal class NetworkPolicyAdapter(
                     pathSegment?.let { addPathSegment(it) }
                 }
                 .build()
-        val requestBuilder =
-            Request.Builder()
-                .url(url)
-                .header("Accept", "application/json")
-
-        when (method) {
-            "GET" -> requestBuilder.get()
-            "DELETE" -> requestBuilder.delete()
-            else ->
-                requestBuilder.method(
-                    method,
-                    (jsonBody ?: buildJsonObject { }).toString().toRequestBody(JSON_MEDIA_TYPE),
-                )
-        }
-
-        httpClientProvider.authenticatedClient.newCall(requestBuilder.build()).execute().use { response ->
-            val responseBody = response.body?.string().orEmpty()
-            if (response.isSuccessful) {
-                return if (response.code == 204 || responseBody.isBlank()) null else responseBody
-            }
-            throw response.toSandboxApiException(responseBody) { statusCode, body ->
-                "$operation failed. Status code: $statusCode, Body: $body"
-            }
-        }
+        return httpClientProvider.authenticatedClient.executeVaultRequest(
+            url = url,
+            method = method,
+            operation = operation,
+            jsonBody = jsonBody,
+        )
     }
 }
