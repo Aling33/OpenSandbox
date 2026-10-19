@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import timedelta
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from opensandbox._pool_reconciler import ReconcileState, run_reconcile_tick
 from opensandbox.config.connection_sync import ConnectionConfigSync
@@ -1133,6 +1133,9 @@ class SandboxPoolSync:
             )
 
         spec = self._creation_spec
+        extra_create_kwargs: dict[str, Any] = {}
+        if spec.credential_proxy is not None:
+            extra_create_kwargs["credential_proxy"] = spec.credential_proxy
         return self._sandbox_factory.create(
             spec.image,
             timeout=self._config.idle_timeout,
@@ -1141,7 +1144,7 @@ class SandboxPoolSync:
             metadata=spec.metadata,
             resource=spec.resource,
             network_policy=spec.network_policy,
-            credential_proxy=spec.credential_proxy,
+            **extra_create_kwargs,
             platform=spec.platform,
             extensions=spec.extensions,
             secure_access=spec.secure_access,
@@ -1185,6 +1188,9 @@ class SandboxPoolSync:
             return sandbox
 
         spec = self._creation_spec
+        extra_create_kwargs: dict[str, Any] = {}
+        if spec.credential_proxy is not None:
+            extra_create_kwargs["credential_proxy"] = spec.credential_proxy
         sandbox = self._sandbox_factory.create(
             spec.image,
             timeout=self._config.idle_timeout,
@@ -1193,7 +1199,7 @@ class SandboxPoolSync:
             metadata=spec.metadata,
             resource=spec.resource,
             network_policy=spec.network_policy,
-            credential_proxy=spec.credential_proxy,
+            **extra_create_kwargs,
             platform=spec.platform,
             extensions=spec.extensions,
             secure_access=spec.secure_access,

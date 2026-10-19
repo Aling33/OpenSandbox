@@ -823,8 +823,58 @@ async def test_async_pool_creation_forwards_credential_proxy(
         else:
             await pool.acquire()
 
-        assert captured_kwargs["credential_proxy"] is credential_proxy
+        if credential_proxy is None:
+            assert "credential_proxy" not in captured_kwargs
+        else:
+            assert captured_kwargs["credential_proxy"] is credential_proxy
         assert captured_kwargs["network_policy"] is network_policy
+    finally:
+        await pool.shutdown(False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("warmup", [False, True], ids=["direct", "warmup"])
+async def test_async_pool_creation_supports_legacy_factory(warmup: bool) -> None:
+    class LegacySandbox(FakeAsyncSandbox):
+        @classmethod
+        async def create(
+            cls,
+            image: Any,
+            *,
+            timeout: Any,
+            ready_timeout: Any,
+            env: Any,
+            metadata: Any,
+            resource: Any,
+            network_policy: Any,
+            platform: Any,
+            extensions: Any,
+            secure_access: Any,
+            entrypoint: Any,
+            volumes: Any,
+            connection_config: Any,
+            health_check: Any,
+            health_check_polling_interval: Any,
+            skip_health_check: Any,
+        ) -> LegacySandbox:
+            return cls("legacy-factory-sandbox")
+
+    pool = SandboxPoolAsync(
+        pool_name="pool",
+        max_idle=1 if warmup else 0,
+        state_store=InMemoryAsyncPoolStateStore(),
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=lambda config: _manager_factory(FakeAsyncManager()),  # type: ignore[arg-type]
+        sandbox_factory=LegacySandbox,  # type: ignore[arg-type]
+    )
+    await pool.start()
+    try:
+        if warmup:
+            await _eventually(lambda: _idle_count_equals(pool, 1))
+        else:
+            sandbox = await pool.acquire()
+            assert sandbox.id == "legacy-factory-sandbox"
     finally:
         await pool.shutdown(False)
 
