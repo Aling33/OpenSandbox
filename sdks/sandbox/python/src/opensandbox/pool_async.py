@@ -23,7 +23,6 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
-from typing import Any
 
 from opensandbox._async_pool_reconciler import run_async_reconcile_tick
 from opensandbox._async_pool_store import InMemoryAsyncPoolStateStore
@@ -62,6 +61,7 @@ from opensandbox.pool_types import (
     PoolLifecycleState,
     PoolSnapshot,
     PoolState,
+    _extra_create_kwargs,
     effective_max_idle_attempts,
     policy_falls_through_to_direct_create,
 )
@@ -913,9 +913,7 @@ class SandboxPoolAsync:
             )
 
         spec = self._creation_spec
-        extra_create_kwargs: dict[str, Any] = {}
-        if spec.credential_proxy is not None:
-            extra_create_kwargs["credential_proxy"] = spec.credential_proxy
+        create_kwargs = _extra_create_kwargs(spec)
         return await self._sandbox_factory.create(
             spec.image,
             timeout=self._config.idle_timeout,
@@ -924,7 +922,7 @@ class SandboxPoolAsync:
             metadata=spec.metadata,
             resource=spec.resource,
             network_policy=spec.network_policy,
-            **extra_create_kwargs,
+            **create_kwargs,
             platform=spec.platform,
             extensions=spec.extensions,
             secure_access=spec.secure_access,
@@ -957,9 +955,7 @@ class SandboxPoolAsync:
             return sandbox
 
         spec = self._creation_spec
-        extra_create_kwargs: dict[str, Any] = {}
-        if spec.credential_proxy is not None:
-            extra_create_kwargs["credential_proxy"] = spec.credential_proxy
+        create_kwargs = _extra_create_kwargs(spec)
         sandbox = await self._sandbox_factory.create(
             spec.image,
             timeout=self._config.idle_timeout,
@@ -968,7 +964,7 @@ class SandboxPoolAsync:
             metadata=spec.metadata,
             resource=spec.resource,
             network_policy=spec.network_policy,
-            **extra_create_kwargs,
+            **create_kwargs,
             platform=spec.platform,
             extensions=spec.extensions,
             secure_access=spec.secure_access,

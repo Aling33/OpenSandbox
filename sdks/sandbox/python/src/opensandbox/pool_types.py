@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
 
 from opensandbox.config.connection_sync import ConnectionConfigSync
@@ -323,6 +323,20 @@ class PoolCreationSpec:
     secure_access: bool = False
     volumes: list[Volume] | None = None
     credential_proxy: CredentialProxyConfig | None = None
+
+
+def _extra_create_kwargs(spec: PoolCreationSpec) -> dict[str, Any]:
+    """Forward a spec field to ``create`` only when it is set.
+
+    Legacy custom factories declare the pre-existing pool keywords instead of
+    ``**kwargs``, so an unset field has to be omitted rather than passed as
+    ``None``. Keeping the rule here stops the four create paths from drifting
+    when the next optional spec field is added.
+    """
+    kwargs: dict[str, Any] = {}
+    if spec.credential_proxy is not None:
+        kwargs["credential_proxy"] = spec.credential_proxy
+    return kwargs
 
 
 @dataclass(frozen=True)
